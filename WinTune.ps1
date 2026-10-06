@@ -1908,8 +1908,8 @@ try {
 
                         $now = Get-Date
                         # Stall detector: abort if no data for 30 s
-                        if (($now - $lastDataTime).TotalSeconds -gt 30) {
-                            throw 'Stalled: no data received for 30 seconds.'
+                        if (($now - $lastDataTime).TotalSeconds -gt 120) {
+                            throw 'Stalled: no data received for 120 seconds.'
                         }
                         $lastDataTime = $now
 
@@ -1958,7 +1958,7 @@ try {
                     [Console]::Write("`r" + (' ' * 140) + "`r")
                     WG-Log ("Attempt {0} failed: {1}" -f $attempt, $_.Exception.Message) 'WARN'
                     if ($attempt -lt $maxAttempts) {
-                        $wait = 5 * $attempt
+                        $wait = 30 * $attempt
                         WG-Log ("  Retrying in {0} s..." -f $wait) 'INFO'
                         Start-Sleep -Seconds $wait
                     }
@@ -13435,27 +13435,3 @@ function Main {
 # ENTRYPOINT
 # ============================================================
 Main
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
