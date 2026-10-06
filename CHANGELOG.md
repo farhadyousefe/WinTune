@@ -1,5 +1,12 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- winget auto-install now tolerates slow CDN connections: stall threshold
+  raised from 30 s to 120 s, and retry wait from 5 s to 30 s per attempt.
+
 All notable changes to WinTune are documented here.
 
 ## [1.0.0] - 2026-10-06
