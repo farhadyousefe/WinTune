@@ -390,54 +390,23 @@ function Invoke-NativeLive {
     $exitCode = -1
     $proc = $null
 
-       # ---- Launch ----
-    # For tools that bypass stdout (SFC, DISM), we run through a tiny
-    # temporary .cmd file with redirection. This avoids all cmd.exe
-    # quoting pitfalls: the .cmd contains the exact command, and
-    # cmd.exe /c just executes it.
-    $captureFile  = $null
-    $cmdScript    = $null
-    $useCmdWrapper = $Exe -match 'sfc|dism'
-
+    # ---- Launch ----
     try {
-        if ($useCmdWrapper) {
-            # Unique temp files for this invocation
-            $guid        = [Guid]::NewGuid().ToString('N').Substring(0,8)
-            $captureFile = Join-Path $env:TEMP ("fc_capture_{0}_{1}.txt" -f $Label, $guid)
-            $cmdScript   = Join-Path $env:TEMP ("fc_cmd_{0}_{1}.cmd"   -f $Label, $guid)
-
-            # Build the .cmd file contents. Use CRLF (cmd.exe prefers it).
-            $argStr = ($Arguments -join ' ')
-            $cmdContent = '@echo off' + "`r`n" +
-                          ('"{0}" {1} > "{2}" 2>&1' -f $Exe, $argStr, $captureFile) + "`r`n" +
-                          'exit /b %ERRORLEVEL%' + "`r`n"
-            Set-Content -LiteralPath $cmdScript -Value $cmdContent -Encoding ASCII -NoNewline
-
-            $psi = New-Object System.Diagnostics.ProcessStartInfo
-            $psi.FileName               = 'cmd.exe'
-            $psi.Arguments              = "/c `"$cmdScript`""
-            $psi.UseShellExecute        = $false
-            $psi.RedirectStandardOutput = $true
-            $psi.RedirectStandardError  = $true
-            $psi.CreateNoWindow         = $false
-        } else {
-            $psi = New-Object System.Diagnostics.ProcessStartInfo
-            $psi.FileName               = $Exe
-            $psi.Arguments              = ($Arguments -join ' ')
-            $psi.UseShellExecute        = $false
-            $psi.RedirectStandardOutput = $true
-            $psi.RedirectStandardError  = $true
-            $psi.CreateNoWindow         = $false
-            $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
-            $psi.StandardErrorEncoding  = [System.Text.Encoding]::UTF8
-        }
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName               = $Exe
+        $psi.Arguments              = ($Arguments -join ' ')
+        $psi.UseShellExecute        = $false
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError  = $true
+        $psi.CreateNoWindow         = $false
+        $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+        $psi.StandardErrorEncoding  = [System.Text.Encoding]::UTF8
 
         $proc = New-Object System.Diagnostics.Process
         $proc.StartInfo = $psi
         [void]$proc.Start()
     } catch {
         Write-Host ("  [ERROR] Failed to launch {0}: {1}" -f $Exe, $_.Exception.Message) -ForegroundColor Red
-        try { Add-Content -LiteralPath $logFile -Value ("--- {0} FAILED to launch ---" -f $Label) -Encoding UTF8 } catch {}
         return @{ ExitCode = -1 }
     }
 
@@ -449,26 +418,29 @@ function Invoke-NativeLive {
     $spinFrames   = @('|','/','-','\')
     $spinIdx      = 0
     $lastProgress = "$Label started"
-    # ---- Stall watchdog state ----
-    # Track when the progress text last changed so we can warn
-    # the user if a step (like RestoreHealth) is stuck.
-    $lastProgressChangeTime = Get-Date
-    $lastProgressValue      = $lastProgress
     $lineWidth    = 110
     $lastLogTime  = Get-Date
 
-    $stdoutLines = New-Object System.Collections.Generic.List[string]
-    $stderrLines = New-Object System.Collections.Generic.List[string]
-
-    # ---- Identify log sources based on the tool ----
-    $logSources = New-Object System.Collections.Generic.List[string]
-
-    # Add the capture file FIRST — it's where SFC's native console output lands
-    if ($captureFile) {
-        $logSources.Add($captureFile)
+    # Progress phase tracking (prevents regression)
+    # Rank each phase; higher rank wins over lower rank
+    $phaseRank = @{
+        'started'          = 0
+        'scan started'     = 1
+        'verify phase started' = 2
+        'verifying'        = 3
+        'verify complete'  = 4
+        'repair phase started' = 5
+        'repairing'        = 6
+        'repair complete'  = 7
     }
+    $lastPhaseRank = 0
 
-    # Also poll the standard logs as a fallback
+    # Stall state
+    $lastProgressChangeTime = Get-Date
+    $stallThreshold = 60   # Show stalled tag only after 60s of no change
+
+    # ---- Identify log sources ----
+    $logSources = New-Object System.Collections.Generic.List[string]
     if ($Exe -match 'sfc|dism') {
         $cbs = Join-Path $env:SystemRoot 'Logs\CBS\CBS.log'
         if (Test-Path -LiteralPath $cbs) { $logSources.Add($cbs) }
@@ -478,225 +450,216 @@ function Invoke-NativeLive {
         if (Test-Path -LiteralPath $dism) { $logSources.Add($dism) }
     }
 
-    # Wait briefly for cmd.exe to create the capture file
-    if ($captureFile) {
-        $waitEnd = (Get-Date).AddSeconds(5)
-        while (-not (Test-Path -LiteralPath $captureFile) -and (Get-Date) -lt $waitEnd) {
-            Start-Sleep -Milliseconds 200
-        }
-    }
-    # Snapshot initial log sizes so we only parse NEW lines this run.
-    # Missing files (like the capture file before cmd creates it) get 0.
-    $ErrorActionPreferenceBackup = $ErrorActionPreference
-    $ErrorActionPreference = 'SilentlyContinue'
+    # ---- Snapshot log offsets (only parse NEW lines) ----
     $logStartOffsets = @{}
     foreach ($src in $logSources) {
         try {
-            $logStartOffsets[$src] = [int64](Get-Item -LiteralPath $src -Force -ErrorAction SilentlyContinue).Length
+            $logStartOffsets[$src] = [int64](Get-Item -LiteralPath $src -Force).Length
         } catch {
             $logStartOffsets[$src] = [int64]0
         }
-        if ($null -eq $logStartOffsets[$src]) { $logStartOffsets[$src] = [int64]0 }
     }
-    $ErrorActionPreference = $ErrorActionPreferenceBackup
 
     # ---- Begin async stdout/stderr line readers ----
     $stdoutTask = $proc.StandardOutput.ReadLineAsync()
     $stderrTask = $proc.StandardError.ReadLineAsync()
 
-    # ---- Main polling loop ----
-    while (-not $proc.HasExited -or
-           ($stdoutTask -and -not $stdoutTask.IsCompleted) -or
-           ($stderrTask -and -not $stderrTask.IsCompleted)) {
-
+    # ---- Main loop ----
+    while (-not $proc.HasExited) {
         Start-Sleep -Milliseconds 250
         $now     = Get-Date
         $elapsed = $now - $start
 
-        # ---- Drain any completed stdout lines ----
+        # ---- Drain stdout ----
         while ($stdoutTask -and $stdoutTask.IsCompleted -and $stdoutTask.Result -ne $null) {
             $line = $stdoutTask.Result
-
-            # SFC's own console progress
             $m = $null
-            if     ($line -match 'Verification\s+(\d+)%\s+complete')  { $m = "SFC verification: $($Matches[1])%" }
-            elseif ($line -match 'Beginning verification phase')      { $m = 'SFC verification phase started' }
-            elseif ($line -match 'Beginning system scan')             { $m = 'SFC system scan started' }
-            elseif ($line -match '\[=+\s*([\d.]+)%\s*\]')             { $m = "DISM: $($Matches[1])% complete" }
+            if     ($line -match 'Verification\s+(\d+)%\s+complete')  { $m = "verification:$($Matches[1])%" }
+            elseif ($line -match 'Beginning verification phase')      { $m = 'verify phase started' }
+            elseif ($line -match 'Beginning system scan')             { $m = 'scan started' }
+            elseif ($line -match '\[=+\s*([\d.]+)%\s*\]')             { $m = "dism:$($Matches[1])%" }
             if ($m) {
-                if ($m -ne $lastProgressValue) {
-                    $lastProgressValue      = $m
-                    $lastProgressChangeTime = Get-Date
+                $rank = if ($m -match '^verification:') { 3 } elseif ($m -match '^dism:') { 3 } else { $phaseRank[$m] }
+                if ($rank -ge $lastPhaseRank) {
+                    $lastProgress = if ($m -match '^verification:(\d+)%$') { "SFC verification: $($Matches[1])%" }
+                                    elseif ($m -match '^dism:([\d.]+)%$') { "DISM: $($Matches[1])% complete" }
+                                    else { "SFC: $m" }
+                    $lastPhaseRank = $rank
+                    $lastProgressChangeTime = $now
                 }
-                $lastProgress = $m
             }
-            else    { $stdoutLines.Add($line) | Out-Null }
-
-            # Issue the next async read
             $stdoutTask = $proc.StandardOutput.ReadLineAsync()
         }
 
-        # ---- Drain stderr ----
+        # Drain stderr
         while ($stderrTask -and $stderrTask.IsCompleted -and $stderrTask.Result -ne $null) {
-            $stderrLines.Add($stderrTask.Result) | Out-Null
             $stderrTask = $proc.StandardError.ReadLineAsync()
         }
 
-        # ---- Poll logs (throttled: every 500 ms) ----
+        # ---- Poll logs (throttled every 500ms) ----
         if (($now - $lastLogTime).TotalMilliseconds -ge 500) {
             $lastLogTime = $now
             foreach ($src in $logSources) {
                 try {
-$startOffset = if ($logStartOffsets.ContainsKey($src)) { $logStartOffsets[$src] } else { 0 }
-
-                    $curLen = 0
-
-                    try {
-                    $curLen = [int64](Get-Item -LiteralPath $src -Force -ErrorAction SilentlyContinue).Length
-                } catch {
-                    $curLen = 0
-                }
-                if ($null -eq $curLen) { $curLen = 0 }
-
+                    $startOffset = if ($logStartOffsets.ContainsKey($src)) { $logStartOffsets[$src] } else { 0 }
+                    $curLen = [int64]0
+                    try { $curLen = (Get-Item -LiteralPath $src -Force).Length } catch { }
                     if ($curLen -le $startOffset) { continue }
 
                     $fs = [System.IO.File]::Open($src, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
-
                     try {
-
                         [void]$fs.Seek($startOffset, [System.IO.SeekOrigin]::Begin)
-
                         $toRead = [int]($curLen - $startOffset)
-
+                        if ($toRead -le 0) { continue }
                         $buf = New-Object byte[] $toRead
-
                         [void]$fs.Read($buf, 0, $toRead)
-
                         $newText = [System.Text.Encoding]::UTF8.GetString($buf)
-
                         $logStartOffsets[$src] = $curLen
+                    } finally {
+                        $fs.Close()
+                    }
 
-                    } finally { $fs.Close() }
-
-                    $tail = $newText -split "`r?`n"
-                    foreach ($line in $tail) {
+                    foreach ($line in ($newText -split "`r?`n")) {
                         $m = $null
+                        $rank = -1
 
-                        # --- CBS WU client download progress (RestoreHealth) ---
-                        if ($line -match 'DownloadProgress:\s*\[(\d+)\s*/\s*(\d+)\]') {
-                            $cur = [int]$Matches[1]
-                            $tot = [int]$Matches[2]
+                        if ($Label -eq 'RestoreHealth' -and $line -match 'DownloadProgress:\s*\[(\d+)\s*/\s*(\d+)\]') {
+                            $cur = [int]$Matches[1]; $tot = [int]$Matches[2]
                             if ($tot -gt 0) {
                                 $pct = [int](($cur / $tot) * 100)
                                 $m = "Download: $pct%"
+                                $rank = 3
                             }
                         }
-                        # --- DISM native bar in dism.log ---
-                        elseif ($line -match '\[=+\s*([\d.]+)%\s*\]') {
-                            $m = "DISM: $($Matches[1])% complete"
-                        }
-                        elseif ($line -match 'Progress:\s*([\d.]+)%') {
-                            $m = "DISM: $($Matches[1])% complete"
-                        }
-                        # --- SFC phases via [SR] tag in CBS.log ---
                         elseif ($line -match '\[SR\]\s+Beginning\s+(Verify|Repair)') {
-                            $m = "SFC: $($Matches[1].ToLower()) phase started"
+                            $phase = $Matches[1].ToLower()
+                            $m = "SFC: $phase phase started"
+                            $rank = if ($phase -eq 'verify') { 2 } else { 5 }
                         }
                         elseif ($line -match '\[SR\]\s+Verifying\s+(\d+)\s+components') {
                             $m = "SFC: verifying $($Matches[1]) components"
+                            $rank = 3
                         }
                         elseif ($line -match '\[SR\]\s+Verify complete') {
                             $m = 'SFC: verify complete'
+                            $rank = 4
                         }
                         elseif ($line -match '\[SR\]\s+Repairing\s+(\d+)\s+components') {
                             $m = "SFC: repairing $($Matches[1]) components"
+                            $rank = 6
                         }
                         elseif ($line -match '\[SR\]\s+Repair complete') {
                             $m = 'SFC: repair complete'
+                            $rank = 7
+                        }
+                        elseif ($line -match '\[SR\].*?[Bb]egin.*?[Vv]erif') {
+                            $m = 'SFC: verify phase started (broad)'
+                            $rank = 2
+                        }
+                        elseif ($line -match '\[SR\].*?[Vv]erif(y|ication|ying)') {
+                            if ($line -match '(\d+)\s+components') {
+                                $m = "SFC: verifying $($Matches[1]) components (broad)"
+                            } else {
+                                $m = 'SFC: verifying components (broad)'
+                            }
+                            $rank = 3
+                        }
+                        elseif ($line -match '\[SR\].*?[Vv]erif.*?complete') {
+                            $m = 'SFC: verify complete (broad)'
+                            $rank = 4
+                        }
+                        elseif ($line -match '\[SR\].*?[Rr]epair(ing|ed)?') {
+                            if ($line -match 'complete') {
+                                $m = 'SFC: repair complete (broad)'
+                                $rank = 7
+                            } else {
+                                $m = 'SFC: repairing components (broad)'
+                                $rank = 5
+                            }
+                        }
+                        elseif ($line -match '\[=+\s*([\d.]+)%\s*\]') {
+                            $m = "DISM: $($Matches[1])% complete"
+                            $rank = 3
+                        }
+                        elseif ($line -match 'Exec(?:uting)?:?\s+Restore\s*Health:?\s+([\d.]+)%') {
+                            $m = "Restoring: $($Matches[1])%"
+                            $rank = 3
+                        }
+                        elseif ($line -match 'Restore\s*Health:?\s+([\d.]+)%\s+complete') {
+                            $m = "Restoring: $($Matches[1])%"
+                            $rank = 3
+                        }
+                        elseif ($line -match 'Restore\s*Health\s+operation\s+completed') {
+                            $m = 'Restore complete'
+                            $rank = 7
                         }
 
-                        if ($m) { $lastProgress = $m }
+                        if ($m -and $rank -ge $lastPhaseRank) {
+                            $lastProgress = $m
+                            $lastPhaseRank = $rank
+                            $lastProgressChangeTime = $now
+                        }
                     }
                 } catch { }
             }
         }
 
         # ---- Render ----
+        # Stall tag: only show if no progress change for 60+ seconds AND process still running
+        $stallSec = [int](($now - $lastProgressChangeTime).TotalSeconds)
+        $stallTag = if ($stallSec -ge $stallThreshold) { "  [stalled ${stallSec}s]" } else { '' }
+
+        $elapsedStr = if ($elapsed.TotalHours -ge 1) { '{0:hh\:mm\:ss}' -f $elapsed } else { '{0:mm\:ss}' -f $elapsed }
+
         if ($isRedirected) {
             if (($now - $start).TotalSeconds % 15 -lt 0.3) {
-                $line = "  [$('{0:mm\:ss}' -f $elapsed)] $Label - $lastProgress"
+                $line = "  [$elapsedStr] $Label - $lastProgress$stallTag"
                 Write-Host $line -ForegroundColor DarkGray
                 try { Add-Content -LiteralPath $logFile -Value $line -Encoding UTF8 } catch {}
             }
         } else {
             $spinIdx = ($spinIdx + 1) % $spinFrames.Length
-
-            # Elapsed: use hh:mm:ss for runs >= 1 hour so the timer
-            # doesn't wrap at 60 minutes.
-            $elapsedStr = if ($elapsed.TotalHours -ge 1) {
-                '{0:hh\:mm\:ss}' -f $elapsed
-            } else {
-                '{0:mm\:ss}' -f $elapsed
-            }
-
-            # Stall tag: append "[stalled Ns]" if progress text has not
-            # changed for >= 120 seconds.
-            $stallSec = [int]((Get-Date) - $lastProgressChangeTime).TotalSeconds
-            $stallTag = if ($stallSec -ge 120) { "  [stalled ${stallSec}s]" } else { '' }
-
-            $status = "  {0} {1}  [{2}]  {3}{4}" -f $spinFrames[$spinIdx], $Label, $elapsedStr, $lastProgress, $stallTag
+            $status = "  {0} {1}  [{2}]  {3}{4}" -f `
+                      $spinFrames[$spinIdx], $Label, $elapsedStr, $lastProgress, $stallTag
             if ($null -eq $status) { $status = '' }
             if ($status.Length -lt $lineWidth) { $status = $status.PadRight($lineWidth) }
-            Write-Host ("`r" + $status) -NoNewline -ForegroundColor Cyan
+            [Console]::Write("`r" + $status)
         }
     }
 
-    # ---- Clear spinner line ----
+    # Clear spinner line
     if (-not $isRedirected) {
-        Write-Host ("`r" + (' ' * $lineWidth) + "`r") -NoNewline
+        [Console]::Write("`r" + (' ' * $lineWidth) + "`r")
     }
 
-    # ---- Wait for exit + collect remaining output ----
+    # ---- Collect final exit code ----
     try {
         $proc.WaitForExit()
-        # Drain any remaining lines that arrived after the last check
-        while ($stdoutTask -and $stdoutTask.IsCompleted -and $stdoutTask.Result -ne $null) {
-            $stdoutLines.Add($stdoutTask.Result) | Out-Null
-            $stdoutTask = $proc.StandardOutput.ReadLineAsync()
-        }
-        while ($stderrTask -and $stderrTask.IsCompleted -and $stderrTask.Result -ne $null) {
-            $stderrLines.Add($stderrTask.Result) | Out-Null
-            $stderrTask = $proc.StandardError.ReadLineAsync()
-        }
         $exitCode = $proc.ExitCode
         if ($null -eq $exitCode) { $exitCode = -1 }
     } catch { $exitCode = -1 }
 
-    # ---- Print captured output ----
-    foreach ($line in $stdoutLines) {
+    # Drain any remaining output
+    $finalLines = New-Object System.Collections.Generic.List[string]
+    while ($stdoutTask -and $stdoutTask.IsCompleted -and $stdoutTask.Result -ne $null) {
+        $finalLines.Add($stdoutTask.Result) | Out-Null
+        $stdoutTask = $proc.StandardOutput.ReadLineAsync()
+    }
+    while ($stderrTask -and $stderrTask.IsCompleted -and $stderrTask.Result -ne $null) {
+        $finalLines.Add($stderrTask.Result) | Out-Null
+        $stderrTask = $proc.StandardError.ReadLineAsync()
+    }
+    foreach ($line in $finalLines) {
         if ([string]::IsNullOrWhiteSpace($line)) { continue }
         Write-Host "  $line" -ForegroundColor Gray
         try { Add-Content -LiteralPath $logFile -Value $line -Encoding UTF8 } catch {}
     }
-    foreach ($line in $stderrLines) {
-        if ([string]::IsNullOrWhiteSpace($line)) { continue }
-        Write-Host "  $line" -ForegroundColor DarkYellow
-        try { Add-Content -LiteralPath $logFile -Value $line -Encoding UTF8 } catch {}
-    }
 
-    # ---- Footer ----
+    # Footer
     $duration = (Get-Date) - $start
     $footer = "--- $Label complete in [ $(([math]::Round($duration.TotalMinutes, 1))) min ] (Exit Code: $exitCode) ---"
     Write-Host $footer -ForegroundColor DarkGray
     try { Add-Content -LiteralPath $logFile -Value $footer -Encoding UTF8 } catch {}
-
-    # Clean up the temp files
-    if ($captureFile -and (Test-Path -LiteralPath $captureFile)) {
-        Remove-Item -LiteralPath $captureFile -Force -ErrorAction SilentlyContinue
-    }
-    if ($cmdScript -and (Test-Path -LiteralPath $cmdScript)) {
-        Remove-Item -LiteralPath $cmdScript -Force -ErrorAction SilentlyContinue
-    }
 
     return @{ ExitCode = $exitCode }
 }
