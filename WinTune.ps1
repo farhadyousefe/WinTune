@@ -118,7 +118,12 @@ param(
 
     # ---- Detached runner tracking ----
     [switch]$WaitForDetached,                                   # Wait indefinitely for all children before PostCheck
-    [switch]$AllowScheduledTaskAction,                         # Step 20 - disable non-Microsoft scheduled tasks
+    [switch]$AllowScheduledTaskAction,
+
+    # ---- Security posture audits (Step 56) ----
+    [switch]$DisableWebClient,                                  # Step 56 - set WebClient service to Disabled
+    [switch]$AddWpadHostsEntry,                                 # Step 56 - append 0.0.0.0 wpad to hosts file
+    [switch]$EnableScriptBlockLogging,                          # Step 56 - enable PowerShell ScriptBlockLogging                         # Step 20 - disable non-Microsoft scheduled tasks
     [int]$DetachedWaitSeconds = 0,                              # Wait up to N seconds (0 = don't wait)
 
     # ---- Thresholds for destructive cleanup steps ----
@@ -225,6 +230,9 @@ $Script:AllowCamWALCleanup = $AllowCamWALCleanup.IsPresent
 $Script:AllowPersistenceAction = $AllowPersistenceAction.IsPresent
 $Script:AllowAutoRunDisable = $AllowAutoRunDisable.IsPresent
 $Script:AllowScheduledTaskAction = $AllowScheduledTaskAction.IsPresent
+$Script:DisableWebClient         = $DisableWebClient.IsPresent
+$Script:AddWpadHostsEntry        = $AddWpadHostsEntry.IsPresent
+$Script:EnableScriptBlockLogging = $EnableScriptBlockLogging.IsPresent
 $Script:AllowContextMenuAction = $AllowContextMenuAction.IsPresent
 $Script:AllowProgramAuditAction = $AllowProgramAuditAction.IsPresent
 # ---- New in v3.4 (driver updates) ----
@@ -358,6 +366,7 @@ $Script:StepNames = @{
     52 = 'Safe Service Trim'
     54 = 'Privacy and Start Menu Tweaks'
     55 = 'TCP Performance Tuning'
+    56 = 'Security Posture Audits'
     '1b' = 'SSD Fullness Check'
     '8b' = 'Driver Update Audit + Install (Detached)'
 }
@@ -13585,6 +13594,193 @@ function Invoke-Step43 {
     Write-Log '[SUCCESS] UWP LocalCache sweep finished.' -Level OK
 }
 
+# ============================================================
+# STEP 56: Security Posture Audits (new)
+# ============================================================
+function Invoke-Step56 {
+    <#
+    .SYNOPSIS
+        Audits seven security controls and optionally applies three
+        of them behind explicit opt-in switches.
+
+    .DESCRIPTION
+        Audit-only by default. Reports:
+          1. WebClient service (WebDAV / NTLM relay vector)
+          2. WPAD hosts-file entry
+          3. LAPS installation + policy state
+          4. PowerShell ScriptBlockLogging state
+          5. UAC configuration (EnableLUA, ConsentPromptBehaviorAdmin,
+             PromptOnSecureDesktop)
+          6. SMB signing (server + client)
+          7. BitLocker / Device Encryption status on the system drive
+
+        Opt-in writes (each gated by its own switch):
+          -DisableWebClient         -> Set-Service WebClient Disabled
+          -AddWpadHostsEntry        -> append 0.0.0.0 wpad + wpad.* to hosts
+          -EnableScriptBlockLogging -> registry write for ScriptBlockLogging
+    #>
+    [CmdletBinding()]
+    param()
+
+    Write-Log 'STEP 56: Security Posture Audits' -Level STEP
+    Write-Log ('-' * 60) -Level STEP
+
+    if ($Script:DryRun) {
+        Write-Log 'Would audit 7 security controls (report-only in DryRun).' -Level PREVIEW
+        return
+    }
+
+    # ---- 1. WebClient (WebDAV) ----
+    Write-Log 'Audit 1/7: WebClient (WebDAV / NTLM relay)' -Level INFO
+    $wcSvc = Get-Service -Name 'WebClient' -ErrorAction SilentlyContinue
+    if ($wcSvc) {
+        $wcStart = (Get-CimInstance Win32_Service -Filter "Name='WebClient'" -ErrorAction SilentlyContinue).StartMode
+        Write-Log ("  Current state: {0} / {1}" -f $wcSvc.Status, $wcStart) -Level INFO
+        if ($wcStart -ne 'Disabled' -and $Script:DisableWebClient) {
+            try {
+                Set-Service -Name 'WebClient' -StartupType Disabled -ErrorAction Stop
+                if ($wcSvc.Status -eq 'Running') { Stop-Service -Name 'WebClient' -Force -ErrorAction SilentlyContinue }
+                Write-Log '  [OK] WebClient set to Disabled.' -Level OK
+            } catch {
+                Write-Log ("  [WARN] Could not disable WebClient: {0}" -f $_.Exception.Message) -Level WARN
+            }
+        } elseif ($wcStart -ne 'Disabled') {
+            Write-Log '  Recommendation: run with -DisableWebClient to harden.' -Level INFO
+        } else {
+            Write-Log '  [OK] Already Disabled.' -Level OK
+        }
+    } else {
+        Write-Log '  [SKIP] WebClient service not present.' -Level DEBUG
+    }
+
+    # ---- 2. WPAD hosts-file entry ----
+    Write-Log 'Audit 2/7: WPAD hosts-file entry' -Level INFO
+    $hostsPath = Join-Path $env:SystemRoot 'System32\drivers\etc\hosts'
+    $wpadPresent = $false
+    if (Test-Path -LiteralPath $hostsPath) {
+        try {
+            $wpadPresent = (Get-Content -LiteralPath $hostsPath -ErrorAction Stop) -match '^\s*0\.0\.0\.0\s+wpad\b'
+        } catch { }
+    }
+    if ($wpadPresent) {
+        Write-Log '  [OK] WPAD already blocked in hosts file.' -Level OK
+    } elseif ($Script:AddWpadHostsEntry) {
+        try {
+            $lines = @('', '# WinTune - WPAD block', '0.0.0.0 wpad', '0.0.0.0 wpad.*')
+            Add-Content -LiteralPath $hostsPath -Value $lines -Encoding ASCII -ErrorAction Stop
+            Write-Log '  [OK] WPAD hosts entry added.' -Level OK
+        } catch {
+            Write-Log ("  [WARN] Could not write hosts file: {0}" -f $_.Exception.Message) -Level WARN
+        }
+    } else {
+        Write-Log '  Missing. Run with -AddWpadHostsEntry to harden.' -Level INFO
+    }
+
+    # ---- 3. LAPS ----
+    Write-Log 'Audit 3/7: Windows LAPS' -Level INFO
+    $lapsPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\LAPS'
+    $lapsLegacy = 'HKLM:\SOFTWARE\Policies\Microsoft Services\AdmPwd'
+    if (Test-Path -LiteralPath $lapsPath) {
+        Write-Log '  [OK] Windows LAPS registry path present.' -Level OK
+        try {
+            $lapsBackup = (Get-ItemProperty -Path $lapsPath -Name 'BackupDirectory' -ErrorAction SilentlyContinue).BackupDirectory
+            if ($null -ne $lapsBackup) {
+                Write-Log ("    BackupDirectory = {0}" -f $lapsBackup) -Level INFO
+            } else {
+                Write-Log '    Not configured (no BackupDirectory value).' -Level INFO
+            }
+        } catch { }
+    } elseif (Test-Path -LiteralPath $lapsLegacy) {
+        Write-Log '  [OK] Legacy LAPS (AdmPwd) policy present.' -Level OK
+    } else {
+        Write-Log '  Not configured. (Report only - no action taken.)' -Level INFO
+    }
+
+    # ---- 4. PowerShell ScriptBlockLogging ----
+    Write-Log 'Audit 4/7: PowerShell ScriptBlockLogging' -Level INFO
+    $sblPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging'
+    $sblEnabled = $null
+    if (Test-Path -LiteralPath $sblPath) {
+        $sblEnabled = (Get-ItemProperty -Path $sblPath -Name 'EnableScriptBlockLogging' -ErrorAction SilentlyContinue).EnableScriptBlockLogging
+    }
+    if ($sblEnabled -eq 1) {
+        Write-Log '  [OK] ScriptBlockLogging enabled.' -Level OK
+    } elseif ($Script:EnableScriptBlockLogging) {
+        try {
+            if (-not (Test-Path -LiteralPath $sblPath)) { New-Item -Path $sblPath -Force | Out-Null }
+            New-ItemProperty -Path $sblPath -Name 'EnableScriptBlockLogging' -Value 1 -PropertyType DWord -Force -ErrorAction Stop | Out-Null
+            Write-Log '  [OK] ScriptBlockLogging enabled.' -Level OK
+        } catch {
+            Write-Log ("  [WARN] Could not enable ScriptBlockLogging: {0}" -f $_.Exception.Message) -Level WARN
+        }
+    } else {
+        Write-Log '  Not configured. Run with -EnableScriptBlockLogging to harden.' -Level INFO
+    }
+
+    # ---- 5. UAC ----
+    Write-Log 'Audit 5/7: User Account Control (UAC)' -Level INFO
+    $sysPolicyPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
+    try {
+        $uacProps = Get-ItemProperty -Path $sysPolicyPath -ErrorAction Stop
+        $enableLua  = $uacProps.PSObject.Properties['EnableLUA'].Value
+        $consent    = $uacProps.PSObject.Properties['ConsentPromptBehaviorAdmin'].Value
+        $secureDesk = $uacProps.PSObject.Properties['PromptOnSecureDesktop'].Value
+        Write-Log ("    EnableLUA                  = {0}" -f $enableLua)  -Level INFO
+        Write-Log ("    ConsentPromptBehaviorAdmin = {0}" -f $consent)    -Level INFO
+        Write-Log ("    PromptOnSecureDesktop      = {0}" -f $secureDesk) -Level INFO
+        if ($enableLua -ne 1) {
+            Write-Log '  [WARN] UAC is disabled (EnableLUA != 1). Report only.' -Level WARN
+        } else {
+            Write-Log '  [OK] UAC enabled.' -Level OK
+        }
+    } catch {
+        Write-Log ("  [WARN] Could not read UAC policy: {0}" -f $_.Exception.Message) -Level WARN
+    }
+
+    # ---- 6. SMB signing ----
+    Write-Log 'Audit 6/7: SMB signing' -Level INFO
+    try {
+        $srv = Get-SmbServerConfiguration -ErrorAction SilentlyContinue
+        $cli = Get-SmbClientConfiguration -ErrorAction SilentlyContinue
+        if ($srv) { Write-Log ("    Server RequireSecuritySignature = {0}" -f $srv.RequireSecuritySignature) -Level INFO }
+        if ($cli) { Write-Log ("    Client RequireSecuritySignature = {0}" -f $cli.RequireSecuritySignature) -Level INFO }
+        if ($srv -and -not $srv.RequireSecuritySignature) {
+            Write-Log '  [WARN] SMB server signing not enforced. Report only.' -Level WARN
+        } elseif ($srv) {
+            Write-Log '  [OK] SMB server signing enforced.' -Level OK
+        }
+    } catch {
+        Write-Log ("  [WARN] Could not read SMB config: {0}" -f $_.Exception.Message) -Level WARN
+    }
+
+    # ---- 7. BitLocker / Device Encryption ----
+    Write-Log 'Audit 7/7: BitLocker / Device Encryption' -Level INFO
+    try {
+        if (Get-Command Get-BitLockerVolume -ErrorAction SilentlyContinue) {
+            $vol = Get-BitLockerVolume -MountPoint $env:SystemDrive -ErrorAction SilentlyContinue
+            if ($vol) {
+                Write-Log ("    Volume {0} - ProtectionStatus = {1}, EncryptionPercentage = {2}%" -f $vol.MountPoint, $vol.ProtectionStatus, $vol.EncryptionPercentage) -Level INFO
+                if ($vol.ProtectionStatus -eq 'On') {
+                    Write-Log '  [OK] System drive is BitLocker-protected.' -Level OK
+                } else {
+                    Write-Log '  [WARN] System drive is NOT BitLocker-protected. Report only.' -Level WARN
+                }
+            }
+        } else {
+            # manage-bde fallback
+            $bde = & manage-bde.exe -status $env:SystemDrive 2>&1
+            if ($bde) {
+                $bde | ForEach-Object { Write-Log ("    {0}" -f $_) -Level DEBUG }
+                $bde | ForEach-Object { Add-Content -LiteralPath $Script:LogFile -Value $_ -Encoding UTF8 -ErrorAction SilentlyContinue }
+            }
+        }
+    } catch {
+        Write-Log ("  [WARN] Could not query BitLocker: {0}" -f $_.Exception.Message) -Level WARN
+    }
+
+    Write-Log 'Step 56 complete.' -Level OK
+}
+
 function Invoke-PostCheck {
     <#
     .SYNOPSIS
@@ -13909,6 +14105,7 @@ function Main {
         'Invoke-Step52'
         'Invoke-Step54'
         'Invoke-Step55'
+        'Invoke-Step56'
             )
 
         for ($i = 0; $i -lt $stepFunctions.Count; $i++) {
