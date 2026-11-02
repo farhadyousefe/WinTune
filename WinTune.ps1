@@ -4085,10 +4085,23 @@ function Invoke-Step03 {
             $allDirs = Get-ChildItem -LiteralPath $browser.Path -Directory -Recurse -Force -ErrorAction SilentlyContinue
 
             $matched = 0
+            # [FIX-SILENT-1] Match by suffix, not exact equality. Real
+            # Chromium caches live at User Data\Default\Cache (and per
+            # profile: Profile 1\Cache, etc.). The old `-contains $rel`
+            # only ever matched caches directly under User Data, missing
+            # the actual bulk of the browser cache.
             foreach ($dir in $allDirs) {
                 $rel = $dir.FullName.Substring($browser.Path.Length).TrimStart('\')
 
-                if ($chromiumCacheDirs -contains $rel) {
+                $isMatch = $false
+                foreach ($entry in $chromiumCacheDirs) {
+                    if ($rel -eq $entry -or $rel -like "*\$entry") {
+                        $isMatch = $true
+                        break
+                    }
+                }
+
+                if ($isMatch) {
                     try {
                         Get-ChildItem -LiteralPath $dir.FullName -Recurse -Force -ErrorAction SilentlyContinue |
                             Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
@@ -6913,6 +6926,25 @@ function Invoke-Step19 {
     Write-Log 'Step 19 complete.' -Level OK
 }
 # ============================================================
+# FIX 2 helper: Test-IsSystemServiceAccount
+# ============================================================
+function Test-IsSystemServiceAccount {  # [FIX-SILENT-2b]
+    param([string]$UserId)
+    if ([string]::IsNullOrWhiteSpace($UserId)) { return $false }
+    $u = $UserId.Trim().ToLowerInvariant()
+    $list = @(
+        'wsiaccount'
+        'system'
+        'nt authority\system'
+        'local service'
+        'nt authority\local service'
+        'network service'
+        'nt authority\network service'
+    )
+    return ($list -contains $u)
+}
+
+# ============================================================
 # STEP 20: Automated Windows Scheduled Tasks Diagnostic Audit
 # ============================================================
 function Invoke-Step20 {
@@ -7083,11 +7115,13 @@ function Invoke-Step20 {
             $_.TaskPath -notlike '\Microsoft\*' -and
             $_.State -eq 'Ready' -and
             $_.TaskPath -notmatch '^\\Microsoft\\Windows\\(UpdateOrchestrator|Defrag|SystemRestore)\\' -and
-            # Exclude tasks running as service accounts that admin cannot
-            # disable (WsiAccount, NetworkService, LocalService, SYSTEM).
-            # These tasks are system-managed and produce "Access is denied"
-            # which is not a real failure.
-            -not ($_.Principal -and $_.Principal.UserId -match '^(WsiAccount|SYSTEM|NT AUTHORITY\\\\(SYSTEM|LOCAL SERVICE|NETWORK SERVICE))$')
+            # [FIX-SILENT-2] Robust ignore-list for system service accounts.
+            # The old regex over-escaped the backslashes (four literal '\'
+            # in a single-quoted string means the regex sees two, which
+            # matches two), so NT AUTHORITY\SYSTEM never matched and
+            # WsiAccount only matched when Principal.UserId was the bare
+            # string (which it is not on some builds).
+            -not (Test-IsSystemServiceAccount -UserId $(if ($_.Principal) { [string]$_.Principal.UserId } else { '' }))
         })
 
         if ($candidates.Count -gt 0) {
@@ -9987,8 +10021,17 @@ function Invoke-Step35 {
             Write-Log ("    [OK] Removed: {0}" -f $pkg.DisplayName) -Level OK
             $removedCount++
         } catch {
-            Write-Log ("    [WARN] Failed to remove {0}: {1}" -f $pkg.DisplayName, $_.Exception.Message) -Level WARN
-            $failedCount++
+            # [FIX-SILENT-3] ERROR_PATH_NOT_FOUND (0x80070003) means the
+            # on-disk payload is already gone; only the staging entry
+            # survives. This is not a real failure - treat as skip.
+            $errMsg = $_.Exception.Message
+            if ($errMsg -match 'cannot find the path|0x80070003|ERROR_PATH_NOT_FOUND') {
+                Write-Log ("    [SKIP] Orphaned staging entry (payload already gone): {0}" -f $pkg.DisplayName) -Level INFO
+                $skippedCount++
+            } else {
+                Write-Log ("    [WARN] Failed to remove {0}: {1}" -f $pkg.DisplayName, $errMsg) -Level WARN
+                $failedCount++
+            }
         }
     }
 
@@ -13104,9 +13147,29 @@ function Invoke-Step55 {
         }
     }
 
-    # ---- Rollback hint ----
+    # [FIX-SILENT-5] Re-read TCP global state and warn if the CUBIC change
+    # didn't persist. Without this check, Step 55 logs "success" every run
+    # while the provider stays at 'default' because a VPN or GPO is
+    # resetting it.
+    Start-Sleep -Milliseconds 500
+    $verifyOutput = ''
+    try {
+        $verifyOutput = (& netsh.exe int tcp show global 2>&1) -join "`r`n"
+    } catch { }
+    $verifyCc = $null
+    foreach ($line in ($verifyOutput -split "`r?`n")) {
+        if ($line -match 'Congestion Control Provider\s*:\s*(.*?)\s*$') {
+            $verifyCc = $Matches[1]
+            break
+        }
+    }
+
     if ($changes -gt 0) {
-        Write-Log ("Step 55 complete. {0} change(s) applied." -f $changes) -Level OK
+        if ($verifyCc -and ($verifyCc -notmatch 'cubic')) {
+            Write-Log ("  [WARN] Congestion provider reverted to '{0}' after set - likely overridden by VPN or policy." -f $verifyCc) -Level WARN
+        } else {
+            Write-Log ("Step 55 complete. {0} change(s) applied." -f $changes) -Level OK
+        }
     } else {
         Write-Log 'Step 55 complete. No changes needed.' -Level OK
     }
@@ -13703,6 +13766,14 @@ function Invoke-Step43 {
     $freedMB = [math]::Round($totalBytes / 1MB, 1)
 
     Write-Log ("UWP LocalCache summary: {0} matched, {1} cleared, {2} failed, {3:N1} MB reclaimed" -f $matched, $cleared, $failed, $freedMB) -Level INFO
+
+    # [FIX-SILENT-4] If every matched cache was already below the 1 MB
+    # threshold, don't claim SUCCESS as if caches were swept. That erodes
+    # trust in the report.
+    if ($cleared -eq 0 -and $failed -eq 0 -and $matched -gt 0) {
+        Write-Log ("All {0} matched UWP caches are already under 1 MB - no action needed." -f $matched) -Level INFO
+        $Script:LastStepStatus = 'OK'
+    }
 
 
     # ---- Microsoft Store cache reset (wsreset) ----
