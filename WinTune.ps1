@@ -1052,6 +1052,10 @@ function Register-DetachedExitTracking {
         [Parameter(Mandatory)][string]$Note
     )
 
+    # [FIX-DETACHED-1] Store the live Process handle. The prior
+    # Register-ObjectEvent -Action approach could not reach
+    # $Script:DetachedRunners from its event runspace, so exit codes
+    # were silently lost for every child that finished before PostCheck.
     $childPid = $Child.Id
     $Script:DetachedRunners[$childPid] = [PSCustomObject]@{
         Kind        = $Kind
@@ -1060,25 +1064,9 @@ function Register-DetachedExitTracking {
         ExitedAt    = $null
         ExitCode    = $null
         EventSource = $null
+        Process     = $Child
     }
-
-    try {
-        $srcId = "WinTuneDetached_$childPid"
-        $null = Register-ObjectEvent -InputObject $Child -EventName Exited -SourceIdentifier $srcId -Action {
-            $__pid   = $Event.MessageData.Pid
-            $__code  = $Event.Sender.ExitCode
-            $__now   = Get-Date
-            if ($Script:DetachedRunners -and $Script:DetachedRunners.ContainsKey($__pid)) {
-                $Script:DetachedRunners[$__pid].ExitedAt = $__now
-                $Script:DetachedRunners[$__pid].ExitCode = $__code
-            }
-        } -MessageData @{ Pid = $childPid }
-
-        $Script:DetachedRunners[$childPid].EventSource = $srcId
-        Write-Log ("  [TRACK] Subscribed to Exited event for PID {0} ({1})." -f $childPid, $Kind) -Level DEBUG
-    } catch {
-        Write-Log ("  [WARN] Could not subscribe to Exited event: {0}" -f $_.Exception.Message) -Level WARN
-    }
+    Write-Log ("  [TRACK] Registered PID {0} ({1}) - exit captured via Process handle" -f $childPid, $Kind) -Level DEBUG
 }
 
 
@@ -1115,33 +1103,101 @@ function Wait-DetachedRunners {
     # NOTE: $PID is a read-only automatic variable in PowerShell. Using
     # it as a foreach loop variable throws "Cannot overwrite variable
     # PID". Use $childPid instead.
+    # [FIX-DETACHED-2] Read ExitCode from the Process handle captured at
+    # launch. Get-Process -Id loses the exit code after process reaping.
     foreach ($childPid in $pending) {
         $entry = $Script:DetachedRunners[$childPid]
-        $proc  = Get-Process -Id $childPid -ErrorAction SilentlyContinue
+        $proc  = if ($entry.PSObject.Properties['Process']) { $entry.Process } else { $null }
         if (-not $proc) {
-            # Event handler already recorded the exit; if not, mark unknown
+            $proc = Get-Process -Id $childPid -ErrorAction SilentlyContinue
+        }
+        if (-not $proc) {
             if ($null -eq $entry.ExitCode) {
                 $entry.ExitedAt = Get-Date
                 $entry.ExitCode = -1
             }
             continue
         }
+        try {
+            if ($proc.HasExited) {
+                $entry.ExitedAt = $proc.ExitTime
+                $entry.ExitCode = $proc.ExitCode
+                continue
+            }
+        } catch { }
 
         if ((Get-Date) -gt $deadline) {
             Write-Log ("  [TIMEOUT] PID {0} ({1}) still running - leaving it detached" -f $childPid, $entry.Kind) -Level WARN
             continue
         }
-
         try {
-            $proc.WaitForExit([int]([Math]::Max(1000, ($deadline - (Get-Date)).TotalMilliseconds)))
-            $entry.ExitedAt = Get-Date
-            $entry.ExitCode = $proc.ExitCode
+            $remainingMs = [int]([Math]::Max(1000, ($deadline - (Get-Date)).TotalMilliseconds))
+            if ($proc.WaitForExit($remainingMs)) {
+                $entry.ExitedAt = $proc.ExitTime
+                $entry.ExitCode = $proc.ExitCode
+            } else {
+                Write-Log ("  [TIMEOUT] PID {0} ({1}) did not exit in time" -f $childPid, $entry.Kind) -Level WARN
+            }
         } catch {
             Write-Log ("  [WARN] Could not wait on PID {0}: {1}" -f $childPid, $_.Exception.Message) -Level WARN
         }
     }
 }
 
+
+# ============================================================
+# FIX 4: Detect already-running children of a given Kind
+# ============================================================
+# [FIX-DETACHED-4] Prevents Steps 8b/12/33/39 from stacking a new child
+# on top of a prior one still in flight. This is what causes the
+# SFC/DISM window accumulation across runs.
+$Script:RunnerKindMarkerFile = Join-Path $Script:ScriptDir 'WinTune.runners.json'
+
+function Get-ExistingDetachedRunnerProcess {
+    param([Parameter(Mandatory)][string]$Kind)
+    if (-not (Test-Path -LiteralPath $Script:RunnerKindMarkerFile)) { return @() }
+    try {
+        $tracked = Get-Content -LiteralPath $Script:RunnerKindMarkerFile -Raw -EA Stop | ConvertFrom-Json
+    } catch { return @() }
+    if (-not $tracked) { return @() }
+
+    $live = @()
+    foreach ($t in @($tracked)) {
+        if ($t.Kind -ne $Kind) { continue }
+        $p = Get-Process -Id $t.Pid -EA SilentlyContinue
+        if ($p -and -not $p.HasExited) {
+            $live += [PSCustomObject]@{ Pid = [int]$t.Pid; Kind = $t.Kind; StartedAt = $t.StartedAt; Note = $t.Note }
+        }
+    }
+    return $live
+}
+
+function Register-TrackedRunnerKind {
+    param(
+        [Parameter(Mandatory)][int]$Pid,
+        [Parameter(Mandatory)][string]$Kind,
+        [string]$Note = ''
+    )
+    $entry = [PSCustomObject]@{
+        Pid       = $Pid
+        Kind      = $Kind
+        Note      = $Note
+        StartedAt = (Get-Date).ToString('o')
+    }
+    $existing = @()
+    if (Test-Path -LiteralPath $Script:RunnerKindMarkerFile) {
+        try {
+            $raw = Get-Content -LiteralPath $Script:RunnerKindMarkerFile -Raw -EA SilentlyContinue
+            if ($raw) { $existing = @($raw | ConvertFrom-Json | Where-Object { (Get-Process -Id $_.Pid -EA SilentlyContinue) }) }
+        } catch { }
+    }
+    $all = @($existing) + $entry
+    try {
+        $all | ConvertTo-Json -Compress | Set-Content -LiteralPath $Script:RunnerKindMarkerFile -Encoding UTF8 -EA Stop
+    } catch {
+        Write-Log ("  [WARN] Could not persist runner tracking: {0}" -f $_.Exception.Message) -Level WARN
+    }
+}
 
 # ============================================================
 # SECURE RUNNER TEMP HELPER
@@ -5695,11 +5751,20 @@ function Invoke-Step08b {
         throw ("Detached runner prereq failure: {0}" -f $__prereq.Reason)
     }
 
+    $__existing = @(Get-ExistingDetachedRunnerProcess -Kind 'Drivers')
+    if ($__existing.Count -gt 0) {
+        Write-Log ("  [SKIP] Drivers runner already active (PID {0}, started {1})." -f $__existing[0].Pid, $__existing[0].StartedAt) -Level WARN
+        Write-Log '  Close the existing window first, or wait for it to exit, then re-run.' -Level WARN
+        $Script:LastStepStatus = 'Skipped'
+        return
+    }
+
     try {
         $child = Start-Process -FilePath $Script:RunnerPowerShellExe -ArgumentList "-NoExit -NoProfile -ExecutionPolicy Bypass -File `"$runnerPath`"" -PassThru
 
         Write-Log ("  [OK] Child PowerShell launched (PID {0})." -f $child.Id) -Level OK
         Register-DetachedExitTracking -Child $child -Kind 'Drivers' -Note 'Step 8b'
+        Register-TrackedRunnerKind -Pid $child.Id -Kind 'Drivers' -Note 'Step 8b'
         Write-Log '  WinTune will continue; driver audit runs independently.' -Level INFO
         Write-Log '  Look for the new window: "WinTune - Driver Update Runner"' -Level INFO
 
@@ -6332,11 +6397,20 @@ function Invoke-Step12 {
         throw ("Detached runner prereq failure: {0}" -f $__prereq.Reason)
     }
 
+    $__existing = @(Get-ExistingDetachedRunnerProcess -Kind 'SFC/DISM')
+    if ($__existing.Count -gt 0) {
+        Write-Log ("  [SKIP] SFC/DISM runner already active (PID {0}, started {1})." -f $__existing[0].Pid, $__existing[0].StartedAt) -Level WARN
+        Write-Log '  Close the existing window first, or wait for it to exit, then re-run.' -Level WARN
+        $Script:LastStepStatus = 'Skipped'
+        return
+    }
+
     try {
         $child = Start-Process -FilePath $Script:RunnerPowerShellExe -ArgumentList "-NoExit -NoProfile -ExecutionPolicy Bypass -File `"$runnerPath`"" -PassThru
 
         Write-Log ("  [OK] Child PowerShell launched (PID {0})." -f $child.Id) -Level OK
         Register-DetachedExitTracking -Child $child -Kind 'SFC/DISM' -Note 'Step 12'
+        Register-TrackedRunnerKind -Pid $child.Id -Kind 'SFC/DISM' -Note 'Step 12'
         Add-ReportRunner -Kind 'SFC/DISM' -RunnerPid $child.Id -Note 'Step 12'
         Write-Log '  WinTune will continue; repairs run independently.' -Level INFO
         Write-Log '  Look for the new window: "WinTune - SFC / DISM Repair"' -Level INFO
@@ -9613,11 +9687,20 @@ function Invoke-Step33 {
         throw ("Detached runner prereq failure: {0}" -f $__prereq.Reason)
     }
 
+    $__existing = @(Get-ExistingDetachedRunnerProcess -Kind 'Winget')
+    if ($__existing.Count -gt 0) {
+        Write-Log ("  [SKIP] Winget runner already active (PID {0}, started {1})." -f $__existing[0].Pid, $__existing[0].StartedAt) -Level WARN
+        Write-Log '  Close the existing window first, or wait for it to exit, then re-run.' -Level WARN
+        $Script:LastStepStatus = 'Skipped'
+        return
+    }
+
     try {
         $child = Start-Process -FilePath $Script:RunnerPowerShellExe -ArgumentList "-NoExit -NoProfile -ExecutionPolicy Bypass -File `"$runnerPath`"" -PassThru
 
         Write-Log ("  [OK] Child PowerShell launched (PID {0})." -f $child.Id) -Level OK
         Register-DetachedExitTracking -Child $child -Kind 'Winget' -Note 'Step 33'
+        Register-TrackedRunnerKind -Pid $child.Id -Kind 'Winget' -Note 'Step 33'
         Add-ReportRunner -Kind 'Winget' -RunnerPid $child.Id -Note 'Step 33'
         Write-Log '  WinTune will continue; winget upgrade runs independently.' -Level INFO
         Write-Log '  Look for the new window: "WinTune - Winget Upgrade (Full Detail Mode)"' -Level INFO
@@ -11095,12 +11178,21 @@ function Invoke-Step39 {
         throw ("Detached runner prereq failure: {0}" -f $__prereq.Reason)
     }
 
+    $__existing = @(Get-ExistingDetachedRunnerProcess -Kind 'Windows Update')
+    if ($__existing.Count -gt 0) {
+        Write-Log ("  [SKIP] Windows Update runner already active (PID {0}, started {1})." -f $__existing[0].Pid, $__existing[0].StartedAt) -Level WARN
+        Write-Log '  Close the existing window first, or wait for it to exit, then re-run.' -Level WARN
+        $Script:LastStepStatus = 'Skipped'
+        return
+    }
+
     try {
         # No -Wait so this returns immediately. Child is independent.
         $child = Start-Process -FilePath $Script:RunnerPowerShellExe -ArgumentList "-NoExit -NoProfile -ExecutionPolicy Bypass -File `"$runnerPath`"" -PassThru
 
         Write-Log ("  [OK] Child PowerShell launched (PID {0})." -f $child.Id) -Level OK
         Register-DetachedExitTracking -Child $child -Kind 'Windows Update' -Note 'Step 39'
+        Register-TrackedRunnerKind -Pid $child.Id -Kind 'Windows Update' -Note 'Step 39'
         Add-ReportRunner -Kind 'Windows Update' -RunnerPid $child.Id -Note 'Step 39'
         Write-Log '  WinTune will continue; Windows Update runs independently.' -Level INFO
         Write-Log '  Look for the new window with the banner: WinTune - Windows Update Installer' -Level INFO
@@ -13321,7 +13413,9 @@ function Write-HtmlReport {
         # ---- Embedded log ----
         # ---- Gather child runner logs (from D:\PS\WinTune_<Kind>.log) ----
         $__childLogsHtml = New-Object System.Text.StringBuilder
-        $__childLogNames = @('WinTune_SfcDism.log', 'WinTune_Winget.log', 'WinTune_WU.log')
+        # [FIX-DETACHED-6] Include the Drivers runner log so driver updates
+        # appear in the report.
+        $__childLogNames = @('WinTune_SfcDism.log', 'WinTune_Winget.log', 'WinTune_WU.log', 'WinTune_Drivers.log')
         foreach ($__childName in $__childLogNames) {
             $__childPath = Join-Path $Script:ScriptDir $__childName
             if (Test-Path -LiteralPath $__childPath) {
@@ -13363,6 +13457,18 @@ function Write-HtmlReport {
             '<div class="reboot-banner">REBOOT REQUIRED to complete pending changes</div>'
         } else { '' }
 
+        # [FIX-DETACHED-7] Banner when any detached runner is still executing.
+        $__stillRunning = 0
+        if ($Script:DetachedRunners) {
+            foreach ($k in $Script:DetachedRunners.Keys) {
+                $e = $Script:DetachedRunners[$k]
+                if ($null -eq $e.ExitCode) { $__stillRunning++ }
+            }
+        }
+        $detachedBanner = if ($__stillRunning -gt 0) {
+            ('<div class="detached-banner">{0} detached runner(s) still executing - see their window(s) and child log(s) below.</div>' -f $__stillRunning)
+        } else { '' }
+
         # ---- Assemble HTML ----
         $html = @"
 <!DOCTYPE html>
@@ -13382,6 +13488,8 @@ function Write-HtmlReport {
   .dry-banner, .reboot-banner { padding: 12px 28px; font-weight: 600; font-size: 14px; }
   .dry-banner { background: #e7f1ff; color: #0958d9; border-bottom: 1px solid #bae0ff; }
   .reboot-banner { background: #fff7e6; color: #d46b08; border-bottom: 1px solid #ffd591; }
+  .detached-banner { background: #f3e8ff; color: #6b21a8; border-bottom: 1px solid #d8b4fe;
+                     padding: 12px 28px; font-weight: 600; font-size: 14px; }
   .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
           gap: 1px; background: #e6e8eb; }
   .card { background: #fff; padding: 16px 20px; }
@@ -14074,8 +14182,23 @@ function Invoke-PostCheck {
     }
 
     # Report detached runner exit codes to the log
+    # [FIX-DETACHED-3] Harvest exit codes from the Process handle first so
+    # children that exited between dispatcher-end and PostCheck show up as
+    # "exited" rather than "still running".
     try {
         if ($Script:DetachedRunners -and $Script:DetachedRunners.Count -gt 0) {
+            foreach ($rPid in $Script:DetachedRunners.Keys) {
+                $r = $Script:DetachedRunners[$rPid]
+                if ($null -eq $r.ExitCode -and $r.PSObject.Properties['Process'] -and $r.Process) {
+                    try {
+                        if ($r.Process.HasExited) {
+                            $r.ExitedAt = $r.Process.ExitTime
+                            $r.ExitCode = $r.Process.ExitCode
+                        }
+                    } catch { }
+                }
+            }
+
             Write-Log 'Detached runner exit codes:' -Level INFO
             foreach ($rPid in $Script:DetachedRunners.Keys) {
                 $r = $Script:DetachedRunners[$rPid]
