@@ -64,7 +64,7 @@ param(
     [switch]$AllowPrefetch,
     [switch]$ForceKill,
     [switch]$SelfTest,
-    [int[]]$SkipSteps = @(),
+    [string[]]$SkipSteps = @(),
 
     # ---- New in v3.1 ----
     [switch]$AllowWinget,                                          # Step 33
@@ -301,8 +301,6 @@ $Script:StepNames = @{
     52 = 'Safe Service Trim'
     54 = 'Privacy and Start Menu Tweaks'
     55 = 'TCP Performance Tuning'
-    53 = 'Privacy and Start Menu Tweaks'
-    56 = 'TCP Performance Tuning'
     '1b' = 'SSD Fullness Check'
     '8b' = 'Driver Update Audit + Install (Detached)'
 }
@@ -1605,7 +1603,7 @@ try {
 
 function Add-ReportStep {
     param(
-        [Parameter(Mandatory)][int]$Number,
+        [Parameter(Mandatory)][string]$Number,
         [Parameter(Mandatory)][string]$Name,
         [Parameter(Mandatory)]
         [ValidateSet('OK','Skipped','Failed','Gated','DryRun','Warning','NoOp')]
@@ -1614,7 +1612,7 @@ function Add-ReportStep {
         [TimeSpan]$Duration = [TimeSpan]::Zero
     )
     [void]$Script:Report.Steps.Add([PSCustomObject]@{
-        Number   = $Number
+        Number   = [string]$Number
         Name     = $Name
         Status   = $Status
         Detail   = $Detail
@@ -1640,16 +1638,21 @@ function Test-StepEnabled {
     <#
     .SYNOPSIS
         Returns $true if the step should run.
+    .DESCRIPTION
+        Accepts either an int (1, 12, 55) or a string key with a
+        letter suffix (''1b'', ''8b''). -SkipSteps entries are compared
+        as strings so ''1b'' and ''8b'' do not collide with ''1'' and ''8''.
     #>
     [CmdletBinding()]
     [OutputType([bool])]
     param(
         [Parameter(Mandatory)]
-        [int]$StepNumber
+        [string]$StepKey
     )
 
-    if ($Script:SkipSteps -contains $StepNumber) {
-        Write-Log "Step $StepNumber skipped by -SkipSteps." -Level WARN
+    $skipStrings = @($Script:SkipSteps | ForEach-Object { [string]$_ })
+    if ($skipStrings -contains $StepKey) {
+        Write-Log "Step $StepKey skipped by -SkipSteps." -Level WARN
         return $false
     }
     return $true
@@ -2144,7 +2147,7 @@ function Reset-WUCache {
 
     .DESCRIPTION
         Recovery step for the WUA COM error "Value does not fall
-        within the expected range" — indicates a corrupted WU cache
+        within the expected range" â€” indicates a corrupted WU cache
         on some Windows 10/11 builds. Windows regenerates both
         cache folders on the next service start.
 
@@ -2396,7 +2399,7 @@ try {
         WU-Log '  Settings -> Windows Update -> Check for updates' 'INFO'
     }
     # Filter out driver updates from the display (they have no KB).
-    # Drivers are handled separately (audit-only) — not auto-installed.
+    # Drivers are handled separately (audit-only) â€” not auto-installed.
     $preFilterCount = $available.Count
     $available = @($available | Where-Object {
         $kbProp = $_.PSObject.Properties['KB']
@@ -8783,7 +8786,7 @@ function Invoke-Step32 {
     Write-Log ('Configuring {0} Defender ASR rules in {1}...' -f $asrRuleIds.Count, $actionMode) -Level INFO
 
     if ($Script:Step32GpoMode) {
-        Write-Log 'Skipping local ASR writes — domain policy is authoritative.' -Level INFO
+        Write-Log 'Skipping local ASR writes â€” domain policy is authoritative.' -Level INFO
         Write-Log 'Showing current ASR state for information only:' -Level INFO
         try {
             $pref = Get-MpPreference -ErrorAction Stop
@@ -10931,21 +10934,51 @@ function Invoke-Step42 {
         Write-Host ('   ... and {0} more' -f ($candidates.Count - 30)) -ForegroundColor DarkGray
     }
 
-    # ---- AUDIT ONLY ----
-    # The filename-family heuristic is not a reliable package-dependency
-    # model. Older folders in a "family" may still be required for repair
-    # or uninstall operations. We list candidates; we do NOT delete them.
+    # ---- Delete pass (gated by -AllowPackageCacheCleanup) ----
     if ($Script:DryRun) {
-        Write-Log ("[PREVIEW] Would list {0} superseded folders ({1:N1} MB)." -f $candidates.Count, $totalCandidateMB) -Level PREVIEW
+        Write-Log ("[PREVIEW] Would delete {0} superseded folders ({1:N1} MB)." -f $candidates.Count, $totalCandidateMB) -Level PREVIEW
+        foreach ($c in $candidates) {
+            Write-Host ('   [PREVIEW] {0,10:N0} KB  {1}' -f ($c.Size / 1KB), $c.Folder.Name) -ForegroundColor Magenta
+        }
+        Write-Log 'Step 42 complete (dry run).' -Level OK
+        return
     }
 
-    Write-Log 'Step 42 is AUDIT-ONLY.' -Level INFO
-    Write-Log 'The list above shows candidates based on a filename heuristic.' -Level INFO
-    Write-Log 'These are NOT safe to delete automatically.' -Level INFO
-    Write-Log 'If you want to reclaim space, review each candidate and delete manually.' -Level INFO
+    if (-not (Confirm-Action -Query ('Delete {0} superseded Package Cache folders ({1:N1} MB)?' -f $candidates.Count, $totalCandidateMB))) {
+        Write-Log 'Step 42 skipped by user.' -Level WARN
+        return
+    }
 
-    Write-Log 'Step 42 complete (audit only).' -Level OK
-    Write-Log '[SUCCESS] Superseded Package Cache candidates listed.' -Level OK
+    $deleted   = 0
+    $delFailed = 0
+    $freed     = [int64]0
+
+    foreach ($c in $candidates) {
+        $target = $c.Folder.FullName
+
+        # Defensive containment guard: refuse anything outside $cacheRoot
+        if (-not $target.StartsWith($cacheRoot, [StringComparison]::OrdinalIgnoreCase)) {
+            Write-Log ("  [WARN] Refused path outside Package Cache: {0}" -f $target) -Level WARN
+            $delFailed++
+            continue
+        }
+
+        try {
+            Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction Stop
+            $deleted++
+            $freed += [int64]$c.Size
+            Write-Log ("  [OK] Removed: {0} ({1:N0} KB)" -f $c.Folder.Name, ($c.Size / 1KB)) -Level OK
+        } catch {
+            $delFailed++
+            Write-Log ("  [WARN] Could not remove {0}: {1}" -f $c.Folder.Name, $_.Exception.Message) -Level WARN
+        }
+    }
+
+    $freedMB = [math]::Round($freed / 1MB, 1)
+    Write-Log ("Step 42 summary: {0} deleted, {1} failed, {2:N1} MB reclaimed" -f $deleted, $delFailed, $freedMB) -Level INFO
+
+    Write-Log 'Step 42 complete.' -Level OK
+    Write-Log '[SUCCESS] Superseded Package Cache folders removed.' -Level OK
 }
 
 # ============================================================
@@ -12138,7 +12171,7 @@ function Add-RollbackEntry {
         } | ConvertTo-Json -Compress
         Add-Content -LiteralPath $Script:RollbackManifestPath -Value $json -Encoding UTF8 -ErrorAction Stop
     } catch {
-        # Rollback is a safety guarantee — a write failure is not silent.
+        # Rollback is a safety guarantee â€” a write failure is not silent.
         Write-Log ("ROLLBACK MANIFEST WRITE FAILED: {0}" -f $_.Exception.Message) -Level ERROR
         Write-Log ("  Manifest path: {0}" -f $Script:RollbackManifestPath) -Level ERROR
         Write-Log ("  Change was applied but cannot be rolled back via -Rollback.") -Level WARN
@@ -12429,14 +12462,14 @@ function Invoke-Step55 {
                     try { $suppOut = (& netsh.exe int tcp show supplemental 2>&1) -join "`r`n" } catch { }
 
                     if ($suppOut -match 'cubic') {
-                        # CUBIC exists but set failed — that's a real problem
+                        # CUBIC exists but set failed â€” that's a real problem
                         Write-Log ("  [WARN] CUBIC set failed (supplemental: {0})" -f $ccOutput.Trim()) -Level WARN
                         Write-Log ("  [WARN] Legacy set also failed: {0}" -f $ccOutput2.Trim()) -Level WARN
                     } else {
-                        # CUBIC isn't offered on this build — the default is already optimal
+                        # CUBIC isn't offered on this build â€” the default is already optimal
                         Write-Log '  [SKIP] CUBIC not offered by this build''s TCP stack.' -Level INFO
                         Write-Log '  Windows 11 24H2+ uses CUBIC as the default congestion provider.' -Level INFO
-                        Write-Log '  No action needed — the current provider is already optimal.' -Level INFO
+                        Write-Log '  No action needed â€” the current provider is already optimal.' -Level INFO
                     }
                 }
             }
@@ -13308,18 +13341,26 @@ function Main {
 
         for ($i = 0; $i -lt $stepFunctions.Count; $i++) {
             $stepName = $stepFunctions[$i]
+            # Extract the full key, including any letter suffix (''1b'', ''8b'').
             $stepNumStr = if ($stepName -match 'Invoke-Step(\d+[a-z]?)') { $Matches[1] } else { [string]($i + 1) }
-            # FIX-1: normalize step number string — strip leading zeros so "01" -> "1",
-            # "01b" -> "1b", "08b" -> "8b", matching $Script:StepNames keys.
+            # Normalize leading zeros: "01" -> "1", "01b" -> "1b", "08b" -> "8b"
             $stepNumStr = $stepNumStr -replace '^0+(\d)', '$1'
             $stepNum = if ($stepNumStr -match '^(\d+)') { [int]$Matches[1] } else { $i + 1 }
 
-            if (-not (Test-StepEnabled $stepNum)) { continue }
+            # Use the full key (with suffix) for skip checks and report rows
+            if (-not (Test-StepEnabled $stepNumStr)) { continue }
 
             if (Get-Command $stepName -ErrorAction SilentlyContinue) {
                 Write-Log '' -Level INFO
                 Write-Log ('=' * 60) -Level STEP
-                Write-Log ('Step {0}: {1}' -f $stepNumStr, $Script:StepNames[$stepNumStr]) -Level STEP
+                $__stepDisplayName = if ($Script:StepNames.ContainsKey($stepNumStr)) {
+    $Script:StepNames[$stepNumStr]
+} elseif ($Script:StepNames.ContainsKey([int]$stepNum)) {
+    $Script:StepNames[[int]$stepNum]
+} else {
+    $stepName
+}
+                Write-Log ('Step {0}: {1}' -f $stepNumStr, $__stepDisplayName) -Level STEP
                 Write-Log ('=' * 60) -Level STEP
 
                 $stepSw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -13339,12 +13380,12 @@ function Main {
                 }
                 $stepSw.Stop()
 
-                $rptName = if ($Script:StepNames.ContainsKey($stepNum)) { $Script:StepNames[$stepNum] } else { $stepName }
-                Add-ReportStep -Number $stepNum -Name $rptName -Status $stepStatus -Detail $stepDetail -Duration $stepSw.Elapsed
+                $rptName = if ($Script:StepNames.ContainsKey($stepNumStr)) { $Script:StepNames[$stepNumStr] } else { $stepName }
+                Add-ReportStep -Number $stepNumStr -Name $rptName -Status $stepStatus -Detail $stepDetail -Duration $stepSw.Elapsed
             } else {
                 Write-Log ("Step function {0} not found - skipping." -f $stepName) -Level WARN
-                $rptName = if ($Script:StepNames.ContainsKey($stepNum)) { $Script:StepNames[$stepNum] } else { $stepName }
-                Add-ReportStep -Number $stepNum -Name $rptName -Status 'Skipped' ` -Detail 'Function not found'
+                $rptName = if ($Script:StepNames.ContainsKey($stepNumStr)) { $Script:StepNames[$stepNumStr] } else { $stepName }
+                Add-ReportStep -Number $stepNumStr -Name $rptName -Status 'Skipped' -Detail 'Function not found'
             }
         }
 
