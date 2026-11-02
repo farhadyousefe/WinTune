@@ -1316,22 +1316,7 @@ function Write-Log {
     }
 }
 
-function Write-LogRaw {
-    <#  Writes a raw line to the log file only (no console).
-        Used for capturing native tool output.  #>
-    param(
-        [Parameter(Mandatory, ValueFromPipeline)]
-        [AllowEmptyString()]
-        [string[]]$InputObject
-    )
-    process {
-        foreach ($line in $InputObject) {
-            try {
-                Write-LogFile -Message $line
-            } catch { }
-        }
-    }
-}
+# [REMOVED-LOGRAM] Write-LogRaw (was dead code - see Clean-DeadCode.ps1)
 
 
 # ============================================================
@@ -1767,99 +1752,7 @@ function Invoke-NativeCommand {
 # ============================================================
 # HELPER: Run native command with live heartbeat
 # ============================================================
-function Invoke-NativeWithHeartbeat {
-    <#
-    .SYNOPSIS
-        Runs a native executable and streams its output live while
-        also printing a periodic heartbeat dot so the user knows
-        the process is still alive.
-
-    .PARAMETER FilePath
-        Executable to run.
-
-    .PARAMETER Arguments
-        Argument array.
-
-    .PARAMETER HeartbeatSeconds
-        How often to print a heartbeat dot (default 5s).
-
-    .OUTPUTS
-        Exit code as [int].
-    #>
-    [CmdletBinding()]
-    [OutputType([int])]
-    param(
-        [Parameter(Mandatory)][string]$FilePath,
-        [string[]]$Arguments = @(),
-        [int]$HeartbeatSeconds = 5
-    )
-
-    $startTime      = Get-Date
-    $lastOutput     = Get-Date
-
-    # Start the process with stdout redirected to a temp file we tail
-    $tmpOut = [System.IO.Path]::GetTempFileName()
-
-    $proc = Start-Process -FilePath $FilePath -ArgumentList $Arguments -NoNewWindow -PassThru -RedirectStandardOutput $tmpOut
-
-    # Open with FileShare.ReadWrite so both our reader and the
-    # redirecting process can access the file simultaneously
-    $fs = [System.IO.File]::Open($tmpOut, [System.IO.FileMode]::Open,
-                                  [System.IO.FileAccess]::Read,
-                                  [System.IO.FileShare]::ReadWrite)
-    $reader = New-Object System.IO.StreamReader($fs)
-    $lastPos = 0
-
-    while (-not $proc.HasExited) {
-        Start-Sleep -Milliseconds 500
-
-        # Read any new output
-        try {
-            $reader.BaseStream.Seek($lastPos, [System.IO.SeekOrigin]::Begin) | Out-Null
-            $chunk = $reader.ReadToEnd()
-            $lastPos = $reader.BaseStream.Position
-
-            if ($chunk) {
-                foreach ($segment in ($chunk -split "`r|`n")) {
-                    $line = $segment.Trim()
-                    if ([string]::IsNullOrWhiteSpace($line)) { continue }
-                    Write-Host ("  {0}" -f $line) -ForegroundColor DarkGray
-                    Write-LogFile -Message $line
-                    $lastOutput = Get-Date
-                }
-            }
-        } catch { }
-
-        # Heartbeat if no output for N seconds
-        $sinceOutput = (Get-Date) - $lastOutput
-        if ($sinceOutput.TotalSeconds -ge $HeartbeatSeconds) {
-            $elapsed = (Get-Date) - $startTime
-            Write-Host ("  . (still running - {0:N0} min elapsed)" -f $elapsed.TotalMinutes) -ForegroundColor DarkYellow
-            $lastOutput = Get-Date
-        }
-    }
-
-    # Drain any remaining output
-    try {
-        $reader.BaseStream.Seek($lastPos, [System.IO.SeekOrigin]::Begin) | Out-Null
-        $remaining = $reader.ReadToEnd()
-        if ($remaining) {
-            foreach ($segment in ($remaining -split "`r|`n")) {
-                $line = $segment.Trim()
-                if (-not [string]::IsNullOrWhiteSpace($line)) {
-                    Write-Host ("  {0}" -f $line) -ForegroundColor DarkGray
-                    Write-LogFile -Message $line
-                }
-            }
-        }
-    } catch { }
-
-    $reader.Close()
-    $fs.Close()
-    Remove-Item $tmpOut -Force -ErrorAction SilentlyContinue
-
-    return $proc.ExitCode
-}
+# [REMOVED-NATWHB] Invoke-NativeWithHeartbeat (was dead code - see Clean-DeadCode.ps1)
 
 
 # ============================================================
@@ -1945,31 +1838,7 @@ function Confirm-Action {
 # ============================================================
 # HELPERS - PROGRESS WRAPPER
 # ============================================================
-function Invoke-WithProgress {
-    <#
-    .SYNOPSIS
-        Runs a script block while showing a Write-Progress bar.
-    .PARAMETER Activity
-        Top-level activity name.
-    .PARAMETER Status
-        Status text.
-    .PARAMETER ScriptBlock
-        Code to execute.
-    #>
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)][string]$Activity,
-        [Parameter(Mandatory)][string]$Status,
-        [Parameter(Mandatory)][ScriptBlock]$ScriptBlock
-    )
-
-    Write-Progress -Activity $Activity -Status $Status -PercentComplete 0
-    try {
-        & $ScriptBlock
-    } finally {
-        Write-Progress -Activity $Activity -Completed
-    }
-}
+# [REMOVED-WITHPROG] Invoke-WithProgress (was dead code - see Clean-DeadCode.ps1)
 
 
 # ============================================================
@@ -2592,95 +2461,7 @@ try {
 # ============================================================
 # HELPER: Windows Update Cache Reset
 # ============================================================
-function Reset-WUCache {
-    <#
-    .SYNOPSIS
-        Stops Windows Update services, renames SoftwareDistribution
-        and catroot2 to timestamped backups, restarts services.
-
-    .DESCRIPTION
-        Recovery step for the WUA COM error "Value does not fall
-        within the expected range" â€” indicates a corrupted WU cache
-        on some Windows 10/11 builds. Windows regenerates both
-        cache folders on the next service start.
-
-    .OUTPUTS
-        [bool] $true on success, $false on failure.
-    #>
-    [CmdletBinding()]
-    [OutputType([bool])]
-    param()
-
-    try {
-        # Stop services (order doesn't strictly matter)
-        foreach ($svc in 'wuauserv', 'bits', 'cryptsvc', 'appidsvc') {
-            try {
-                Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
-            } catch { }
-        }
-        Start-Sleep -Seconds 3
-
-        # ---- Wait for SoftwareDistribution handles to release ----
-        $sd = Join-Path $env:SystemRoot 'SoftwareDistribution'
-        $cr = Join-Path $env:SystemRoot 'System32\catroot2'
-
-        $waitDeadline = (Get-Date).AddSeconds(10)
-        $canRenameSd  = $false
-        while ((Get-Date) -lt $waitDeadline) {
-            try {
-                if (Test-Path -LiteralPath $sd) {
-                    $probe = [System.IO.File]::Open((Join-Path $sd 'Download'),
-                        [System.IO.FileMode]::Open,
-                        [System.IO.FileAccess]::ReadWrite,
-                        [System.IO.FileShare]::None)
-                    $probe.Close(); $probe.Dispose()
-                }
-                $canRenameSd = $true
-                break
-            } catch {
-                Start-Sleep -Milliseconds 500
-            }
-        }
-
-        if (-not $canRenameSd) {
-            return @{ Ok = $false; Reason = 'SoftwareDistribution\Download still locked after 10s (wuauserv may not have fully stopped)' }
-        }
-
-        # Rename caches with timestamp so old state is preserved
-        $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-        try {
-            if (Test-Path -LiteralPath $sd) {
-                Rename-Item -LiteralPath $sd -NewName "SoftwareDistribution.old_$stamp" -Force -ErrorAction Stop
-            }
-            if (Test-Path -LiteralPath $cr) {
-                Rename-Item -LiteralPath $cr -NewName "catroot2.old_$stamp" -Force -ErrorAction Stop
-            }
-        } catch {
-            return @{ Ok = $false; Reason = ("Rename failed: {0}" -f $_.Exception.Message) }
-        }
-
-        # Restart services (cryptsvc first so wuauserv can bind)
-        foreach ($svc in 'cryptsvc', 'bits', 'wuauserv', 'appidsvc') {
-            try {
-                Start-Service -Name $svc -ErrorAction SilentlyContinue -WarningAction SilentlyContinue
-            } catch { }
-        }
-        Start-Sleep -Seconds 3
-
-        # Verify wuauserv is running - poll for up to 30 seconds
-        $deadline = (Get-Date).AddSeconds(30)
-        while ((Get-Date) -lt $deadline) {
-            $wu = Get-Service -Name wuauserv -ErrorAction SilentlyContinue
-            if ($wu -and $wu.Status -eq 'Running') {
-                return @{ Ok = $true; Reason = 'ok' }
-            }
-            Start-Sleep -Seconds 2
-        }
-        return @{ Ok = $false; Reason = 'wuauserv did not return to Running within 30s after cache reset' }
-    } catch {
-        return @{ Ok = $false; Reason = ("Reset-WUCache outer error: {0}" -f $_.Exception.Message) }
-    }
-}
+# [REMOVED-RESETWU] Reset-WUCache (was dead code - see Clean-DeadCode.ps1)
 
 # ============================================================
 # STEP 1: Clean System-Wide Junk
@@ -6453,40 +6234,7 @@ function Invoke-Step13 {
 # ============================================================
 # HELPER: DISM Exit Code Interpretation
 # ============================================================
-function Get-DismErrorDescription {
-    <#
-    .SYNOPSIS
-        Maps common DISM /RestoreHealth exit codes to human-readable
-        descriptions for logging.
-
-    .PARAMETER ExitCode
-        The signed integer exit code from DISM.
-    #>
-    [CmdletBinding()]
-    [OutputType([string])]
-    param(
-        [Parameter(Mandatory)]
-        [int]$ExitCode
-    )
-
-    # DISM uses HRESULT-style codes; we mask to unsigned for lookup
-    $code = '{0:X8}' -f $ExitCode
-
-    switch ($code) {
-        '00000000' { return 'Success.' }
-        '800F081F' { return 'Source files could not be found. Check Windows Update connectivity.' }
-        '800F0906' { return 'Source files could not be downloaded. Network or proxy issue likely.' }
-        '800F0907' { return 'DISM does not support servicing this Windows version.' }
-        '800F0908' { return 'No valid source files available. Run Windows Update first.' }
-        '800F0909' { return 'Repair content not found. The image may be too corrupted.' }
-        '800F081E' { return 'The specified package is not applicable to this image.' }
-        '800F0A12' { return 'The component store is corrupt and cannot be mounted.' }
-        '80070005' { return 'Access denied. Ensure you are running as Administrator.' }
-        '8007000E' { return 'Out of memory. Close other applications and retry.' }
-        '800F0A13' { return 'The component store cannot be serviced while in use. Reboot and retry.' }
-        default    { return $null }
-    }
-}
+# [REMOVED-DISMDESC] Get-DismErrorDescription (was dead code - see Clean-DeadCode.ps1)
 
 # ============================================================
 # STEP 14: Component Store Base Optimization
