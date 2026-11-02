@@ -3214,23 +3214,58 @@ function Invoke-Step01 {
     }
 
     # ---- Stop services (dosvc first, since it holds DO cache handles) ----
+    # Each stop is bounded at 30 seconds. If a service doesn't reach
+    # Stopped in time, we mark it "still running" and skip the cache
+    # cleanups that depend on that service being stopped. This prevents
+    # the historical indefinite hang when wuauserv had active WU work.
     $servicesToStop = @('dosvc', 'wuauserv', 'bits', 'cryptsvc')
     $stoppedServices = @()
+    $stillRunningServices = @()
 
     foreach ($svc in $servicesToStop) {
         $svcObj = Get-Service -Name $svc -ErrorAction SilentlyContinue
         if (-not $svcObj) { continue }
 
-        if ($svcObj.Status -eq 'Running') {
-            try {
-                Stop-Service -Name $svc -Force -ErrorAction Stop
-                Write-Log ("  [OK] Stopped: {0}" -f $svc) -Level OK
-                $stoppedServices += $svc
-            } catch {
-                Write-Log ("  [WARN] Could not stop {0}: {1}" -f $svc, $_.Exception.Message) -Level WARN
-            }
-        } else {
+        if ($svcObj.Status -ne 'Running') {
             Write-Log ("  {0} already stopped." -f $svc) -Level DEBUG
+            $stoppedServices += $svc   # treat as stopped; cache is safe to clear
+            continue
+        }
+
+        # Fire-and-forget stop, then poll HasExited with a 30s timeout.
+        # Stop-Service's own -Wait has no timeout; this is the only way to
+        # bound it without spawning a background job.
+        Write-Log ("  Stopping {0} (30s timeout)..." -f $svc) -Level INFO
+        $stopSw = [System.Diagnostics.Stopwatch]::StartNew()
+        try {
+            # Redirect stderr to NUL so the "WARNING: Waiting for service"
+            # lines don't flood the console. Start-Process -NoNewWindow
+            # still shows stdout, but sc.exe writes to stderr.
+            $null = Start-Process -FilePath 'sc.exe' -ArgumentList "stop $svc" -NoNewWindow -Wait -RedirectStandardOutput "$env:TEMP\sc_stop_$svc.out" -RedirectStandardError "$env:TEMP\sc_stop_$svc.err" -ErrorAction Stop
+            Remove-Item "$env:TEMP\sc_stop_$svc.out","$env:TEMP\sc_stop_$svc.err" -Force -ErrorAction SilentlyContinue
+        } catch {
+            Write-Log ("  [WARN] sc.exe stop {0} failed: {1}" -f $svc, $_.Exception.Message) -Level WARN
+        }
+
+        # Poll for Stopped status
+        $deadline = (Get-Date).AddSeconds(30)
+        $becameStopped = $false
+        while ((Get-Date) -lt $deadline) {
+            $s = Get-Service -Name $svc -ErrorAction SilentlyContinue
+            if ($s -and $s.Status -eq 'Stopped') {
+                $becameStopped = $true
+                break
+            }
+            Start-Sleep -Milliseconds 500
+        }
+        $stopSw.Stop()
+
+        if ($becameStopped) {
+            Write-Log ("  [OK] Stopped: {0} ({1:N1}s)" -f $svc, $stopSw.Elapsed.TotalSeconds) -Level OK
+            $stoppedServices += $svc
+        } else {
+            Write-Log ("  [WARN] {0} still not Stopped after 30s (skipping its cache clear)" -f $svc) -Level WARN
+            $stillRunningServices += $svc
         }
     }
 
@@ -3297,6 +3332,19 @@ function Invoke-Step01 {
 
         if (-not $path -or -not (Test-Path -LiteralPath $path)) {
             Write-Log ("  [SKIP] Not present: {0}" -f $name) -Level DEBUG
+            $skippedCount++
+            continue
+        }
+
+        # Skip cache targets whose owning service is still running.
+        # Deleting a running service's cache leaves it broken until reboot.
+        $requiresService = switch -Regex ($name) {
+            'Windows Update Cache|Windows Update Logs'      { 'wuauserv' }
+            'Delivery Optimization Cache'                   { 'dosvc' }
+            default                                          { $null }
+        }
+        if ($requiresService -and ($stillRunningServices -contains $requiresService)) {
+            Write-Log ("  [SKIP] {0} - {1} still running" -f $name, $requiresService) -Level WARN
             $skippedCount++
             continue
         }
@@ -8632,15 +8680,38 @@ function Invoke-Step29 {
     # ============================================================
     # LAYER 1: Disable SMB1 via Windows Optional Features (DISM)
     # ============================================================
+    # Pre-flight: if CBS has a pending reboot, Get-WindowsOptionalFeature
+    # will block for 5-20 minutes while TrustedInstaller tries to service
+    # the pending operation. Skip Step 29 entirely in that state and let
+    # the user reboot first.
+    $__cbsPending = Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
+    if ($__cbsPending) {
+        Write-Log 'Step 29 skipped: CBS reboot pending (TrustedInstaller will block).' -Level WARN
+        Write-Log '  Reboot first, then re-run WinTune to disable SMBv1.' -Level WARN
+        return
+    }
+
     Write-Log 'Running deep component store checks on SMB1 infrastructure...' -Level INFO
     Write-Log 'Engaging TrustedInstaller subsystem - Please do not close this console...' -Level INFO
 
     try {
-        # Enumerate all SMB1Protocol* features currently enabled
-        $features = Get-WindowsOptionalFeature -Online -ErrorAction Stop |
-                    Where-Object {
-                        $_.FeatureName -like 'SMB1Protocol*' -and $_.State -eq 'Enabled'
-                    }
+        # Enumerate SMB1Protocol* features in a background job with a 60s
+        # timeout. Get-WindowsOptionalFeature is un-interruptible by Ctrl+C
+        # on some Windows builds, so a job is the only way to bound it.
+        $__job = Start-Job -ScriptBlock {
+            Get-WindowsOptionalFeature -Online -ErrorAction Stop |
+                Where-Object { $_.FeatureName -like 'SMB1Protocol*' -and $_.State -eq 'Enabled' }
+        }
+        $__completed = Wait-Job -Job $__job -Timeout 60
+        if (-not $__completed) {
+            Stop-Job -Job $__job -ErrorAction SilentlyContinue
+            Remove-Job -Job $__job -Force -ErrorAction SilentlyContinue
+            Write-Log 'Step 29 skipped: Get-WindowsOptionalFeature timed out after 60s.' -Level WARN
+            Write-Log '  TrustedInstaller is busy. Reboot and re-run to disable SMBv1.' -Level WARN
+            return
+        }
+        $features = Receive-Job -Job $__job -ErrorAction Stop
+        Remove-Job -Job $__job -Force -ErrorAction SilentlyContinue
 
         if ($features -and @($features).Count -gt 0) {
             foreach ($feature in $features) {
