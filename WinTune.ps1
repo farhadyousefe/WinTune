@@ -4952,8 +4952,17 @@ try {
                     2 { DR-Log ("  [OK] Installed: {0}" -f $row.Title) 'OK'; $okCount++ }
                     3 { DR-Log ("  [WARN] Installed with errors: {0}" -f $row.Title) 'WARN'; $okCount++ }
                     4 {
-                        $hresHex = if ($effectiveHResult -ne 0) { (' (0x{0:X8})' -f $effectiveHResult) } else { '' }
-                        DR-Log ("  [FAIL] Failed{0}: {1}" -f $hresHex, $row.Title) 'ERROR'
+                        $hresHex  = if ($effectiveHResult -ne 0) { ('0x{0:X8}' -f $effectiveHResult) } else { '0x80240022' }
+                        $hresName = switch ($effectiveHResult) {
+                            -2145124329 { 'WU_E_NOT_APPLICABLE - driver does not match this system' }
+                            -2145124320 { 'WU_E_INSTALL_NOT_ALLOWED - another install in progress' }
+                            -2145124307 { 'WU_E_SOURCE_ABSENT - reboot required before install' }
+                            -2144796149 { 'WU_E_USER_LOGON_REQUIRED - needs user interaction' }
+                            -2145124341 { 'WU_E_CALL_CANCELLED - cancelled' }
+                            -2147024891 { 'E_ACCESSDENIED - permission denied' }
+                            default     { 'unknown WU error' }
+                        }
+                        DR-Log ("  [FAIL] Failed {0} ({1}): {2}" -f $hresHex, $hresName, $row.Title) 'ERROR'
                         $failCount++
                     }
                     5 { DR-Log ("  [FAIL] Aborted: {0}" -f $row.Title) 'ERROR'; $failCount++ }
