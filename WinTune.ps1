@@ -114,7 +114,11 @@ param(
 
     # ---- New in v3.7 (TCP / VBS additions) ----
     [switch]$AllowTcpTuning,                                    # Step 55 - TCP performance tuning
-    [switch]$AllowVbsAudit                                      # Step 24 enhancement - VBS/HVCI audit
+    [switch]$AllowVbsAudit,                                     # Step 24 enhancement - VBS/HVCI audit
+
+    # ---- Detached runner tracking ----
+    [switch]$WaitForDetached,                                   # Wait indefinitely for all children before PostCheck
+    [int]$DetachedWaitSeconds = 0                               # Wait up to N seconds (0 = don't wait)
 )
 
 # ---- B1 fix: shadow the reserved $Profile automatic variable ----
@@ -134,6 +138,12 @@ $Script:ScriptDir    = Split-Path -Parent $Script:ScriptPath
 $Script:ScriptName   = Split-Path -Leaf   $Script:ScriptPath
 $Script:RunStamp     = Get-Date -Format 'yyyyMMdd_HHmmss'
 $Script:LogFile      = Join-Path $Script:ScriptDir 'WinTune.log'
+
+# ---- Resolve the runner host once, at load time ----
+# Prefer pwsh.exe (PowerShell 7) when available so detached runners
+# use the same engine as the parent shell. Fall back to powershell.exe.
+$__pwsh = Get-Command pwsh.exe -ErrorAction SilentlyContinue
+$Script:PowerShellExe = if ($__pwsh) { $__pwsh.Source } else { (Get-Command powershell.exe -ErrorAction Stop).Source }
 
 # ---- Log rotation: if the file is over 5 MB, rotate to timestamped file
 # ---- and keep the 3 most recent rotated logs. Never silently delete. ----
@@ -212,6 +222,10 @@ $Script:AllowTcpTuning     = $AllowTcpTuning.IsPresent
 $Script:AllowVbsAudit      = $AllowVbsAudit.IsPresent
 $Script:RollbackMode       = $Rollback.IsPresent
 $Script:InRollbackMode   = $false
+
+# Detached runner tracking (populated by Fix A; consumed by Fix C)
+$Script:WaitForDetached     = $WaitForDetached.IsPresent
+$Script:DetachedWaitSeconds = [int]$DetachedWaitSeconds
 $Script:RollbackFrom       = $RollbackFrom
 $Script:RollbackEntries    = New-Object System.Collections.ArrayList
 $Script:BackupDir         = $null
@@ -252,6 +266,15 @@ $Script:LockStream          = $null
 $Script:RebootRequired      = $false
 $Script:RebootReasons       = New-Object System.Collections.ArrayList
 $Script:LastStepStatus      = $null   # set by steps that want non-default report status
+
+# Detached runner tracking (populated by Fix A / Fix B / Fix C)
+#   Key: PID (int)
+#   Value: PSCustomObject { Kind; Note; StartedAt; ExitedAt; ExitCode; EventSource }
+# Note: $Script:WaitForDetached and $Script:DetachedWaitSeconds are
+# initialized from the CLI parameters in the RollbackMode block below
+# (Fix C2). Do not initialize them here â€” that would clobber the CLI
+# values when this block runs after the parameter assignment block.
+$Script:DetachedRunners     = @{}
 $Script:ResetBaseStatus     = $null
 
 
@@ -821,6 +844,184 @@ try {
     Pause-Exit -ExitCode 1
 }
 '@
+# ============================================================
+# DETACHED RUNNER PRE-LAUNCH HELPER (Fix B)
+# ============================================================
+function Test-DetachedLaunchPrereqs {
+    <#
+    .SYNOPSIS
+        Verifies that a child PowerShell can actually run before the
+        parent commits to launching a detached step. Catches the case
+        where $Script:PowerShellExe is broken, ExecutionPolicy blocks
+        the runner, or the child cannot execute at all.
+    .OUTPUTS
+        [PSCustomObject] with .Ok (bool) and .Reason (string).
+    #>
+    [CmdletBinding()]
+    [OutputType([PSCustomObject])]
+    param()
+
+    # 0. Self-heal: if $Script:PowerShellExe was never populated, resolve now.
+    #    This guards against the class of bug where the launch sites were
+    #    substituted to use $Script:PowerShellExe before the resolver was
+    #    inserted.
+    $__exe = $null
+    try {
+        $__exe = $Script:PowerShellExe
+    } catch { }
+    if ([string]::IsNullOrWhiteSpace($__exe)) {
+        try {
+            $__pwshCmd = Get-Command pwsh.exe -ErrorAction SilentlyContinue
+            if ($__pwshCmd) {
+                $__exe = $__pwshCmd.Source
+            } else {
+                $__exe = (Get-Command powershell.exe -ErrorAction Stop).Source
+            }
+            $Script:PowerShellExe = $__exe
+        } catch {
+            return [PSCustomObject]@{ Ok = $false; Reason = ("Could not resolve runner host: {0}" -f $_.Exception.Message) }
+        }
+    }
+
+    # 1. Resolver present?
+    if ([string]::IsNullOrWhiteSpace($__exe)) {
+        return [PSCustomObject]@{ Ok = $false; Reason = 'PowerShellExe not resolved' }
+    }
+
+    # 2. Executable present on disk?
+    if (-not (Test-Path -LiteralPath $__exe)) {
+        return [PSCustomObject]@{ Ok = $false; Reason = ("PowerShellExe not found: {0}" -f $__exe) }
+    }
+
+    # 3. Child can launch and exit 0? (100ms probe)
+    try {
+        $probe = Start-Process -FilePath $__exe `
+                               -ArgumentList '-NoProfile','-NonInteractive','-Command','exit 0' `
+                               -PassThru -Wait -WindowStyle Hidden
+        if ($probe.ExitCode -ne 0) {
+            return [PSCustomObject]@{ Ok = $false; Reason = ("Probe exit code {0}" -f $probe.ExitCode) }
+        }
+    } catch {
+        return [PSCustomObject]@{ Ok = $false; Reason = ("Probe failed: {0}" -f $_.Exception.Message) }
+    }
+
+    return [PSCustomObject]@{ Ok = $true; Reason = 'ok' }
+}
+
+
+# ============================================================
+# DETACHED RUNNER EXIT TRACKING (Fix A)
+# ============================================================
+function Register-DetachedExitTracking {
+    <#
+    .SYNOPSIS
+        Subscribes to $Child.Exited and records the exit code in
+        $Script:DetachedRunners when the child dies. Does not block.
+    .PARAMETER Child
+        Process object from Start-Process -PassThru.
+    .PARAMETER Kind
+        Human label ("Winget", "SFC/DISM", "Windows Update", "Drivers").
+    .PARAMETER Note
+        Step identifier ("Step 33", etc.).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][System.Diagnostics.Process]$Child,
+        [Parameter(Mandatory)][string]$Kind,
+        [Parameter(Mandatory)][string]$Note
+    )
+
+    $childPid = $Child.Id
+    $Script:DetachedRunners[$childPid] = [PSCustomObject]@{
+        Kind        = $Kind
+        Note        = $Note
+        StartedAt   = Get-Date
+        ExitedAt    = $null
+        ExitCode    = $null
+        EventSource = $null
+    }
+
+    try {
+        $srcId = "WinTuneDetached_$childPid"
+        $null = Register-ObjectEvent -InputObject $Child -EventName Exited -SourceIdentifier $srcId -Action {
+            $__pid   = $Event.MessageData.Pid
+            $__code  = $Event.Sender.ExitCode
+            $__now   = Get-Date
+            if ($Script:DetachedRunners -and $Script:DetachedRunners.ContainsKey($__pid)) {
+                $Script:DetachedRunners[$__pid].ExitedAt = $__now
+                $Script:DetachedRunners[$__pid].ExitCode = $__code
+            }
+        } -MessageData @{ Pid = $childPid }
+
+        $Script:DetachedRunners[$childPid].EventSource = $srcId
+        Write-Log ("  [TRACK] Subscribed to Exited event for PID {0} ({1})." -f $childPid, $Kind) -Level DEBUG
+    } catch {
+        Write-Log ("  [WARN] Could not subscribe to Exited event: {0}" -f $_.Exception.Message) -Level WARN
+    }
+}
+
+
+# ============================================================
+# DETACHED RUNNER WAIT HELPER (Fix C)
+# ============================================================
+function Wait-DetachedRunners {
+    <#
+    .SYNOPSIS
+        Waits for detached runner processes to exit and records their
+        exit codes. Called from PostCheck.
+    .PARAMETER MaxSeconds
+        Upper bound on total wait. -1 = infinite. 0 = don't wait.
+    #>
+    [CmdletBinding()]
+    param([int]$MaxSeconds = 0)
+
+    if ($MaxSeconds -eq 0 -or -not $Script:DetachedRunners -or $Script:DetachedRunners.Count -eq 0) {
+        return
+    }
+
+    $deadline = if ($MaxSeconds -lt 0) { [datetime]::MaxValue } else { (Get-Date).AddSeconds($MaxSeconds) }
+    $pending = @($Script:DetachedRunners.Keys | Where-Object {
+        $null -eq $Script:DetachedRunners[$_].ExitCode
+    })
+
+    if ($pending.Count -eq 0) {
+        return
+    }
+
+    Write-Log ("Waiting for {0} detached runner(s) (max {1})..." -f $pending.Count,
+        $(if ($MaxSeconds -lt 0) { 'unlimited' } else { "${MaxSeconds}s" })) -Level INFO
+
+    # NOTE: $PID is a read-only automatic variable in PowerShell. Using
+    # it as a foreach loop variable throws "Cannot overwrite variable
+    # PID". Use $childPid instead.
+    foreach ($childPid in $pending) {
+        $entry = $Script:DetachedRunners[$childPid]
+        $proc  = Get-Process -Id $childPid -ErrorAction SilentlyContinue
+        if (-not $proc) {
+            # Event handler already recorded the exit; if not, mark unknown
+            if ($null -eq $entry.ExitCode) {
+                $entry.ExitedAt = Get-Date
+                $entry.ExitCode = -1
+            }
+            continue
+        }
+
+        if ((Get-Date) -gt $deadline) {
+            Write-Log ("  [TIMEOUT] PID {0} ({1}) still running - leaving it detached" -f $childPid, $entry.Kind) -Level WARN
+            continue
+        }
+
+        try {
+            $proc.WaitForExit([int]([Math]::Max(1000, ($deadline - (Get-Date)).TotalMilliseconds)))
+            $entry.ExitedAt = Get-Date
+            $entry.ExitCode = $proc.ExitCode
+        } catch {
+            Write-Log ("  [WARN] Could not wait on PID {0}: {1}" -f $childPid, $_.Exception.Message) -Level WARN
+        }
+    }
+}
+
+
 # ============================================================
 # SECURE RUNNER TEMP HELPER
 # ============================================================
@@ -5220,10 +5421,19 @@ function Invoke-Step08b {
     # ---- Launch ----
     Write-Log 'Launching detached visible PowerShell window...' -Level INFO
 
+    # Fix B3 v2: probe the runner host before committing to a launch
+    $__prereq = Test-DetachedLaunchPrereqs
+    if (-not $__prereq.Ok) {
+        Write-Log ("  [FAIL] Detached launch prerequisites failed: {0}" -f $__prereq.Reason) -Level ERROR
+        Write-Log '  Step marked Failed (child could not start).' -Level ERROR
+        throw ("Detached runner prereq failure: {0}" -f $__prereq.Reason)
+    }
+
     try {
-        $child = Start-Process -FilePath 'powershell.exe' -ArgumentList "-NoExit -NoProfile -ExecutionPolicy Bypass -File `"$runnerPath`"" -PassThru
+        $child = Start-Process -FilePath $Script:PowerShellExe -ArgumentList "-NoExit -NoProfile -ExecutionPolicy Bypass -File `"$runnerPath`"" -PassThru
 
         Write-Log ("  [OK] Child PowerShell launched (PID {0})." -f $child.Id) -Level OK
+        Register-DetachedExitTracking -Child $child -Kind 'Drivers' -Note 'Step 8b'
         Write-Log '  WinTune will continue; driver audit runs independently.' -Level INFO
         Write-Log '  Look for the new window: "WinTune - Driver Update Runner"' -Level INFO
 
@@ -5807,10 +6017,19 @@ function Invoke-Step12 {
     # ---- Launch detached ----
     Write-Log 'Launching detached visible PowerShell window...' -Level INFO
 
+    # Fix B3 v2: probe the runner host before committing to a launch
+    $__prereq = Test-DetachedLaunchPrereqs
+    if (-not $__prereq.Ok) {
+        Write-Log ("  [FAIL] Detached launch prerequisites failed: {0}" -f $__prereq.Reason) -Level ERROR
+        Write-Log '  Step marked Failed (child could not start).' -Level ERROR
+        throw ("Detached runner prereq failure: {0}" -f $__prereq.Reason)
+    }
+
     try {
-        $child = Start-Process -FilePath 'powershell.exe' -ArgumentList "-NoExit -NoProfile -ExecutionPolicy Bypass -File `"$runnerPath`"" -PassThru
+        $child = Start-Process -FilePath $Script:PowerShellExe -ArgumentList "-NoExit -NoProfile -ExecutionPolicy Bypass -File `"$runnerPath`"" -PassThru
 
         Write-Log ("  [OK] Child PowerShell launched (PID {0})." -f $child.Id) -Level OK
+        Register-DetachedExitTracking -Child $child -Kind 'SFC/DISM' -Note 'Step 12'
         Add-ReportRunner -Kind 'SFC/DISM' -RunnerPid $child.Id -Note 'Step 12'
         Write-Log '  WinTune will continue; repairs run independently.' -Level INFO
         Write-Log '  Look for the new window: "WinTune - SFC / DISM Repair"' -Level INFO
@@ -9173,10 +9392,19 @@ function Invoke-Step33 {
     # ---- Launch detached visible shell ----
     Write-Log 'Launching detached visible PowerShell window...' -Level INFO
 
+    # Fix B3 v2: probe the runner host before committing to a launch
+    $__prereq = Test-DetachedLaunchPrereqs
+    if (-not $__prereq.Ok) {
+        Write-Log ("  [FAIL] Detached launch prerequisites failed: {0}" -f $__prereq.Reason) -Level ERROR
+        Write-Log '  Step marked Failed (child could not start).' -Level ERROR
+        throw ("Detached runner prereq failure: {0}" -f $__prereq.Reason)
+    }
+
     try {
-        $child = Start-Process -FilePath 'powershell.exe' -ArgumentList "-NoExit -NoProfile -ExecutionPolicy Bypass -File `"$runnerPath`"" -PassThru
+        $child = Start-Process -FilePath $Script:PowerShellExe -ArgumentList "-NoExit -NoProfile -ExecutionPolicy Bypass -File `"$runnerPath`"" -PassThru
 
         Write-Log ("  [OK] Child PowerShell launched (PID {0})." -f $child.Id) -Level OK
+        Register-DetachedExitTracking -Child $child -Kind 'Winget' -Note 'Step 33'
         Add-ReportRunner -Kind 'Winget' -RunnerPid $child.Id -Note 'Step 33'
         Write-Log '  WinTune will continue; winget upgrade runs independently.' -Level INFO
         Write-Log '  Look for the new window: "WinTune - Winget Upgrade (Full Detail Mode)"' -Level INFO
@@ -10650,11 +10878,20 @@ function Invoke-Step39 {
     # ---- Launch detached visible shell ----
     Write-Log 'Launching detached visible PowerShell window...' -Level INFO
 
+    # Fix B3 v3: probe the runner host before committing to a launch
+    $__prereq = Test-DetachedLaunchPrereqs
+    if (-not $__prereq.Ok) {
+        Write-Log ("  [FAIL] Detached launch prerequisites failed: {0}" -f $__prereq.Reason) -Level ERROR
+        Write-Log '  Step marked Failed (child could not start).' -Level ERROR
+        throw ("Detached runner prereq failure: {0}" -f $__prereq.Reason)
+    }
+
     try {
         # No -Wait so this returns immediately. Child is independent.
-        $child = Start-Process -FilePath 'powershell.exe' -ArgumentList "-NoExit -NoProfile -ExecutionPolicy Bypass -File `"$runnerPath`"" -PassThru
+        $child = Start-Process -FilePath $Script:PowerShellExe -ArgumentList "-NoExit -NoProfile -ExecutionPolicy Bypass -File `"$runnerPath`"" -PassThru
 
         Write-Log ("  [OK] Child PowerShell launched (PID {0})." -f $child.Id) -Level OK
+        Register-DetachedExitTracking -Child $child -Kind 'Windows Update' -Note 'Step 39'
         Add-ReportRunner -Kind 'Windows Update' -RunnerPid $child.Id -Note 'Step 39'
         Write-Log '  WinTune will continue; Windows Update runs independently.' -Level INFO
         Write-Log '  Look for the new window with the banner: WinTune - Windows Update Installer' -Level INFO
@@ -12828,11 +13065,27 @@ function Write-HtmlReport {
         $runnerRows = New-Object System.Text.StringBuilder
         foreach ($r in $Script:Report.DetachedRunners) {
             $ts = '{0:HH:mm:ss}' -f $r.At
+
+            # Fix C: enrich with exit info if present in the tracking hashtable
+            $exitInfo = '(not tracked)'
+            $exitCls  = ''
+            if ($Script:DetachedRunners -and $Script:DetachedRunners.ContainsKey($r.Pid)) {
+                $t = $Script:DetachedRunners[$r.Pid]
+                if ($null -ne $t.ExitCode) {
+                    $exitInfo = ('0x{0:X8} ({1})' -f [uint32]$t.ExitCode, $t.ExitCode)
+                    $exitCls  = if ($t.ExitCode -eq 0) { 'st-ok' } else { 'st-warn' }
+                } else {
+                    $exitInfo = 'running'
+                    $exitCls  = 'st-detached'
+                }
+            }
+
             [void]$runnerRows.AppendLine("      <tr>")
             [void]$runnerRows.AppendLine("        <td>$(& $enc $r.Kind)</td>")
             [void]$runnerRows.AppendLine("        <td>$($r.Pid)</td>")
             [void]$runnerRows.AppendLine("        <td>$(& $enc $r.Note)</td>")
             [void]$runnerRows.AppendLine("        <td>$ts</td>")
+            [void]$runnerRows.AppendLine("        <td class=""status $exitCls"">$exitInfo</td>")
             [void]$runnerRows.AppendLine("      </tr>")
         }
 
@@ -13031,7 +13284,7 @@ $($stepRows.ToString())
     $(if ($Script:Report.DetachedRunners.Count -eq 0) {
       '<p style="color:#6b7280;font-size:13px;">No detached runners were launched in this run.</p>'
     } else {
-      '<table><thead><tr><th>Kind</th><th>PID</th><th>Note</th><th>Launched</th></tr></thead><tbody>' + $runnerRows.ToString() + '</tbody></table>'
+      '<table><thead><tr><th>Kind</th><th>PID</th><th>Note</th><th>Launched</th><th>Exit</th></tr></thead><tbody>' + $runnerRows.ToString() + '</tbody></table>'
     })
   </section>
 
@@ -13388,6 +13641,40 @@ function Invoke-PostCheck {
         $endFreeBytes = 0
     } else {
         Write-Log 'Final free-space measurement captured.' -Level OK
+
+    # Fix C: optionally wait for detached runners before computing metrics.
+    # This block must never abort the run: if Wait-DetachedRunners throws
+    # (unexpected bug, killed process, permission issue), log a warning
+    # and continue so the report and lock release still happen.
+    try {
+        if ($Script:WaitForDetached -or $Script:DetachedWaitSeconds -ne 0) {
+            $__waitSecs = if ($Script:WaitForDetached) { -1 } else { $Script:DetachedWaitSeconds }
+            Wait-DetachedRunners -MaxSeconds $__waitSecs
+        }
+    } catch {
+        Write-Log ("  [WARN] Wait-DetachedRunners threw: {0}" -f $_.Exception.Message) -Level WARN
+        Write-Log '  Continuing without waiting for detached runners.' -Level INFO
+    }
+
+    # Report detached runner exit codes to the log
+    try {
+        if ($Script:DetachedRunners -and $Script:DetachedRunners.Count -gt 0) {
+            Write-Log 'Detached runner exit codes:' -Level INFO
+            foreach ($rPid in $Script:DetachedRunners.Keys) {
+                $r = $Script:DetachedRunners[$rPid]
+                if ($null -ne $r.ExitCode) {
+                    $lvl = if ($r.ExitCode -eq 0) { 'OK' } else { 'WARN' }
+                    Write-Log ("  PID {0} ({1}/{2}): exit 0x{3:X8} ({4})" -f `
+                        $rPid, $r.Kind, $r.Note, [uint32]$r.ExitCode, $r.ExitCode) -Level $lvl
+                } else {
+                    Write-Log ("  PID {0} ({1}/{2}): still running" -f `
+                        $rPid, $r.Kind, $r.Note) -Level WARN
+                }
+            }
+        }
+    } catch {
+        Write-Log ("  [WARN] Detached runner exit-code reporting threw: {0}" -f $_.Exception.Message) -Level WARN
+    }
     }
 
     # ============================================================
