@@ -2693,35 +2693,36 @@ try {
     # A silent failure here is what causes the interactive "install from
     # untrusted repository?" prompt. If trust cannot be established we
     # log it loudly so the user knows why a prompt appeared.
-    # PSGALLERY-TRUST-HARDENING
-    try {
-        # Ensure execution policy allows module loading
-        Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser -Force -ErrorAction SilentlyContinue
-        # Explicitly import PowerShellGet (not auto-loaded in non-interactive context)
-        Import-Module PowerShellGet -Force -ErrorAction Stop
-        $__repo = Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue
-        if (-not $__repo) {
-            Register-PSRepository -Default -ErrorAction Stop
-            WU-Log 'PSGallery repository registered.' 'OK'
-        }
-        Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction Stop
-        WU-Log 'PSGallery trusted - no install prompt expected.' 'OK'
-    } catch {
-        WU-Log ("PSGallery trust failed: {0}" -f $_.Exception.Message) 'WARN'
-        WU-Log 'Attempting fallback: registering PSGallery directly...' 'INFO'
-        try {
-            Register-PSRepository -Default -ErrorAction Stop
-            Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction Stop
-            WU-Log 'PSGallery registered and trusted via fallback.' 'OK'
-        } catch {
-            WU-Log ("Fallback also failed: {0}" -f $_.Exception.Message) 'ERROR'
-        }
-    }
-
+    # Reorder: check presence BEFORE attempting PSGallery trust.
+    # PSGallery trust is entirely unnecessary if PSWindowsUpdate is
+    # already installed. Skipping it avoids the module-load failure
+    # path that occurs on systems with CBS pending state.
     $minVersion = [version]'2.2.1.5'
     $module = Get-Module -ListAvailable -Name PSWindowsUpdate -ErrorAction SilentlyContinue |
               Sort-Object Version -Descending |
               Select-Object -First 1
+
+    $needsInstall = (-not $module)
+    $needsUpdate  = ($module -and $module.Version -lt $minVersion)
+
+    if ($needsInstall -or $needsUpdate) {
+        WU-Log 'PSGallery trust required (module needs install/update).' 'STEP'
+        try {
+            Import-Module PowerShellGet -Force -ErrorAction Stop
+            $__repo = Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue
+            if (-not $__repo) {
+                Register-PSRepository -Default -ErrorAction Stop
+                WU-Log 'PSGallery repository registered.' 'OK'
+            }
+            Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction Stop
+            WU-Log 'PSGallery trusted - no install prompt expected.' 'OK'
+        } catch {
+            WU-Log ("PSGallery trust failed (best-effort): {0}" -f $_.Exception.Message) 'WARN'
+            WU-Log 'Continuing anyway - Install-Module may still prompt.' 'INFO'
+        }
+    } else {
+        WU-Log ("PSWindowsUpdate {0} already available - skipping PSGallery trust." -f $module.Version) 'OK'
+    }
 
     if (-not $module) {
         WU-Log 'PSWindowsUpdate not installed - installing from PSGallery...' 'STEP'
@@ -2758,9 +2759,21 @@ try {
         Import-Module PSWindowsUpdate -ErrorAction Stop
         WU-Log 'Module loaded.' 'OK'
     } catch {
-        WU-Log "Module import failed: $($_.Exception.Message)" 'ERROR'
-        Pause-Exit
-        exit 1
+        $__impErr = $_.Exception.Message
+        WU-Log "Primary import failed: $__impErr" 'WARN'
+        try {
+            if ($module) {
+                $__mPath = Join-Path $module.ModuleBase ($module.Name + '.psd1')
+                if (Test-Path -LiteralPath $__mPath) {
+                    Import-Module $__mPath -ErrorAction Stop
+                    WU-Log 'Module loaded via explicit path fallback.' 'OK'
+                } else { throw 'Module manifest not found' }
+            } else { throw 'No module handle for fallback' }
+        } catch {
+            WU-Log "Module import failed: $__impErr; fallback: $($_.Exception.Message)" 'ERROR'
+            Pause-Exit
+            exit 1
+        }
     }
 
     WU-Log 'Scanning for available updates (PSWindowsUpdate)...' 'STEP'
