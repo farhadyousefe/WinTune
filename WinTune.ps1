@@ -123,7 +123,7 @@ param(
 
 # ---- B1 fix: shadow the reserved $Profile automatic variable ----
 # Public CLI still accepts -Profile; internal logic uses $Script:PresetName.
-if ($Profile) { $Script:PresetName = $Preset } else { $Script:PresetName = '' }
+if ($PSBoundParameters.ContainsKey('Preset')) { $Script:PresetName = [string]$Preset } else { $Script:PresetName = '' }
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -1565,7 +1565,7 @@ function Invoke-NativeCommand {
             $proc = Start-Process @procArgs
         }
 
-        $code = $proc.ExitCode
+        $code = if ($null -ne $proc.ExitCode) { [int]$proc.ExitCode } else { -1 }
 
         if (Test-Path $outFile) { $stdOut = Get-Content -LiteralPath $outFile -ErrorAction SilentlyContinue }
         if (Test-Path $errFile) { $stdErr = Get-Content -LiteralPath $errFile -ErrorAction SilentlyContinue }
