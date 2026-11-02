@@ -1129,9 +1129,13 @@ function New-SecureRunnerPath {
         $Script:RunnerTempDir = Join-Path $env:TEMP ([Guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Path $Script:RunnerTempDir -Force -ErrorAction Stop | Out-Null
         try {
-            # Ensure the Security module is loaded; non-interactive
-            # PowerShell hosts may not auto-load it.
-            Import-Module Microsoft.PowerShell.Security -Force -ErrorAction SilentlyContinue
+            # Best-effort module load WITHOUT -Force. -Force re-registers
+            # TypeData on already-loaded modules, producing "member already
+            # present" warnings that the catch block would surface as a
+            # failure. Without -Force, the import is a no-op when loaded.
+            if (-not (Get-Module -Name Microsoft.PowerShell.Security -ErrorAction SilentlyContinue)) {
+                Import-Module Microsoft.PowerShell.Security -ErrorAction SilentlyContinue
+            }
             $acl = Get-Acl -LiteralPath $Script:RunnerTempDir
             $acl.SetAccessRuleProtection($true, $false)
             $acl.Access | ForEach-Object { $acl.RemoveAccessRule($_) | Out-Null }
@@ -3585,7 +3589,7 @@ function Invoke-Step01 {
         if ($pending.Count -eq 0) {
             Write-Log '  [OK] All WU infrastructure services are Running.' -Level OK
         } else {
-            Write-Log ("  [WARN] Services still not Running after 20s: {0}" -f ($pending -join ', ')) -Level WARN
+            Write-Log ("  [WARN] Services still not Running after 45s: {0}" -f ($pending -join ', ')) -Level WARN
             Write-Log '  They may recover on their own; check with Get-Service later.' -Level INFO
         }
     }
@@ -3607,9 +3611,21 @@ function Invoke-Step01 {
                 Write-Log ("  [INFO] {0} DO job(s) paused (retained by Windows for resume; expected)." -f $pausedCount) -Level INFO
             }
             Write-Log '  Paused jobs will resume or expire on their own.' -Level INFO
-            foreach ($j in $remaining) {
-                $mb = [math]::Round([int64]$j.TotalBytesDownloaded / 1MB, 1)
-                Write-Log ("    {0}: {1:N1} MB, Status={2}" -f $j.FileId.Substring(0,8), $mb, $j.Status) -Level DEBUG
+            # Only show jobs with meaningful downloaded bytes; aggregate the rest
+            $significantJobs = @($remaining | Where-Object {
+                [int64]$_.TotalBytesDownloaded -ge 524288  # 0.5 MB
+            })
+            $trivialCount = $remaining.Count - $significantJobs.Count
+
+            if ($significantJobs.Count -gt 0) {
+                Write-Log ("  Significant paused jobs ({0}):" -f $significantJobs.Count) -Level DEBUG
+                foreach ($j in $significantJobs) {
+                    $mb = [math]::Round([int64]$j.TotalBytesDownloaded / 1MB, 1)
+                    Write-Log ("    {0}: {1:N1} MB, Status={2}" -f $j.FileId.Substring(0,8), $mb, $j.Status) -Level DEBUG
+                }
+            }
+            if ($trivialCount -gt 0) {
+                Write-Log ("  ({0} additional paused job(s) with <0.5 MB downloaded - suppressed)" -f $trivialCount) -Level DEBUG
             }
         }
     } catch {
@@ -7053,7 +7069,12 @@ function Invoke-Step20 {
         $candidates = @($tasks | Where-Object {
             $_.TaskPath -notlike '\Microsoft\*' -and
             $_.State -eq 'Ready' -and
-            $_.TaskPath -notmatch '^\\Microsoft\\Windows\\(UpdateOrchestrator|Defrag|SystemRestore)\\'
+            $_.TaskPath -notmatch '^\\Microsoft\\Windows\\(UpdateOrchestrator|Defrag|SystemRestore)\\' -and
+            # Exclude tasks running as service accounts that admin cannot
+            # disable (WsiAccount, NetworkService, LocalService, SYSTEM).
+            # These tasks are system-managed and produce "Access is denied"
+            # which is not a real failure.
+            -not ($_.Principal -and $_.Principal.UserId -match '^(WsiAccount|SYSTEM|NT AUTHORITY\\\\(SYSTEM|LOCAL SERVICE|NETWORK SERVICE))$')
         })
 
         if ($candidates.Count -gt 0) {
@@ -7075,8 +7096,13 @@ function Invoke-Step20 {
                         }
                         $disabled++
                     } catch {
-                        Write-Log ("  [FAIL] {0}{1}: {2}" -f $c.TaskPath, $c.TaskName, $_.Exception.Message) -Level WARN
-                        $failed++
+                        $errMsg = $_.Exception.Message
+                        if ($errMsg -match 'Access is denied|Access denied|0x80070005') {
+                            Write-Log ("  [SKIP] {0}{1} - system-managed (Access Denied)" -f $c.TaskPath, $c.TaskName) -Level INFO
+                        } else {
+                            Write-Log ("  [FAIL] {0}{1}: {2}" -f $c.TaskPath, $c.TaskName, $errMsg) -Level WARN
+                            $failed++
+                        }
                     }
                 }
                 Write-Log ("  Step 20 disable summary: {0} disabled, {1} failed" -f $disabled, $failed) -Level INFO
