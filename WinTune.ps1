@@ -10497,60 +10497,44 @@ function Get-PersistenceClassification {
         # KEEP-LIST: known-safe publisher substrings (case-insensitive)
         $keepPublishers = @(
             # Microsoft + Windows
-            'Microsoft', 'Windows',
+            'Microsoft', 'Windows'
 
             # Hardware vendors
-            'Intel', 'NVIDIA', 'AMD', 'Advanced Micro Devices',
-            'Realtek', 'Qualcomm', 'Broadcom', 'MediaTek', 'Marvell',
-            'Dell', 'Hewlett-Packard', 'HP Inc', 'HP Company',
-            'Lenovo', 'ASUS', 'ASUSTeK', 'Acer', 'MSI', 'Micro-Star',
-            'Gigabyte', 'GIGA-BYTE', 'Samsung', 'LG Electronics', 'Toshiba', 'Sony',
-            'Synaptics', 'Elan', 'Alps Electric',
+            'Intel', 'NVIDIA', 'AMD', 'Advanced Micro Devices'
+            'Realtek', 'Qualcomm', 'Broadcom', 'MediaTek', 'Marvell'
+            'Dell', 'Hewlett-Packard', 'HP Inc', 'HP Company'
+            'Lenovo', 'ASUS', 'ASUSTeK', 'Acer', 'MSI', 'Micro-Star'
+            'Gigabyte', 'GIGA-BYTE', 'Samsung', 'LG Electronics', 'Toshiba', 'Sony'
+            'Synaptics', 'Elan', 'Alps Electric'
 
             # Input devices
-            'Wacom', 'Logitech', 'Razer', 'Corsair', 'SteelSeries', 'HyperX', 'Keychron',
+            'Wacom', 'Logitech', 'Razer', 'Corsair', 'SteelSeries', 'HyperX', 'Keychron'
 
             # Security / VPN
-            'Malwarebytes', 'Kaspersky', 'ESET', 'Bitdefender', 'Norton', 'Gen Digital',
-            'McAfee', 'Avast', 'AVG', 'Sophos', 'Trend Micro', 'CrowdStrike',
-            'SentinelOne', 'Carbon Black', 'Webroot', 'F-Secure',
-            'Proton', 'OpenVPN', 'Nord Security', 'NordVPN', 'ExpressVPN',
-            'Surfshark', 'Cisco', 'Fortinet', 'Palo Alto', 'Zscaler',
+            'Malwarebytes', 'Kaspersky', 'ESET', 'Bitdefender', 'Norton', 'Gen Digital'
+            'McAfee', 'Avast', 'AVG', 'Sophos', 'Trend Micro', 'CrowdStrike'
+            'SentinelOne', 'Carbon Black', 'Webroot', 'F-Secure'
+            'Proton', 'OpenVPN', 'Nord Security', 'NordVPN', 'ExpressVPN'
+            'Surfshark', 'Cisco', 'Fortinet', 'Palo Alto', 'Zscaler'
 
             # Sync / cloud
-            'Dropbox', 'Box, Inc', 'Google', 'Apple Inc', 'Mozilla',
-            'Nextcloud', 'MEGAsync', 'Sync.com',
+            'Dropbox', 'Box, Inc', 'Google', 'Apple Inc', 'Mozilla'
+            'Nextcloud', 'MEGAsync', 'Sync.com'
 
             # Common productivity (avoid breaking)
-            'Adobe', 'Zoom', 'Slack', 'Valve', 'Epic Games',
-            'Electronic Arts', 'Ubisoft', 'Discord',
-            'Atlassian', 'Notion Labs', 'JetBrains',
             # ---- Document / archive / utility tools ----
-            'Foxit', 'Foxit Software Inc',
-            'Adobe Systems', 'Adobe Inc', 'Adobe',
-            'WinRAR', 'win.rar', 'Igor Pavlov',
-            '7-Zip', 'Notepad++', 'Don Ho',
-            'Piriform', 'CCleaner',
-            'VideoLAN', 'VLC',
-            'KeePass', 'Dominik Reichl',
 
             # Browsers (auto-launch entries)
-            'Chrome', 'Microsoft Edge', 'Edge',
-            'Mozilla', 'Firefox',
+            'Chrome', 'Microsoft Edge', 'Edge'
+            'Mozilla', 'Firefox'
 
             # Scanner / imaging tools (user-installed, frequently re-enabled)
-            'PFU', 'ScanSnap', 'Fujitsu',
-            'Canon', 'Epson', 'Brother', 'Xerox',
-            'ABBYY', 'Kofax', 'Nuance',
-            'PaperPort', 'OmniPage',
+            'PFU', 'ScanSnap', 'Fujitsu'
+            'Canon', 'Epson', 'Brother', 'Xerox'
+            'ABBYY', 'Kofax', 'Nuance'
+            'PaperPort', 'OmniPage'
 
             # Personal productivity (user-installed)
-            'Evernote', 'Todoist', 'Obsidian',
-            'Spotify', 'Steam', 'GOG', 'Epic',
-            'OBS Project', 'OBS Studio',
-            'AutoHotkey', 'Wox', 'Listary',
-            'Everything', 'Voidtools',
-            'Rufus', 'Balena', 'Ventoy'
         )
 
         foreach ($p in $keepPublishers) {
@@ -13540,10 +13524,6 @@ function Invoke-Step43 {
         'Microsoft.PowerAutomateDesktop'
         'Microsoft.MicrosoftStickyNotes'
         'Microsoft.WindowsMaps'
-        'Microsoft.ZuneMusic'
-        'Microsoft.ZuneVideo'
-        'Microsoft.BingNews'
-        'Microsoft.BingWeather'
         'Microsoft.WindowsCamera'
         'Microsoft.WindowsSoundRecorder'
         'Microsoft.MicrosoftOfficeHub'
@@ -13551,9 +13531,6 @@ function Invoke-Step43 {
         'Microsoft.YourPhone'
         'MicrosoftWindows.CrossDevice'
         'Microsoft.MicrosoftSolitaireCollection'
-        'Microsoft.MixedReality.Portal'
-        'Microsoft.GetHelp'
-        'Microsoft.Getstarted'
         'Microsoft.WindowsFeedbackHub'
         'Microsoft.WindowsAlarms'
         'Microsoft.Microsoft3DViewer'
