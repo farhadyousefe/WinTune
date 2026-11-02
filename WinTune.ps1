@@ -13956,9 +13956,26 @@ function Invoke-PostCheck {
     # ============================================================
     # 3. Convert to human-readable GB
     # ============================================================
+    # FREE-SPACE-TRANSPARENCY
     $startGB = [math]::Round($startFreeBytes / 1GB, 2)
     $endGB   = [math]::Round($endFreeBytes   / 1GB, 2)
     $deltaGB = [math]::Round($netDeltaBytes  / 1GB, 2)
+
+    # Estimate space consumed by active system activity
+    $activeConsumptionGB = 0.0
+    try {
+        # Delivery Optimization active/paused jobs
+        $doJobs = @(Get-DeliveryOptimizationStatus -ErrorAction SilentlyContinue | Where-Object { $_.Status -in 'Caching','Downloading','Paused' })
+        if ($doJobs.Count -gt 0) {
+            $doBytes = ($doJobs | Measure-Object -Property TotalBytesDownloaded -Sum).Sum
+            if ($doBytes) { $activeConsumptionGB += [math]::Round($doBytes / 1GB, 2) }
+        }
+    } catch { }
+    # Note: VSS and WU consumption is estimated via the discrepancy itself
+
+    $reportedFreedGB = [math]::Round(($Script:StartFreeBytes - $endFreeBytes + $activeConsumptionGB * 1GB) / 1GB, 2)
+    # Simpler: use the delta plus active DO consumption as "reported"
+    $reportedFreedGB = $deltaGB + $activeConsumptionGB
 
     # ============================================================
     # 4. Determine storage result direction
@@ -13982,6 +13999,9 @@ function Invoke-PostCheck {
         ('Baseline Free Storage:      {0} GB' -f $startGB)
         ('Final Free Storage:         {0} GB' -f $endGB)
         ('Net Free-Space Change:      {0} GB' -f $deltaGB)
+        if ($activeConsumptionGB -gt 0.01) {
+            ('Space consumed by active system activity: {0} GB' -f [math]::Round($activeConsumptionGB, 2))
+        }
         ('Storage Result:             {0}'   -f $spaceResult)
         ('Completed:                  {0:yyyy-MM-dd HH:mm:ss}' -f (Get-Date))
         '===================================================='
@@ -14006,6 +14026,9 @@ function Invoke-PostCheck {
         default     { 'Gray' }
     }
     Write-Host (' Net Free-Space Change:    {0} GB' -f $deltaGB) -ForegroundColor $deltaColor
+    if ($activeConsumptionGB -gt 0.01) {
+        Write-Host (' Space consumed by active system activity: {0} GB' -f [math]::Round($activeConsumptionGB, 2)) -ForegroundColor DarkGray
+    }
     Write-Host (' Storage Result:           {0}' -f $spaceResult) -ForegroundColor $deltaColor
     Write-Host ('=' * 60) -ForegroundColor Green
 
