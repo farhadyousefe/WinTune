@@ -10216,8 +10216,11 @@ function Get-PersistenceClassification {
         '\Program Files\Microsoft\Edge\',
         '\Program Files\Windows Defender\',
         '\Program Files\WindowsApps\Microsoft.',
-        '\Windows\System32\',
-        '\Windows\SysWOW64\',
+        # NOTE: \Windows\System32\ and \Windows\SysWOW64\ are intentionally
+        # NOT in this list. Unsigned or unknown-publisher binaries in those
+        # folders must still go through the signature check below and be
+        # classified Disable. Microsoft-signed binaries there are kept by
+        # the 'Microsoft'/'Windows' publisher match that follows.
         '\Program Files\Windows Security\',
         '\Program Files\Microsoft\EdgeUpdate\',
         '\Program Files (x86)\Microsoft\EdgeUpdate\'
