@@ -2686,7 +2686,12 @@ try {
     # A silent failure here is what causes the interactive "install from
     # untrusted repository?" prompt. If trust cannot be established we
     # log it loudly so the user knows why a prompt appeared.
+    # PSGALLERY-TRUST-HARDENING
     try {
+        # Ensure execution policy allows module loading
+        Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser -Force -ErrorAction SilentlyContinue
+        # Explicitly import PowerShellGet (not auto-loaded in non-interactive context)
+        Import-Module PowerShellGet -Force -ErrorAction Stop
         $__repo = Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue
         if (-not $__repo) {
             Register-PSRepository -Default -ErrorAction Stop
@@ -2696,7 +2701,14 @@ try {
         WU-Log 'PSGallery trusted - no install prompt expected.' 'OK'
     } catch {
         WU-Log ("PSGallery trust failed: {0}" -f $_.Exception.Message) 'WARN'
-        WU-Log 'Module install may prompt for repository confirmation.' 'WARN'
+        WU-Log 'Attempting fallback: registering PSGallery directly...' 'INFO'
+        try {
+            Register-PSRepository -Default -ErrorAction Stop
+            Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction Stop
+            WU-Log 'PSGallery registered and trusted via fallback.' 'OK'
+        } catch {
+            WU-Log ("Fallback also failed: {0}" -f $_.Exception.Message) 'ERROR'
+        }
     }
 
     $minVersion = [version]'2.2.1.5'
