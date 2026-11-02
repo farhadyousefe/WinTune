@@ -118,7 +118,14 @@ param(
 
     # ---- Detached runner tracking ----
     [switch]$WaitForDetached,                                   # Wait indefinitely for all children before PostCheck
-    [int]$DetachedWaitSeconds = 0                               # Wait up to N seconds (0 = don't wait)
+    [int]$DetachedWaitSeconds = 0,                              # Wait up to N seconds (0 = don't wait)
+
+    # ---- Thresholds for destructive cleanup steps ----
+    [int]$InstallerMinOrphanMB   = 500,                         # Step 40 - minimum orphan size to trigger cleanup
+    [int]$InstallerMinAgeDays    = 180,                         # Step 40 - MSI/MSP age cutoff
+    [int]$PackageCacheMinAgeDays = 30,                          # Step 42 - superseded folder age cutoff
+    [int]$PackageCacheMinSizeMB  = 5,                           # Step 42 - minimum folder size
+    [int]$PackageCacheMinTotalMB = 100                          # Step 42 - minimum total candidate size
 )
 
 # ---- B1 fix: shadow the reserved $Profile automatic variable ----
@@ -236,6 +243,11 @@ $Script:InRollbackMode   = $false
 # Detached runner tracking (populated by Fix A; consumed by Fix C)
 $Script:WaitForDetached     = $WaitForDetached.IsPresent
 $Script:DetachedWaitSeconds = [int]$DetachedWaitSeconds
+$Script:InstallerMinOrphanMB   = [int]$InstallerMinOrphanMB
+$Script:InstallerMinAgeDays    = [int]$InstallerMinAgeDays
+$Script:PackageCacheMinAgeDays = [int]$PackageCacheMinAgeDays
+$Script:PackageCacheMinSizeMB  = [int]$PackageCacheMinSizeMB
+$Script:PackageCacheMinTotalMB = [int]$PackageCacheMinTotalMB
 $Script:RollbackFrom       = $RollbackFrom
 $Script:RollbackEntries    = New-Object System.Collections.ArrayList
 $Script:BackupDir         = $null
@@ -8545,15 +8557,20 @@ function Invoke-Step29 {
         Remove-Job -Job $__job -Force -ErrorAction SilentlyContinue
 
         if ($features -and @($features).Count -gt 0) {
+            $featureTotal = @($features).Count
+            $featureIndex = 0
             foreach ($feature in $features) {
-                Write-Log ("  [REMOVING] Disabling: {0}" -f $feature.FeatureName) -Level WARN
+                $featureIndex++
+                Write-Log ("  [{0}/{1}] Servicing SMB1 feature (may take 30-45s): {2}" -f $featureIndex, $featureTotal, $feature.FeatureName) -Level WARN
 
+                $sw = [System.Diagnostics.Stopwatch]::StartNew()
                 try {
                     # -NoRestart because we'll suggest a reboot separately
                     Disable-WindowsOptionalFeature -Online -FeatureName $feature.FeatureName -NoRestart -WarningAction SilentlyContinue -ErrorAction Stop | Out-Null
-
-                    Write-Log ("    [OK] Disabled: {0}" -f $feature.FeatureName) -Level OK
+                    $sw.Stop()
+                    Write-Log ("    [OK] Disabled: {0} ({1:N1}s)" -f $feature.FeatureName, $sw.Elapsed.TotalSeconds) -Level OK
                 } catch {
+                    $sw.Stop()
                     Write-Log ("    [WARN] Could not disable {0}: {1}" -f $feature.FeatureName, $_.Exception.Message) -Level WARN
                     $overallSuccess = $false
                 }
@@ -11068,7 +11085,7 @@ function Invoke-Step40 {
         return
     }
 
-    $cutoff = (Get-Date).AddDays(-180)
+    $cutoff = (Get-Date).AddDays(-$Script:InstallerMinAgeDays)
     $orphans = @()
     $totalOrphanBytes = [int64]0
 
@@ -11099,9 +11116,9 @@ function Invoke-Step40 {
     $totalOrphanMB = [math]::Round($totalOrphanBytes / 1MB, 1)
     Write-Log ("Orphaned MSI/MSP: {0} files, {1:N1} MB" -f $orphans.Count, $totalOrphanMB) -Level INFO
 
-    if ($totalOrphanMB -lt 500 -and -not $Script:ForceIrreversible) {
-        Write-Log ('Less than 500 MB of orphans ({0:N1} MB) - not worth touching Windows\Installer.' -f $totalOrphanMB) -Level INFO
-        Write-Log 'Add -ForceIrreversible to override the 500 MB threshold.' -Level INFO
+    if ($totalOrphanMB -lt $Script:InstallerMinOrphanMB -and -not $Script:ForceIrreversible) {
+        Write-Log ('Less than {0} MB of orphans ({1:N1} MB) - not worth touching Windows\Installer.' -f $Script:InstallerMinOrphanMB, $totalOrphanMB) -Level INFO
+        Write-Log ('Add -ForceIrreversible to override the {0} MB threshold.' -f $Script:InstallerMinOrphanMB) -Level INFO
         Write-Log '[INFO] Step 40 skipped: below safety threshold.' -Level INFO
         return
     } elseif ($totalOrphanMB -lt 500 -and $Script:ForceIrreversible) {
@@ -11273,8 +11290,8 @@ function Invoke-Step42 {
     Write-Log ("  Product families: {0}" -f $groups.Count) -Level INFO
 
     # ---- Identify superseded folders ----
-    $cutoff = (Get-Date).AddDays(-30)
-    $minSizeBytes = 5 * 1MB
+    $cutoff = (Get-Date).AddDays(-$Script:PackageCacheMinAgeDays)
+    $minSizeBytes = $Script:PackageCacheMinSizeMB * 1MB
     $candidates = @()
     $totalCandidateBytes = [int64]0
 
@@ -11320,9 +11337,9 @@ function Invoke-Step42 {
     $totalCandidateMB = [math]::Round($totalCandidateBytes / 1MB, 1)
     Write-Log ("Superseded Package Cache folders: {0}, {1:N1} MB" -f $candidates.Count, $totalCandidateMB) -Level INFO
 
-    if ($totalCandidateMB -lt 100 -and -not $Script:ForceIrreversible) {
-        Write-Log ('Less than 100 MB of superseded caches ({0:N1} MB) - not worth touching.' -f $totalCandidateMB) -Level INFO
-        Write-Log 'Add -ForceIrreversible to override the 100 MB threshold.' -Level INFO
+    if ($totalCandidateMB -lt $Script:PackageCacheMinTotalMB -and -not $Script:ForceIrreversible) {
+        Write-Log ('Less than {0} MB of superseded caches ({1:N1} MB) - not worth touching.' -f $Script:PackageCacheMinTotalMB, $totalCandidateMB) -Level INFO
+        Write-Log ('Add -ForceIrreversible to override the {0} MB threshold.' -f $Script:PackageCacheMinTotalMB) -Level INFO
         Write-Log '[INFO] Step 42 skipped: below safety threshold.' -Level INFO
         return
     } elseif ($totalCandidateMB -lt 100 -and $Script:ForceIrreversible) {
