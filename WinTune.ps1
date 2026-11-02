@@ -751,11 +751,25 @@ function Invoke-NativeLive {
 
         $elapsedStr = if ($elapsed.TotalHours -ge 1) { '{0:hh\:mm\:ss}' -f $elapsed } else { '{0:mm\:ss}' -f $elapsed }
 
-        # SIMPLE-HEARTBEAT-PROGRESS: 10-second heartbeat, no spinner
-        if (($now - $start).TotalSeconds % 10 -lt 0.5) {
-            $line = "  [$elapsedStr] $Label - $lastProgress$stallTag"
+        # [FIX-S12-1] Deduplicated 10-second heartbeat.
+        # The old check `% 10 -lt 0.5` fired twice per window (at t=10.00s
+        # and t=10.25s) because the loop runs every 250 ms. Use an explicit
+        # last-print timestamp instead.
+        if (-not $script:__lastHeartbeat) { $script:__lastHeartbeat = $start }
+        if (($now - $script:__lastHeartbeat).TotalSeconds -ge 10) {
+            # [FIX-S12-2] Suppress the stall tag once DISM's download
+            # reached 100% - the install phase emits no progress lines,
+            # so the old stall tag looked like a hang when the process
+            # was actually working. Only show "stalled" if we haven't
+            # seen any progress line at all in `stallThreshold` seconds.
+            $effectiveStall = $stallTag
+            if ($lastProgress -match 'Download:\s*100%|RestoreHealth.*100%') {
+                $effectiveStall = ''
+            }
+            $line = "  [$elapsedStr] $Label - $lastProgress$effectiveStall"
             Write-Host $line -ForegroundColor DarkGray
             try { Add-Content -LiteralPath $logFile -Value $line -Encoding UTF8 } catch {}
+            $script:__lastHeartbeat = $now
         }
     }
 
@@ -819,6 +833,16 @@ try {
     Write-Host ('=' * 60) -ForegroundColor Cyan
     Write-Host ' WinTune - SFC / DISM Repair (Interactive Mode)' -ForegroundColor Cyan
     Write-Host ('=' * 60) -ForegroundColor Cyan
+
+    # [FIX-S12-3] Truncate the child log so this run's content is the
+    # only thing in WinTune_SfcDism.log. Prior runs accumulated here,
+    # making it impossible to know which SFC/DISM output belonged to
+    # which parent invocation.
+    try {
+        if (Test-Path -LiteralPath $logFile) {
+            Remove-Item -LiteralPath $logFile -Force -ErrorAction SilentlyContinue
+        }
+    } catch { }
 
     SD-Log 'SFC / DISM runner started.' 'OK'
     SD-Log "PID: $PID"
