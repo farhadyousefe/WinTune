@@ -118,6 +118,7 @@ param(
 
     # ---- Detached runner tracking ----
     [switch]$WaitForDetached,                                   # Wait indefinitely for all children before PostCheck
+    [switch]$AllowScheduledTaskAction,                         # Step 20 - disable non-Microsoft scheduled tasks
     [int]$DetachedWaitSeconds = 0,                              # Wait up to N seconds (0 = don't wait)
 
     # ---- Thresholds for destructive cleanup steps ----
@@ -223,6 +224,7 @@ $Script:AllowDoTuning = $AllowDoTuning.IsPresent
 $Script:AllowCamWALCleanup = $AllowCamWALCleanup.IsPresent
 $Script:AllowPersistenceAction = $AllowPersistenceAction.IsPresent
 $Script:AllowAutoRunDisable = $AllowAutoRunDisable.IsPresent
+$Script:AllowScheduledTaskAction = $AllowScheduledTaskAction.IsPresent
 $Script:AllowContextMenuAction = $AllowContextMenuAction.IsPresent
 $Script:AllowProgramAuditAction = $AllowProgramAuditAction.IsPresent
 # ---- New in v3.4 (driver updates) ----
@@ -6912,6 +6914,49 @@ function Invoke-Step20 {
     } else {
         Write-Log 'Task scheduler query encountered an operational access limitation.' -Level WARN
         Write-Log ("[WARNING] schtasks query returned non-zero code: {0}" -f $auditStatus) -Level WARN
+    }
+
+    # ---- Step 20 disable phase (gated) ----
+    if ($Script:AllowScheduledTaskAction -and -not $Script:DryRun -and $tasks.Count -gt 0) {
+        $candidates = @($tasks | Where-Object {
+            $_.TaskPath -notlike '\Microsoft\*' -and
+            $_.State -eq 'Ready' -and
+            $_.TaskPath -notmatch '^\\Microsoft\\Windows\\(UpdateOrchestrator|Defrag|SystemRestore)\\'
+        })
+
+        if ($candidates.Count -gt 0) {
+            Write-Host ''
+            Write-Log ("Step 20 disable phase: {0} non-Microsoft Ready task(s) eligible" -f $candidates.Count) -Level WARN
+            foreach ($c in $candidates) {
+                Write-Log ("  [CANDIDATE] {0}{1}" -f $c.TaskPath, $c.TaskName) -Level WARN
+            }
+
+            if (Confirm-Action -Query ('Disable {0} candidate task(s)?' -f $candidates.Count)) {
+                $disabled = 0; $failed = 0
+                foreach ($c in $candidates) {
+                    try {
+                        Disable-ScheduledTask -TaskPath $c.TaskPath -TaskName $c.TaskName -ErrorAction Stop | Out-Null
+                        Write-Log ("  [DISABLED] {0}{1}" -f $c.TaskPath, $c.TaskName) -Level OK
+                        Add-RollbackEntry -Step 20 -Type 'ScheduledTask' -Data @{
+                            Path = $c.TaskPath
+                            Name = $c.TaskName
+                        }
+                        $disabled++
+                    } catch {
+                        Write-Log ("  [FAIL] {0}{1}: {2}" -f $c.TaskPath, $c.TaskName, $_.Exception.Message) -Level WARN
+                        $failed++
+                    }
+                }
+                Write-Log ("  Step 20 disable summary: {0} disabled, {1} failed" -f $disabled, $failed) -Level INFO
+            } else {
+                Write-Log 'Step 20 disable phase declined by user.' -Level INFO
+            }
+        }
+    } elseif (-not $Script:AllowScheduledTaskAction -and $tasks.Count -gt 0) {
+        $candidateCount = @($tasks | Where-Object { $_.TaskPath -notlike '\Microsoft\*' -and $_.State -eq 'Ready' }).Count
+        if ($candidateCount -gt 0) {
+            Write-Log ("  {0} non-Microsoft Ready task(s) - audit only (use -AllowScheduledTaskAction to disable)" -f $candidateCount) -Level INFO
+        }
     }
 
     Write-Log 'Step 20 complete.' -Level OK
