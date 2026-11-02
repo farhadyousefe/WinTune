@@ -12965,7 +12965,7 @@ function Write-HtmlReport {
     <#
     .SYNOPSIS
         Serializes $Script:Report to a self-contained HTML file
-        at D:\PS\Reports\WinTune_Report_<timestamp>.html.
+        in <ScriptDir>\Reports\WinTune_Report_<timestamp>.html.
 
     .DESCRIPTION
         Reads:
