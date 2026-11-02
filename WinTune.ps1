@@ -2215,7 +2215,9 @@ $Script:EmbeddedWuRunner = @'
 # Launched by WinTune Step 39. Runs in its own visible window.
 
 $ErrorActionPreference = 'Continue'
-$ProgressPreference = 'SilentlyContinue'
+# ProgressPreference must be Continue, not SilentlyContinue, or
+# PSWindowsUpdate's native Write-Progress bars are suppressed.
+$ProgressPreference = 'Continue'
 $__logDir = if ($env:FC_LOG_DIR) { $env:FC_LOG_DIR } else { Split-Path -Parent $PSCommandPath }
 $logFile = if ($env:FC_LOG_DIR) { Join-Path $env:FC_LOG_DIR 'WinTune_WU.log' } else { Join-Path (Split-Path -Parent $PSCommandPath) 'WinTune_WU.log' }
 function WU-Log {
@@ -2288,12 +2290,22 @@ try {
 
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
+    # Make PSGallery trust a hard step BEFORE any module operation.
+    # A silent failure here is what causes the interactive "install from
+    # untrusted repository?" prompt. If trust cannot be established we
+    # log it loudly so the user knows why a prompt appeared.
     try {
-        if (-not (Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue)) {
-            Register-PSRepository -Default -ErrorAction SilentlyContinue
+        $__repo = Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue
+        if (-not $__repo) {
+            Register-PSRepository -Default -ErrorAction Stop
+            WU-Log 'PSGallery repository registered.' 'OK'
         }
-        Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction SilentlyContinue
-    } catch { }
+        Set-PSRepository -Name PSGallery -InstallationPolicy Trusted -ErrorAction Stop
+        WU-Log 'PSGallery trusted - no install prompt expected.' 'OK'
+    } catch {
+        WU-Log ("PSGallery trust failed: {0}" -f $_.Exception.Message) 'WARN'
+        WU-Log 'Module install may prompt for repository confirmation.' 'WARN'
+    }
 
     $minVersion = [version]'2.2.1.5'
     $module = Get-Module -ListAvailable -Name PSWindowsUpdate -ErrorAction SilentlyContinue |
@@ -2303,7 +2315,14 @@ try {
     if (-not $module) {
         WU-Log 'PSWindowsUpdate not installed - installing from PSGallery...' 'STEP'
         try {
-            Install-Module -Name PSWindowsUpdate -Scope CurrentUser -Force -AllowClobber -SkipPublisherCheck -Confirm:$false -ErrorAction Stop
+            Install-Module -Name PSWindowsUpdate `
+                -Scope CurrentUser `
+                -Force `
+                -AllowClobber `
+                -SkipPublisherCheck `
+                -AcceptLicense `
+                -Confirm:$false `
+                -ErrorAction Stop
             WU-Log 'PSWindowsUpdate installed.' 'OK'
         } catch {
             WU-Log "Failed to install PSWindowsUpdate: $($_.Exception.Message)" 'ERROR'
