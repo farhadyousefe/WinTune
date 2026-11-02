@@ -311,7 +311,7 @@ $Script:StartFreeBytes      = 0
 $Script:StartFreeDisplay    = '0.00'
 $Script:LockStream          = $null
 $Script:RebootRequired      = $false
-$Script:RebootReasons       = New-Object System.Collections.ArrayList
+$Script:RebootReasons       = @()
 $Script:LastStepStatus      = $null   # set by steps that want non-default report status
 
 # Detached runner tracking (populated by Fix A / Fix B / Fix C)
@@ -1129,6 +1129,9 @@ function New-SecureRunnerPath {
         $Script:RunnerTempDir = Join-Path $env:TEMP ([Guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Path $Script:RunnerTempDir -Force -ErrorAction Stop | Out-Null
         try {
+            # Ensure the Security module is loaded; non-interactive
+            # PowerShell hosts may not auto-load it.
+            Import-Module Microsoft.PowerShell.Security -Force -ErrorAction SilentlyContinue
             $acl = Get-Acl -LiteralPath $Script:RunnerTempDir
             $acl.SetAccessRuleProtection($true, $false)
             $acl.Access | ForEach-Object { $acl.RemoveAccessRule($_) | Out-Null }
@@ -3392,8 +3395,23 @@ function Invoke-Step01 {
             Write-Log ("  [OK] Stopped: {0} ({1:N1}s)" -f $svc, $stopSw.Elapsed.TotalSeconds) -Level OK
             $stoppedServices += $svc
         } else {
-            Write-Log ("  [WARN] {0} still not Stopped after 30s (skipping its cache clear)" -f $svc) -Level WARN
-            $stillRunningServices += $svc
+            # wuauserv in particular can take longer when WU is mid-download.
+            # Re-attempt once with a longer timeout before giving up.
+            Write-Log ("  [INFO] {0} still not Stopped after 30s - retrying with 60s grace..." -f $svc) -Level INFO
+            $deadline2 = (Get-Date).AddSeconds(60)
+            $becameStopped2 = $false
+            while ((Get-Date) -lt $deadline2) {
+                $s2 = Get-Service -Name $svc -ErrorAction SilentlyContinue
+                if ($s2 -and $s2.Status -eq 'Stopped') { $becameStopped2 = $true; break }
+                Start-Sleep -Milliseconds 1000
+            }
+            if ($becameStopped2) {
+                Write-Log ("  [OK] Stopped on retry: {0}" -f $svc) -Level OK
+                $stoppedServices += $svc
+            } else {
+                Write-Log ("  [WARN] {0} still not Stopped after retry (skipping its cache clear)" -f $svc) -Level WARN
+                $stillRunningServices += $svc
+            }
         }
     }
 
@@ -3548,7 +3566,7 @@ function Invoke-Step01 {
 
         # ---- Verify services reached Running state ----
         Write-Log 'Verifying service health...' -Level INFO
-        $deadline = (Get-Date).AddSeconds(20)
+        $deadline = (Get-Date).AddSeconds(45)
         $pending  = @('wuauserv', 'dosvc')
 
         while ((Get-Date) -lt $deadline -and $pending.Count -gt 0) {
@@ -3580,9 +3598,15 @@ function Invoke-Step01 {
         if ($remaining.Count -eq 0) {
             Write-Log '  [OK] DO cache is empty - no residual jobs.' -Level OK
         } else {
-            Write-Log ("  [WARN] {0} DO job(s) still present after cache clear." -f $remaining.Count) -Level WARN
-            Write-Log '  This usually means a WU download was active when services stopped.' -Level INFO
-            Write-Log '  They will either resume or expire on their own.' -Level INFO
+            $pausedCount   = @($remaining | Where-Object { $_.Status -eq 'Paused' }).Count
+            $activeCount   = $remaining.Count - $pausedCount
+            if ($activeCount -gt 0) {
+                Write-Log ("  [WARN] {0} DO job(s) still active after cache clear." -f $activeCount) -Level WARN
+            }
+            if ($pausedCount -gt 0) {
+                Write-Log ("  [INFO] {0} DO job(s) paused (retained by Windows for resume; expected)." -f $pausedCount) -Level INFO
+            }
+            Write-Log '  Paused jobs will resume or expire on their own.' -Level INFO
             foreach ($j in $remaining) {
                 $mb = [math]::Round([int64]$j.TotalBytesDownloaded / 1MB, 1)
                 Write-Log ("    {0}: {1:N1} MB, Status={2}" -f $j.FileId.Substring(0,8), $mb, $j.Status) -Level DEBUG
@@ -11735,8 +11759,8 @@ function Invoke-Step45 {
             Write-Log '[REBOOT REQUIRED] The prefetcher change takes effect on next boot.' -Level WARN
             Write-Log 'Rollback: set EnablePrefetcher and EnableSuperfetch back to 3.' -Level INFO
             $Script:RebootRequired = $true
-            if ($Script:RebootReasons -and -not $Script:RebootReasons.Contains('Step 45 (prefetcher)')) {
-                [void]$Script:RebootReasons.Add('Step 45 (prefetcher)')
+            if ($Script:RebootReasons -notcontains 'Step 45 (prefetcher)') {
+                $Script:RebootReasons += 'Step 45 (prefetcher)'
             }
         } catch {
             Write-Log ("  [WARN] Could not write PrefetchParameters: {0}" -f $_.Exception.Message) -Level WARN
@@ -14084,8 +14108,9 @@ function Invoke-PostCheck {
 
     $reasons = @()
     if ($Script:RebootRequired) {
-        if ($Script:RebootReasons -and $Script:RebootReasons.Count -gt 0) {
-            foreach ($r in $Script:RebootReasons) {
+        $__reasonsArr = @($Script:RebootReasons)
+        if ($__reasonsArr.Count -gt 0) {
+            foreach ($r in $__reasonsArr) {
                 $reasons += ("WinTune: {0}" -f $r)
             }
         } else {
