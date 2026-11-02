@@ -285,9 +285,24 @@ switch ($Script:PresetName.ToLowerInvariant()) {
     }
 }
 
-# Merge user -SkipSteps with profile skip list (union, not overwrite)
-$__profileSkips = @($SkipSteps)
-$SkipSteps = @($__profileSkips + $__userSkipSteps) | Sort-Object -Unique
+# Merge user -SkipSteps with profile skip list (union, not overwrite).
+# Fix-SkipSteps-Merge-applied
+# Both sides are normalised to strings first: the preset switch assigns
+# integers (@(4,5,6,...)) while the parameter is [string[]] (from
+# -SkipSteps 1,1b,...). Mixing int[] and string[] breaks Sort-Object
+# -Unique in PS 5.1 (dedupe only within type groups). The explicit
+# hashtable dedupe below is type-agnostic.
+$__profileSkips = @($SkipSteps | ForEach-Object { [string]$_ })
+$__userSkipSteps = @($__userSkipSteps | ForEach-Object { [string]$_ })
+$__seen = @{}
+$__merged = New-Object System.Collections.ArrayList
+foreach ($v in @($__profileSkips + $__userSkipSteps)) {
+    if (-not $__seen.ContainsKey($v)) {
+        $__seen[$v] = $true
+        [void]$__merged.Add($v)
+    }
+}
+$SkipSteps = @($__merged | Sort-Object)
 
 $Script:FeatureUpdateDelayDays = $FeatureUpdateDelayDays
 
