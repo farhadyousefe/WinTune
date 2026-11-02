@@ -5799,6 +5799,47 @@ function Invoke-Step10 {
 
     # ---- 3. Summary ----
 
+    # ---- 3. Telemetry scheduled tasks ----
+    Write-Log 'Disabling telemetry scheduled tasks...' -Level INFO
+
+    # Positive list (NOT a regex) - localized Windows task names break regex.
+    $telemetryTasks = @(
+        @{ Path = '\Microsoft\Windows\Application Experience\';                    Name = 'ProgramDataUpdater' }
+        @{ Path = '\Microsoft\Windows\Application Experience\';                    Name = 'Microsoft Compatibility Appraiser' }
+        @{ Path = '\Microsoft\Windows\Application Experience\';                    Name = 'StartupAppTask' }
+        @{ Path = '\Microsoft\Windows\Customer Experience Improvement Program\';   Name = 'Consolidator' }
+        @{ Path = '\Microsoft\Windows\Customer Experience Improvement Program\';   Name = 'UsbCeip' }
+        @{ Path = '\Microsoft\Windows\Customer Experience Improvement Program\';   Name = 'KernelCeipTask' }
+        @{ Path = '\Microsoft\Windows\Autochk\';                                   Name = 'Proxy' }
+        @{ Path = '\Microsoft\Windows\Feedback\Siuf\';                             Name = 'DmClient' }
+        @{ Path = '\Microsoft\Windows\Feedback\Siuf\';                             Name = 'DmClientOnScenarioDownload' }
+        @{ Path = '\Microsoft\Windows\Windows Error Reporting\';                   Name = 'QueueReporting' }
+    )
+
+    $tasksDisabled = 0
+    $tasksSkipped  = 0
+    foreach ($t in $telemetryTasks) {
+        $task = Get-ScheduledTask -TaskPath $t.Path -TaskName $t.Name -ErrorAction SilentlyContinue
+        if (-not $task) {
+            Write-Log ("  [SKIP] Task not present: {0}{1}" -f $t.Path, $t.Name) -Level DEBUG
+            $tasksSkipped++
+            continue
+        }
+        if ($task.State -eq 'Disabled') {
+            Write-Log ("  [SKIP] Already disabled: {0}{1}" -f $t.Path, $t.Name) -Level DEBUG
+            $tasksSkipped++
+            continue
+        }
+        try {
+            Disable-ScheduledTask -TaskPath $t.Path -TaskName $t.Name -ErrorAction Stop | Out-Null
+            Write-Log ("  [OK] Disabled task: {0}{1}" -f $t.Path, $t.Name) -Level OK
+            $tasksDisabled++
+        } catch {
+            Write-Log ("  [WARN] Could not disable {0}{1}: {2}" -f $t.Path, $t.Name, $_.Exception.Message) -Level WARN
+        }
+    }
+    Write-Log ("  Telemetry tasks: {0} disabled, {1} already/skipped" -f $tasksDisabled, $tasksSkipped) -Level INFO
+
     # ---- Advertising ID (privacy) ----
     Write-Log 'Disabling Advertising ID...' -Level INFO
     $advPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AdvertisingInfo'
