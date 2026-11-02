@@ -135,12 +135,20 @@ $Script:ScriptName   = Split-Path -Leaf   $Script:ScriptPath
 $Script:RunStamp     = Get-Date -Format 'yyyyMMdd_HHmmss'
 $Script:LogFile      = Join-Path $Script:ScriptDir 'WinTune.log'
 
-# ---- Log truncation: if the file is over 5 MB, delete it and start fresh ----
+# ---- Log rotation: if the file is over 5 MB, rotate to timestamped file
+# ---- and keep the 3 most recent rotated logs. Never silently delete. ----
 if (Test-Path -LiteralPath $Script:LogFile) {
     try {
         $__logSize = (Get-Item -LiteralPath $Script:LogFile -Force -ErrorAction Stop).Length
         if ($__logSize -gt 5MB) {
-            Remove-Item -LiteralPath $Script:LogFile -Force -ErrorAction SilentlyContinue
+            $__rotated = '{0}.{1}.log' -f ($Script:LogFile -replace '\.log$',''), $Script:RunStamp
+            Move-Item -LiteralPath $Script:LogFile -Destination $__rotated -Force -ErrorAction Stop
+            # Keep only the 3 most recent rotated logs
+            $__rotatedFiles = Get-ChildItem -LiteralPath $Script:ScriptDir -Filter 'WinTune.*.log' -File -ErrorAction SilentlyContinue |
+                              Sort-Object LastWriteTime -Descending
+            if ($__rotatedFiles.Count -gt 3) {
+                $__rotatedFiles | Select-Object -Skip 3 | Remove-Item -Force -ErrorAction SilentlyContinue
+            }
         }
     } catch { }
 }
@@ -242,6 +250,8 @@ $Script:StartFreeBytes      = 0
 $Script:StartFreeDisplay    = '0.00'
 $Script:LockStream          = $null
 $Script:RebootRequired      = $false
+$Script:RebootReasons       = New-Object System.Collections.ArrayList
+$Script:LastStepStatus      = $null   # set by steps that want non-default report status
 $Script:ResetBaseStatus     = $null
 
 
@@ -654,10 +664,27 @@ function Invoke-NativeLive {
     }
 
     # Footer
+    # ---- Copy capture file into the log (Bug 3) ----
+    if ($captureFile -and (Test-Path -LiteralPath $captureFile)) {
+        try {
+            $captured = Get-Content -LiteralPath $captureFile -Raw -ErrorAction SilentlyContinue
+            if ($captured) {
+                Add-Content -LiteralPath $logFile -Value $captured -Encoding UTF8 -ErrorAction SilentlyContinue
+            }
+        } catch { }
+    }
+
     $duration = (Get-Date) - $start
     $footer = "--- $Label complete in [ $(([math]::Round($duration.TotalMinutes, 1))) min ] (Exit Code: $exitCode) ---"
     Write-Host $footer -ForegroundColor DarkGray
     try { Add-Content -LiteralPath $logFile -Value $footer -Encoding UTF8 } catch {}
+
+    # Cleanup temp files
+    foreach ($f in @($captureFile, $cmdScript)) {
+        if ($f -and (Test-Path -LiteralPath $f)) {
+            Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue
+        }
+    }
 
     return @{ ExitCode = $exitCode }
 }
@@ -1606,7 +1633,7 @@ function Add-ReportStep {
         [Parameter(Mandatory)][string]$Number,
         [Parameter(Mandatory)][string]$Name,
         [Parameter(Mandatory)]
-        [ValidateSet('OK','Skipped','Failed','Gated','DryRun','Warning','NoOp')]
+        [ValidateSet('OK','Skipped','Failed','Gated','DryRun','Warning','NoOp','Detached')]
         [string]$Status,
         [string]$Detail = '',
         [TimeSpan]$Duration = [TimeSpan]::Zero
@@ -1976,7 +2003,6 @@ try {
         Pause-Exit -ExitCode 1
     }
     WG-Log ("winget: {0}" -f $wg.Source) 'OK'
-    WG-Log "winget: $($wg.Source)" 'OK'
 
     try {
         $wgVersion = (& winget.exe --version 2>&1 | Select-Object -First 1)
@@ -1987,12 +2013,35 @@ try {
         WG-Log 'Could not determine winget version.' 'WARN'
     }
 
-    WG-Log 'Accepting winget source agreements...' 'STEP'
-    try {
-        $null = & winget.exe source update --accept-source-agreements 2>&1
-        WG-Log 'Source agreements accepted.' 'OK'
-    } catch {
-        WG-Log "Source agreement acceptance failed: $($_.Exception.Message)" 'WARN'
+    WG-Log 'Refreshing winget source index (this may fail on restricted networks)...' 'STEP'
+    $__srcOk = $false
+    $__srcOut = @()
+    for ($__attempt = 1; $__attempt -le 3; $__attempt++) {
+        try {
+            # NOTE: winget source update does NOT accept
+            # --accept-source-agreements. That flag exists only on
+            # search / install / upgrade / list. Passing it here causes
+            # the command to fail with its usage text, which is the
+            # historical cause of the 0x8A150014 cascade downstream.
+            $__srcOut = & winget.exe source update 2>&1
+            if ($LASTEXITCODE -eq 0) { $__srcOk = $true; break }
+        } catch {
+            $__srcOut = @($_.Exception.Message)
+        }
+        if ($__attempt -lt 3) {
+            WG-Log ("  source update attempt {0}/3 failed, retrying in 5s..." -f $__attempt) 'WARN'
+            Start-Sleep -Seconds 5
+        }
+    }
+
+    if ($__srcOk) {
+        WG-Log 'Source index refreshed.' 'OK'
+    } else {
+        WG-Log 'winget source update FAILED after 3 attempts.' 'WARN'
+        foreach ($__l in $__srcOut) { if (-not [string]::IsNullOrWhiteSpace($__l)) { WG-Log ("  [src] $__l") 'WARN' } }
+        WG-Log 'Upgrade pass will run against a CACHED index.' 'WARN'
+        WG-Log 'If upgrades fail with 0x8A150014 (UPDATE_NOT_APPLICABLE), the cached index is stale.' 'WARN'
+        WG-Log 'Typical causes: firewall blocking cdn.winget.microsoft.com (Zscaler, VPN, proxy).' 'WARN'
     }
 
     # ============================================================
@@ -2099,8 +2148,26 @@ try {
         $installOk = ($exitCode -eq 0)
 
         $duration = (Get-Date) - $start
+
+        # Map winget exit codes to readable text
+        $codeText = switch ([int64]$exitCode) {
+            0            { 'SUCCESS' }
+            -1978335188  { 'APPINSTALLER_CLI_ERROR_UPDATE_NOT_APPLICABLE (0x8A150014) - source index is stale, or package requires interactive install' }
+            -1978335135  { 'APPINSTALLER_CLI_ERROR_NO_APPLICABLE_UPGRADE_FOUND (0x8A150031)' }
+            -1978335182  { 'APPINSTALLER_CLI_ERROR_INSTALL_PACKAGE_IN_USE (0x8A15001A)' }
+            -1978334968  { 'APPINSTALLER_CLI_ERROR_INSTALL_REBOOT_REQUIRED_TO_FINISH (0x8A1500A8)' }
+            default      { "exit code {0} (0x{1:X8})" -f $exitCode, [uint32]$exitCode }
+        }
+
         $level = if ($installOk) { 'OK' } else { 'WARN' }
-        WG-Log ("Winget upgrade completed in {0:N1} minutes (exit code {1})." -f $duration.TotalMinutes, $exitCode) $level
+        WG-Log ("Winget upgrade completed in {0:N1} minutes." -f $duration.TotalMinutes) $level
+        WG-Log ("  Result: {0}" -f $codeText) $level
+
+        if (-not $installOk -and [int64]$exitCode -eq -1978335188) {
+            WG-Log '  Recommendation: check network path to cdn.winget.microsoft.com, then re-run:' 'INFO'
+            WG-Log '    winget source update' 'INFO'
+            WG-Log '    winget upgrade --all' 'INFO'
+        }
     } catch {
         WG-Log "Upgrade failed: $($_.Exception.Message)" 'ERROR'
     }
@@ -2167,16 +2234,43 @@ function Reset-WUCache {
         }
         Start-Sleep -Seconds 3
 
+        # ---- Wait for SoftwareDistribution handles to release ----
+        $sd = Join-Path $env:SystemRoot 'SoftwareDistribution'
+        $cr = Join-Path $env:SystemRoot 'System32\catroot2'
+
+        $waitDeadline = (Get-Date).AddSeconds(10)
+        $canRenameSd  = $false
+        while ((Get-Date) -lt $waitDeadline) {
+            try {
+                if (Test-Path -LiteralPath $sd) {
+                    $probe = [System.IO.File]::Open((Join-Path $sd 'Download'),
+                        [System.IO.FileMode]::Open,
+                        [System.IO.FileAccess]::ReadWrite,
+                        [System.IO.FileShare]::None)
+                    $probe.Close(); $probe.Dispose()
+                }
+                $canRenameSd = $true
+                break
+            } catch {
+                Start-Sleep -Milliseconds 500
+            }
+        }
+
+        if (-not $canRenameSd) {
+            return @{ Ok = $false; Reason = 'SoftwareDistribution\Download still locked after 10s (wuauserv may not have fully stopped)' }
+        }
+
         # Rename caches with timestamp so old state is preserved
         $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-        $sd    = Join-Path $env:SystemRoot 'SoftwareDistribution'
-        $cr    = Join-Path $env:SystemRoot 'System32\catroot2'
-
-        if (Test-Path -LiteralPath $sd) {
-            Rename-Item -LiteralPath $sd -NewName "SoftwareDistribution.old_$stamp" -Force -ErrorAction Stop
-        }
-        if (Test-Path -LiteralPath $cr) {
-            Rename-Item -LiteralPath $cr -NewName "catroot2.old_$stamp" -Force -ErrorAction Stop
+        try {
+            if (Test-Path -LiteralPath $sd) {
+                Rename-Item -LiteralPath $sd -NewName "SoftwareDistribution.old_$stamp" -Force -ErrorAction Stop
+            }
+            if (Test-Path -LiteralPath $cr) {
+                Rename-Item -LiteralPath $cr -NewName "catroot2.old_$stamp" -Force -ErrorAction Stop
+            }
+        } catch {
+            return @{ Ok = $false; Reason = ("Rename failed: {0}" -f $_.Exception.Message) }
         }
 
         # Restart services (cryptsvc first so wuauserv can bind)
@@ -2188,18 +2282,17 @@ function Reset-WUCache {
         Start-Sleep -Seconds 3
 
         # Verify wuauserv is running - poll for up to 30 seconds
-        # (Windows Update services can take 10-20s to fully start after a cache reset)
         $deadline = (Get-Date).AddSeconds(30)
         while ((Get-Date) -lt $deadline) {
             $wu = Get-Service -Name wuauserv -ErrorAction SilentlyContinue
             if ($wu -and $wu.Status -eq 'Running') {
-                return $true
+                return @{ Ok = $true; Reason = 'ok' }
             }
             Start-Sleep -Seconds 2
         }
-        return $false
+        return @{ Ok = $false; Reason = 'wuauserv did not return to Running within 30s after cache reset' }
     } catch {
-        return $false
+        return @{ Ok = $false; Reason = ("Reset-WUCache outer error: {0}" -f $_.Exception.Message) }
     }
 }
 
@@ -2377,7 +2470,11 @@ try {
             WU-Log 'This is a known Windows Update Agent state issue.' 'WARN'
             WU-Log 'Resetting Windows Update cache (stops services, clears caches)...' 'STEP'
 
-            if (Reset-WUCache) {
+            $resetResult = Reset-WUCache
+            $resetOk    = if ($resetResult -is [hashtable]) { $resetResult.Ok } else { [bool]$resetResult }
+            $resetWhy   = if ($resetResult -is [hashtable] -and $resetResult.Reason) { $resetResult.Reason } else { '(no reason)' }
+
+            if ($resetOk) {
                 WU-Log 'Cache reset complete. Retrying scan in 5 seconds...' 'STEP'
                 Start-Sleep -Seconds 5
 
@@ -2392,7 +2489,7 @@ try {
                     WU-Log 'Run Windows Update manually: Settings -> Windows Update' 'INFO'
                 }
             } else {
-                WU-Log 'Cache reset did not complete (services may still be recovering).' 'WARN'
+                WU-Log ("Cache reset did not complete: {0}" -f $resetWhy) 'WARN'
                 WU-Log 'Scan failed and cache reset did not complete.' 'ERROR'
                 WU-Log 'Run Windows Update manually: Settings -> Windows Update' 'INFO'
             }
@@ -4635,6 +4732,9 @@ function DR-TestCandidate {
 
     # Gate 2: Size
     $sizeMB = [int64]$Update.MaxDownloadSize / 1MB
+    if ([int64]$Update.MaxDownloadSize -eq 0) {
+        return @{ Pass = $false; Reason = 'Zero-size driver (notification-only; install via Windows Update Optional Updates)' }
+    }
     if ($sizeMB -gt $maxSizeMB) {
         return @{ Pass = $false; Reason = ("Suspicious size ({0:N0} MB > {1} MB)" -f $sizeMB, $maxSizeMB) }
     }
@@ -4914,7 +5014,21 @@ try {
                 DR-Log ("  [OK] Downloaded ({0:N1} MB)" -f $sizeMB) 'OK'
                 $dlOk = $true
             } else {
-                if ($dlResult -and $dlResult.HResult) { $dlHres = $dlResult.HResult }
+                # Recover the real HResult from whichever source has it.
+                # $dlResult.HResult is populated when the downloader
+                # returned a structured failure; otherwise the runspace
+                # exception text carries the HResult as "Exception from
+                # HRESULT: 0xNNNNNNNN" - parse it out so the log line
+                # stops printing 0x00000000 next to a real error code.
+                if ($dlResult -and $dlResult.HResult -and [int64]$dlResult.HResult -ne 0) {
+                    $dlHres = [int64]$dlResult.HResult
+                } elseif ($dlResult -and $dlResult.Error -and $dlResult.Error -match 'HRESULT:\s*0x([0-9A-Fa-f]{8})') {
+                    # Cast back to signed int so the skip switch below matches
+                    $dlHres = [int32][Convert]::ToUInt32($matches[1], 16)
+                } else {
+                    $dlHres = 0
+                }
+
                 $errText = if ($dlResult -and $dlResult.Error) { $dlResult.Error } else { '(no error text)' }
                 DR-Log ("  [FAIL] Download failed (0x{0:X8}) - {1}" -f $dlHres, $errText) 'ERROR'
                 $failCount++
@@ -4957,11 +5071,16 @@ try {
             $skipReason = $null
             if ($effectiveHResult -ne 0) {
                 switch ($effectiveHResult) {
-                    -2145124329 { $skipReason = 'Not applicable to this system' }                       # 0x80240017
-                    -2145124320 { $skipReason = 'Another install in progress' }                          # 0x80240020
-                    -2145124307 { $skipReason = 'Reboot required before install' }                       # 0x8024002D
-                    -2144796149 { $skipReason = 'User logon required' }                                  # 0x800F020B
-                    -2145124341 { $skipReason = 'Call cancelled' }                                       # 0x8024000B
+                    -2145124329 { $skipReason = 'Not applicable to this system (0x80240017)' }                    # WU_E_NOT_APPLICABLE
+                    -2145124320 { $skipReason = 'Another install in progress (0x80240020)' }                       # WU_E_INSTALL_NOT_ALLOWED
+                    -2145124307 { $skipReason = 'Reboot required before install (0x8024002D)' }                    # WU_E_SOURCE_ABSENT
+                    -2144796149 { $skipReason = 'User logon required (0x800F020B)' }                               # WU_E_USER_LOGON_REQUIRED
+                    -2145124341 { $skipReason = 'Call cancelled (0x8024000B)' }                                    # WU_E_CALL_CANCELLED
+                    -2145124318 { $skipReason = 'All updates failed to install (0x80240022 WU_E_ALL_UPDATES_FAILED) - likely a signed-package or applicability issue; try installing manually via Windows Update' }
+                    -2145124302 { $skipReason = 'Update not applicable to current OS version (0x80240032)' }       # WU_E_INVALID_OPERATION
+                    -2147024891 { $skipReason = 'Access denied (0x80070005) - run as SYSTEM or elevated' }         # E_ACCESSDENIED
+                    -2147023436 { $skipReason = 'Timeout (0x800705B4) - driver download/install exceeded WUA timeout' } # ERROR_TIMEOUT
+                    -2145124322 { $skipReason = 'WU service stopped (0x8024001E WU_E_SERVICE_STOP) - transient; retry the step' } # WU_E_SERVICE_STOP
                 }
             }
 
@@ -5124,6 +5243,7 @@ function Invoke-Step08b {
 
     Write-Log 'Step 8b launched (detached). Driver update audit runs independently.' -Level OK
     Write-Log '[SUCCESS] Step 8b: Detached driver update shell launched.' -Level OK
+    $Script:LastStepStatus = 'Detached'
 }
 # ============================================================
 # STEP 9: Dead Desktop Shortcut Link Clipper
@@ -5705,6 +5825,8 @@ function Invoke-Step12 {
     Remove-Item Env:\FC_ALLOW_DISM_RESTORE -ErrorAction SilentlyContinue
     Remove-Item Env:\FC_YES_TO_ALL         -ErrorAction SilentlyContinue
     Write-Log '[SUCCESS] Step 12: Detached SFC / DISM shell launched.' -Level OK
+    Write-Log ('[INFO] Repair result will be in WinTune_SfcDism.log after the child exits (PID {0}).' -f $child.Id) -Level INFO
+    $Script:LastStepStatus = 'Detached'
 }
 
 
@@ -7092,6 +7214,9 @@ function Invoke-Step23 {
 
         # Mark reboot as required for the final summary (PostCheck)
         $Script:RebootRequired = $true
+        if ($Script:RebootReasons -and -not $Script:RebootReasons.Contains('Step 23 (network reset)')) {
+            [void]$Script:RebootReasons.Add('Step 23 (network reset)')
+        }
     } else {
         Write-Log 'Some network interface modifications could not be fully written.' -Level WARN
         Write-Log ("[WARNING] netsh stack realignment returned non-zero code: {0}" -f $exitStatus) -Level WARN
@@ -7474,7 +7599,42 @@ if (-not (Confirm-Action -Query 'Create a pre-change restore point?')) {
         if ($finalRps -gt $rpCount) {
             Write-Log ("  Verified: restore point count increased {0} -> {1}" -f $rpCount, $finalRps) -Level OK
         } else {
-            Write-Log ("  [WARN] Checkpoint-Computer reported success but count unchanged ({0})." -f $rpCount) -Level WARN
+            # Diagnose why the count didn't move. Two common causes:
+            #   (a) VSS cap from Step 17 is full, so Windows pruned the
+            #       oldest point to make room for the new one (net zero).
+            #   (b) SystemRestorePointCreationFrequency is still honored
+            #       despite our reg override (rare, but happens when a
+            #       domain GPO overrides the HKCU/HKLM value).
+            Write-Log ("  [WARN] Checkpoint-Computer reported success but restore point count is still {0}." -f $rpCount) -Level WARN
+
+            # (a) Inspect VSS storage usage
+            $capDiag = $null
+            try {
+                $vssOut = & vssadmin.exe list shadowstorage 2>&1
+                $capDiag = ($vssOut | Where-Object { $_ -match 'Maximum Shadow Copy Storage space|Used Shadow Copy Storage space|Allocated Shadow Copy Storage space' }) -join ' | '
+            } catch { }
+
+            if ($capDiag) {
+                Write-Log ("  [DIAG] VSS storage: {0}" -f $capDiag) -Level INFO
+                Write-Log '  [DIAG] Most likely cause: the 5 GB VSS cap from Step 17 is already full,' -Level INFO
+                Write-Log '         so Windows silently pruned the oldest restore point to fit the new one.' -Level INFO
+                Write-Log '  [DIAG] Fix: increase the cap with:' -Level INFO
+                Write-Log '         vssadmin resize shadowstorage /for=C: /on=C: /maxsize=10GB' -Level INFO
+                Write-Log '         or remove older points manually via System Restore UI.' -Level INFO
+            } else {
+                Write-Log '  [DIAG] Could not read VSS storage. Possible causes:' -Level INFO
+                Write-Log '         - VSS cap from Step 17 is full (older point pruned)' -Level INFO
+                Write-Log '         - SystemRestorePointCreationFrequency is still enforced by domain GPO' -Level INFO
+                Write-Log '         - Checkpoint-Computer no-op because a point was created <24h ago' -Level INFO
+            }
+
+            # (b) Check the frequency value still in place
+            try {
+                $freqNow = (Get-ItemProperty -Path $restoreRegPath -Name 'SystemRestorePointCreationFrequency' -ErrorAction SilentlyContinue).SystemRestorePointCreationFrequency
+                if ($null -ne $freqNow -and [int]$freqNow -ne 0) {
+                    Write-Log ("  [DIAG] SystemRestorePointCreationFrequency is {0} (not 0) after Checkpoint - a GPO is overriding it." -f $freqNow) -Level WARN
+                }
+            } catch { }
         }
     } catch {
         Write-Log '  [WARNING] Unable to generate checkpoint. Ensure System Protection is enabled.' -Level WARN
@@ -8822,7 +8982,15 @@ function Invoke-Step32 {
                 Write-Log ("  {0}: {1}" -f $id, $modeText) -Level INFO
             }
         } catch {
-            Write-Log '  Could not read current ASR state.' -Level WARN
+            Write-Log '  Could not read current ASR state locally.' -Level WARN
+            if ($domainJoined32) {
+                Write-Log '  This is EXPECTED on domain-joined machines: ASR state is managed by Group Policy.' -Level INFO
+                Write-Log '  To view the effective rules, run on the domain controller:' -Level INFO
+                Write-Log '    Get-MpPreference (from a machine with the Defender module)' -Level INFO
+                Write-Log '  or check GPO: Computer Configuration -> Administrative Templates -> Windows Components -> Microsoft Defender Antivirus -> Attack Surface Reduction' -Level INFO
+            } else {
+                Write-Log '  Run Get-MpPreference manually to inspect current ASR rules.' -Level INFO
+            }
         }
         Write-Log 'Step 32 complete (domain policy mode).' -Level OK
         return
@@ -9023,6 +9191,7 @@ function Invoke-Step33 {
     Remove-Item Env:\FC_YES_TO_ALL -ErrorAction SilentlyContinue
     Remove-Item Env:\FC_ALLOW_UNKNOWN_VERSIONS -ErrorAction SilentlyContinue
     Write-Log '[SUCCESS] Step 33: Detached winget upgrade shell launched.' -Level OK
+    $Script:LastStepStatus = 'Detached'
 }
 
 
@@ -9397,6 +9566,12 @@ function Invoke-Step35 {
     }
 
     # ---- Confirm removal ----
+    if ($removable.Count -eq 0) {
+        Write-Log 'No provisioned bloatware candidates detected - nothing to remove.' -Level OK
+        Write-Log '[SUCCESS] Step 35: No bloatware candidates detected.' -Level OK
+        return
+    }
+
     Write-Log ('[WARNING] About to REMOVE {0} provisioned packages.' -f $removable.Count) -Level WARN
     Write-Log 'These will not be reinstalled on new user profiles.' -Level WARN
 
@@ -9544,7 +9719,6 @@ function Invoke-Step36 {
         Write-Log 'require a reboot. It is intentionally NOT automated here because' -Level INFO
         Write-Log 'it temporarily disables Search (including Outlook/Exchange search).' -Level INFO
         Write-Log '' -Level INFO
-        Write-Log '[INFO] Step 36 skipped: modern index layout does not support compaction.' -Level INFO
         return
     }
 
@@ -10015,7 +10189,21 @@ function Get-PersistenceClassification {
 
             # Browsers (auto-launch entries)
             'Chrome', 'Microsoft Edge', 'Edge',
-            'Mozilla', 'Firefox'
+            'Mozilla', 'Firefox',
+
+            # Scanner / imaging tools (user-installed, frequently re-enabled)
+            'PFU', 'ScanSnap', 'Fujitsu',
+            'Canon', 'Epson', 'Brother', 'Xerox',
+            'ABBYY', 'Kofax', 'Nuance',
+            'PaperPort', 'OmniPage',
+
+            # Personal productivity (user-installed)
+            'Evernote', 'Todoist', 'Obsidian',
+            'Spotify', 'Steam', 'GOG', 'Epic',
+            'OBS Project', 'OBS Studio',
+            'AutoHotkey', 'Wox', 'Listary',
+            'Everything', 'Voidtools',
+            'Rufus', 'Balena', 'Ventoy'
         )
 
         foreach ($p in $keepPublishers) {
@@ -10313,11 +10501,40 @@ function Invoke-Step38 {
         $approvedPath = $approvedMap[$e.Location]
         if ($approvedPath) {
             try {
+                # Suppression: if we disabled this entry on a previous run AND
+                # the user has re-enabled it since, honor their choice.
+                # Marker key is a sibling of the StartupApproved value.
+                $markerPath = 'HKCU:\Software\WinTune\DisabledStartups'
+                if (-not (Test-Path -LiteralPath $markerPath)) {
+                    New-Item -Path $markerPath -Force -ErrorAction SilentlyContinue | Out-Null
+                }
+                $markerName = '{0}_{1}' -f ($e.Location -replace '[\\/:*?"<>|]', '_'), $e.Name
+                $markerVal  = (Get-ItemProperty -Path $markerPath -Name $markerName -ErrorAction SilentlyContinue).$markerName
+
+                if ($markerVal -eq 'user-reenabled') {
+                    Write-Log ("  [SKIP-REENABLED] {0} (user re-enabled since last run)" -f $e.Name) -Level INFO
+                    $kept++
+                    continue
+                }
+
+                # Check if the entry is currently ENABLED (first byte != 0x03)
+                $currentBytes = (Get-ItemProperty -Path $approvedPath -Name $e.Name -ErrorAction SilentlyContinue).($e.Name)
+                if ($currentBytes -and $currentBytes.Length -ge 1 -and $currentBytes[0] -ne 0x03 -and $markerVal) {
+                    # We disabled it before, user re-enabled it. Record that and skip.
+                    New-ItemProperty -Path $markerPath -Name $markerName -Value 'user-reenabled' -PropertyType String -Force -ErrorAction SilentlyContinue | Out-Null
+                    Write-Log ("  [SKIP-REENABLED] {0} (user re-enabled since last run - not disabling again)" -f $e.Name) -Level INFO
+                    $kept++
+                    continue
+                }
+
                 if (-not (Test-Path -LiteralPath $approvedPath)) {
                     New-Item -Path $approvedPath -Force -ErrorAction Stop | Out-Null
                 }
                 $disabledBytes = [byte[]](0x03,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00)
                 New-ItemProperty -Path $approvedPath -Name $e.Name -Value $disabledBytes -PropertyType Binary -Force -ErrorAction Stop | Out-Null
+
+                # Record that WE disabled it, so a future run can detect user re-enable.
+                New-ItemProperty -Path $markerPath -Name $markerName -Value 'wintune-disabled' -PropertyType String -Force -ErrorAction SilentlyContinue | Out-Null
                 Write-Log ("  [DISABLED STARTUP] {0}" -f $e.Name) -Level OK
                 $startupDisabled++
             } catch {
@@ -10334,7 +10551,7 @@ function Invoke-Step38 {
     # Summary
     # ================================================================
     Write-Host ''
-    Write-Log ("Step 38 summary: {0} startup disabled, {1} tasks disabled, {2} kept, {3} failed" -f $startupDisabled, $tasksDisabled, $kept, $failed) -Level INFO
+    Write-Log ("Step 38 summary: {0} startup disabled, {1} tasks disabled, {2} protected/skipped, {3} failed" -f $startupDisabled, $tasksDisabled, $kept, $failed) -Level INFO
     Write-Log '' -Level INFO
     Write-Log 'Rollback:' -Level INFO
     Write-Log '  Startup entries: Task Manager -> Startup tab -> re-enable' -Level INFO
@@ -10451,6 +10668,7 @@ function Invoke-Step39 {
     # ---- B3 fix: clear FC_* env vars so a re-run in this session starts fresh ----
     Remove-Item Env:\FC_YES_TO_ALL -ErrorAction SilentlyContinue
     Write-Log '[SUCCESS] Step 39: Detached Windows Update installer launched.' -Level OK
+    $Script:LastStepStatus = 'Detached'
 }
 
 
@@ -10719,10 +10937,13 @@ function Invoke-Step40 {
     $totalOrphanMB = [math]::Round($totalOrphanBytes / 1MB, 1)
     Write-Log ("Orphaned MSI/MSP: {0} files, {1:N1} MB" -f $orphans.Count, $totalOrphanMB) -Level INFO
 
-    if ($totalOrphanMB -lt 500) {
-        Write-Log 'Less than 500 MB of orphans - not worth touching Windows\Installer.' -Level INFO
+    if ($totalOrphanMB -lt 500 -and -not $Script:ForceIrreversible) {
+        Write-Log ('Less than 500 MB of orphans ({0:N1} MB) - not worth touching Windows\Installer.' -f $totalOrphanMB) -Level INFO
+        Write-Log 'Add -ForceIrreversible to override the 500 MB threshold.' -Level INFO
         Write-Log '[INFO] Step 40 skipped: below safety threshold.' -Level INFO
         return
+    } elseif ($totalOrphanMB -lt 500 -and $Script:ForceIrreversible) {
+        Write-Log ('Only {0:N1} MB of orphans, but -ForceIrreversible was passed - proceeding.' -f $totalOrphanMB) -Level WARN
     }
 
     Write-Host '  Orphaned files (sample, first 30):' -ForegroundColor Cyan
@@ -10937,10 +11158,13 @@ function Invoke-Step42 {
     $totalCandidateMB = [math]::Round($totalCandidateBytes / 1MB, 1)
     Write-Log ("Superseded Package Cache folders: {0}, {1:N1} MB" -f $candidates.Count, $totalCandidateMB) -Level INFO
 
-    if ($totalCandidateMB -lt 100) {
-        Write-Log 'Less than 100 MB of superseded caches - not worth touching.' -Level INFO
+    if ($totalCandidateMB -lt 100 -and -not $Script:ForceIrreversible) {
+        Write-Log ('Less than 100 MB of superseded caches ({0:N1} MB) - not worth touching.' -f $totalCandidateMB) -Level INFO
+        Write-Log 'Add -ForceIrreversible to override the 100 MB threshold.' -Level INFO
         Write-Log '[INFO] Step 42 skipped: below safety threshold.' -Level INFO
         return
+    } elseif ($totalCandidateMB -lt 100 -and $Script:ForceIrreversible) {
+        Write-Log ('Only {0:N1} MB of superseded caches, but -ForceIrreversible was passed - proceeding.' -f $totalCandidateMB) -Level WARN
     }
 
     Write-Host '  Superseded folders (sample, first 30):' -ForegroundColor Cyan
@@ -11176,7 +11400,12 @@ function Invoke-Step45 {
             Write-Host ''
             Write-Log 'Step 45 complete.' -Level OK
             Write-Log '[SUCCESS] Prefetcher disabled via registry (SysMain left running).' -Level OK
+            Write-Log '[REBOOT REQUIRED] The prefetcher change takes effect on next boot.' -Level WARN
             Write-Log 'Rollback: set EnablePrefetcher and EnableSuperfetch back to 3.' -Level INFO
+            $Script:RebootRequired = $true
+            if ($Script:RebootReasons -and -not $Script:RebootReasons.Contains('Step 45 (prefetcher)')) {
+                [void]$Script:RebootReasons.Add('Step 45 (prefetcher)')
+            }
         } catch {
             Write-Log ("  [WARN] Could not write PrefetchParameters: {0}" -f $_.Exception.Message) -Level WARN
         }
@@ -11419,24 +11648,25 @@ function Invoke-Step47 {
             return
         }
     } catch {
-        $measureMethod = 'robocopy'
+        # Direct Get-Item failed (usually permission). Try CIM first, then
+        # report honestly if both fail - do NOT guess with robocopy parsing.
+        $measureMethod = 'cim'
         try {
-            $tempDir = Join-Path $env:TEMP ("camwal_$([guid]::NewGuid().ToString('N').Substring(0,8))")
-            $null = New-Item -ItemType Directory -Path $tempDir -Force -ErrorAction Stop
-            # List entire folder (no file filter), filter for the WAL line in
-            # PowerShell. The file-filtered version outputs full paths, which
-            # makes the regex fragile across robocopy versions.
-            $rcOut = & robocopy.exe $walFolder $tempDir /L /B /NJH /NJS /BYTES /NC 2>&1
-            $walSizeBytes = -1
-            foreach ($line in $rcOut) {
-                if ($line -match '^\s*(\d+)\s+CapabilityAccessManager\.db-wal\s*$') {
-                    $walSizeBytes = [int64]$matches[1]
-                    break
-                }
+            $cim = Get-CimInstance -ClassName CIM_DataFile -Filter (
+                "Name='{0}'" -f $walPath.Replace('\','\\')
+            ) -ErrorAction Stop
+            if ($cim -and $cim.FileSize) {
+                $walSizeBytes = [int64]$cim.FileSize
+            } else {
+                throw 'CIM query returned no FileSize'
             }
-            Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue
         } catch {
-            Write-Log ('Could not measure WAL file: {0}' -f $_.Exception.Message) -Level WARN
+            $measureMethod = 'unknown'
+            Write-Log ('Could not measure WAL file directly or via CIM: {0}' -f $_.Exception.Message) -Level WARN
+            Write-Log 'WAL size UNKNOWN (permission denied on CapabilityAccessManager folder).' -Level WARN
+            Write-Log 'This is normal for non-SYSTEM users. If you suspect a bloated WAL,' -Level INFO
+            Write-Log 'check manually from an elevated prompt:' -Level INFO
+            Write-Log ('  Get-Item "{0}"' -f $walPath) -Level INFO
             Write-Log '[INFO] Step 47 complete: measurement unavailable.' -Level INFO
             return
         }
@@ -12549,6 +12779,7 @@ function Write-HtmlReport {
         $gatedCount   = @($Script:Report.Steps | Where-Object { $_.Status -eq 'Gated' }).Count
         $dryCount     = @($Script:Report.Steps | Where-Object { $_.Status -eq 'DryRun' }).Count
         $warnCount    = @($Script:Report.Steps | Where-Object { $_.Status -eq 'Warning' }).Count
+        $detCount     = @($Script:Report.Steps | Where-Object { $_.Status -eq 'Detached' }).Count
         $totalCount   = @($Script:Report.Steps).Count
 
         # ---- Duration ----
@@ -12575,17 +12806,21 @@ function Write-HtmlReport {
                 'DryRun'  { 'st-dry' }
                 'Warning' { 'st-warn' }
                 'NoOp'    { 'st-noop' }
+                'Detached' { 'st-detached' }
                 default   { 'st-other' }
             }
             $durMs  = $s.DurationMs
             $durTxt = if ($durMs -ge 1000) { '{0:N1}s' -f ($durMs / 1000) } else { "$durMs" + 'ms' }
 
-            [void]$stepRows.AppendLine("      <tr class=""$cls"">")
+            $detailText  = if ([string]::IsNullOrWhiteSpace($s.Detail)) { '<span style="color:#94a3b8;font-style:italic;">(no detail)</span>' } else { & $enc $s.Detail }
+            $durDisplay  = if ($durMs -eq 0) { '<span style="color:#94a3b8;">&mdash;</span>' } else { $durTxt }
+            $rowTitle    = "Step $($s.Number) - $($s.Status)"
+            [void]$stepRows.AppendLine("      <tr class=""$cls"" title=""$(& $enc $rowTitle)"" data-status=""$($s.Status)"">")
             [void]$stepRows.AppendLine("        <td class=""num"">$($s.Number)</td>")
             [void]$stepRows.AppendLine("        <td class=""name"">$(& $enc $s.Name)</td>")
             [void]$stepRows.AppendLine("        <td class=""status"">$($s.Status)</td>")
-            [void]$stepRows.AppendLine("        <td class=""detail"">$(& $enc $s.Detail)</td>")
-            [void]$stepRows.AppendLine("        <td class=""dur"">$durTxt</td>")
+            [void]$stepRows.AppendLine("        <td class=""detail"">$detailText</td>")
+            [void]$stepRows.AppendLine("        <td class=""dur"">$durDisplay</td>")
             [void]$stepRows.AppendLine("      </tr>")
         }
 
@@ -12633,7 +12868,9 @@ function Write-HtmlReport {
         $logEscaped = & $enc $logText
 
         # ---- Delta color ----
-        $deltaColor = if ($netDelta -gt 0) { '#0a7' } elseif ($netDelta -lt 0) { '#c33' } else { '#666' }
+        # Net Change color: green for gain, red for loss, gray for zero.
+        # The old code colored '+0.00 GB' green when both sides were 0.
+        $deltaColor = if ($netDelta -gt 0.01) { '#0a7' } elseif ($netDelta -lt -0.01) { '#c33' } else { '#6b7280' }
         $deltaSign  = if ($netDelta -gt 0) { '+' } else { '' }
 
         $dryBanner = if ($Script:Report.DryRun) {
@@ -12690,6 +12927,7 @@ function Write-HtmlReport {
   tr.st-dry td.status { color: #0958d9; }
   tr.st-warn td.status { color: #d4a008; }
   tr.st-noop td.status { color: #94a3b8; }
+  tr.st-detached td.status { color: #7c3aed; font-style: italic; }
   pre { background: #1c1f23; color: #e6e8eb; padding: 16px; border-radius: 6px;
         font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
         font-size: 12px; line-height: 1.4; overflow-x: auto; max-height: 500px;
@@ -12751,18 +12989,34 @@ function Write-HtmlReport {
     <h2>Summary</h2>
     <div class="grid">
       <div class="card"><div class="label">Total Steps</div><div class="value metric">$totalCount</div></div>
+      <div class="card"><div class="label">Total Step Time</div><div class="value metric">$(($Script:Report.Steps | Measure-Object -Property DurationMs -Sum).Sum | ForEach-Object { '{0:N1}s' -f ($_ / 1000) })</div></div>
       <div class="card"><div class="label">OK</div><div class="value metric" style="color:#0a7">$okCount</div></div>
       <div class="card"><div class="label">Skipped</div><div class="value metric" style="color:#94a3b8">$skipCount</div></div>
       <div class="card"><div class="label">Gated</div><div class="value metric" style="color:#d46b08">$gatedCount</div></div>
       <div class="card"><div class="label">Dry Run</div><div class="value metric" style="color:#0958d9">$dryCount</div></div>
       <div class="card"><div class="label">Warnings</div><div class="value metric" style="color:#d4a008">$warnCount</div></div>
+      <div class="card"><div class="label">Detached</div><div class="value metric" style="color:#7c3aed">$detCount</div></div>
       <div class="card"><div class="label">Failed</div><div class="value metric" style="color:#c33">$failCount</div></div>
     </div>
   </section>
 
   <section>
     <h2>Steps</h2>
-    <table>
+    <div style="margin-bottom:12px;font-size:12px;color:#4b5563;">
+      Filter:
+      <select id="statusFilter" onchange="filterSteps()" style="padding:4px 8px;border:1px solid #d1d5db;border-radius:4px;font-size:12px;">
+        <option value="">All statuses</option>
+        <option value="OK">OK</option>
+        <option value="Skipped">Skipped</option>
+        <option value="Failed">Failed</option>
+        <option value="Gated">Gated</option>
+        <option value="DryRun">DryRun</option>
+        <option value="Warning">Warning</option>
+        <option value="NoOp">NoOp</option>
+      </select>
+      <span id="filterCount" style="color:#6b7280;margin-left:8px;"></span>
+    </div>
+    <table id="stepsTable">
       <thead>
         <tr><th>#</th><th>Name</th><th>Status</th><th>Detail</th><th>Duration</th></tr>
       </thead>
@@ -12799,6 +13053,23 @@ $($stepRows.ToString())
   </footer>
 
 </div>
+<script>
+  function filterSteps() {
+    var sel   = document.getElementById('statusFilter').value;
+    var rows  = document.querySelectorAll('#stepsTable tbody tr');
+    var shown = 0, total = 0;
+    rows.forEach(function (tr) {
+      total++;
+      var match = !sel || tr.getAttribute('data-status') === sel;
+      tr.style.display = match ? '' : 'none';
+      if (match) shown++;
+    });
+    document.getElementById('filterCount').textContent =
+      sel ? ('Showing ' + shown + ' of ' + total) : ('Showing all ' + total);
+  }
+  // Initialize count on load
+  window.addEventListener('DOMContentLoaded', filterSteps);
+</script>
 </body>
 </html>
 "@
@@ -13220,7 +13491,15 @@ function Invoke-PostCheck {
     $anyPending = $pendingServicing -or $pendingWU -or $Script:RebootRequired
 
     $reasons = @()
-    if ($Script:RebootRequired)  { $reasons += 'WinTune (network reset)' }
+    if ($Script:RebootRequired) {
+        if ($Script:RebootReasons -and $Script:RebootReasons.Count -gt 0) {
+            foreach ($r in $Script:RebootReasons) {
+                $reasons += ("WinTune: {0}" -f $r)
+            }
+        } else {
+            $reasons += 'WinTune (reason not recorded)'
+        }
+    }
     if ($pendingServicing)       { $reasons += 'Windows servicing (CBS)' }
     if ($pendingWU)              { $reasons += 'Windows Update' }
 
@@ -13385,9 +13664,14 @@ function Main {
                 $stepSw = [System.Diagnostics.Stopwatch]::StartNew()
                 $stepStatus = 'OK'
                 $stepDetail = ''
+                $Script:LastStepStatus = $null
                 try {
                     & $stepName
-                    if ($Script:DryRun) {
+                    if ($Script:LastStepStatus) {
+                        # Step signalled a non-default status (e.g. 'Detached')
+                        $stepStatus = $Script:LastStepStatus
+                        $stepDetail = 'Launched in detached window - see child log for result'
+                    } elseif ($Script:DryRun) {
                         $stepStatus = 'DryRun'
                         $stepDetail = 'Dry run - no changes made'
                     }
