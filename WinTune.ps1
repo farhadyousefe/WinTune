@@ -8931,18 +8931,38 @@ function Invoke-Step31 {
     }
 
     # ============================================================
-    # 6. Detect the current DNS servers (informational)
+    # 6. Detect DNS servers and check DoH capability
     # ============================================================
-    try {
-        $dnsServers = Get-DnsClientServerAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-                      Where-Object { $_.ServerAddresses -and $_.ServerAddresses.Count -gt 0 } |
-                      Select-Object -First 1 -ExpandProperty ServerAddresses
+    $knownDohServers = @(
+        '1.1.1.1', '1.0.0.1',               # Cloudflare
+        '8.8.8.8', '8.8.4.4',               # Google
+        '9.9.9.9', '149.112.112.112',       # Quad9
+        '208.67.222.222', '208.67.220.220', # OpenDNS
+        '94.140.14.14', '94.140.15.15'      # AdGuard
+    )
 
-        if ($dnsServers) {
-            Write-Log ("  Active IPv4 DNS servers: {0}" -f ($dnsServers -join ', ')) -Level INFO
+    try {
+        $currentDns = @(
+            Get-DnsClientServerAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+            Where-Object { $_.ServerAddresses -and $_.ServerAddresses.Count -gt 0 } |
+            ForEach-Object { $_.ServerAddresses } |
+            Select-Object -Unique
+        )
+
+        if ($currentDns.Count -gt 0) {
+            Write-Log ("  Current DNS servers: {0}" -f ($currentDns -join ', ')) -Level INFO
+            $dohCapable = @($currentDns | Where-Object { $knownDohServers -contains $_ })
+            if ($dohCapable.Count -gt 0) {
+                Write-Log ("  DoH-capable resolvers: {0}" -f ($dohCapable -join ', ')) -Level OK
+                Write-Log '  DoH will activate automatically on the next DNS resolution.' -Level INFO
+            } else {
+                Write-Log '  [WARN] None of the configured DNS servers support DoH.' -Level WARN
+                Write-Log '  AutoDoh is enabled but dormant until a supported resolver is configured.' -Level WARN
+                Write-Log '  Recommended: 1.1.1.1 (Cloudflare), 9.9.9.9 (Quad9), 8.8.8.8 (Google)' -Level INFO
+            }
         }
     } catch {
-        # DNS server lookup is best-effort - never fail the step for it
+        Write-Log ("  Could not inspect DNS servers: {0}" -f $_.Exception.Message) -Level DEBUG
     }
 
     # ============================================================
