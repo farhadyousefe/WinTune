@@ -386,6 +386,67 @@ $Script:StepNames = @{
     '8b' = 'Driver Update Audit + Install (Detached)'
 }
 
+# Per-step descriptions used in the HTML report Details column
+$Script:StepDescriptions = @{
+    '1' = 'Cleared temporary files, caches, and logs to reclaim disk space.'
+    '1b' = 'Checked drive fullness; warned if any drive exceeded 80% usage.'
+    '2' = 'Emptied Recycle Bins and removed log files older than 30 days.'
+    '3' = 'Purged browser caches for Chrome, Edge, and other Chromium browsers.'
+    '4' = 'Closed Office apps and cleared temp locks and Outlook attachment caches.'
+    '5' = 'Cleared PDF reader caches for Adobe, Foxit, and SumatraPDF.'
+    '6' = 'Cleared VS Code, Teams, and Copilot developer caches.'
+    '7' = 'Interactively scanned and offered to purge large known app caches.'
+    '8' = 'Reset Windows thumbnail and icon caches to fix corrupted icons.'
+    '8b' = 'Launched a detached driver audit to identify eligible updates.'
+    '9' = 'Removed broken desktop shortcuts pointing to missing targets.'
+    '10' = 'Set telemetry services to Manual and disabled scheduled telemetry tasks.'
+    '11' = 'Enabled taskbar End Task and disabled Game DVR background recording.'
+    '12' = 'Launched a detached DISM and SFC repair to fix system file corruption.'
+    '13' = 'No-op; handled by Step 12 detached runner.'
+    '14' = 'No-op; handled by Step 12 detached runner.'
+    '15' = 'No-op; handled by Step 12 detached runner.'
+    '16' = 'Cleared Application, System, and Setup event logs.'
+    '17' = 'Capped Volume Shadow Copy storage for System Restore retention.'
+    '18' = 'Audited third-party driver packages in the DriverStore.'
+    '19' = 'Audited all auto-launching programs.'
+    '20' = 'Audited scheduled tasks and optionally disabled non-Microsoft tasks.'
+    '21' = 'Purged Prefetch cache (discouraged for general use).'
+    '22' = 'No-op; standby memory is managed automatically by Windows.'
+    '23' = 'Reset Winsock and TCP/IP stack (requires reboot).'
+    '24' = 'Skipped defrag on SSDs and launched defrag only for HDDs.'
+    '25' = 'Created a System Restore point as a safety snapshot.'
+    '26' = 'Set the Balanced power plan for balanced performance and power.'
+    '27' = 'Disabled transparency and animations; preserved ClearType.'
+    '28' = 'Configured Storage Sense with Downloads folder protected.'
+    '29' = 'Disabled SMBv1 and hardened LanmanServer registry settings.'
+    '30' = 'Disabled LLMNR and WPAD to prevent credential theft.'
+    '31' = 'Enabled DNS over HTTPS and verified resolver compatibility.'
+    '32' = 'Applied seven Defender ASR rules in Audit mode.'
+    '33' = 'Launched a detached winget upgrade runner.'
+    '34' = 'Rebuilt the font cache and Explorer icon index.'
+    '35' = 'Audited and optionally removed provisioned bloatware packages.'
+    '36' = 'Checked search index for legacy layout; advised on manual rebuild.'
+    '37' = 'Configured 30-day deferral for Windows feature updates.'
+    '38' = 'Audited startup entries; kept signed publishers and flagged others.'
+    '39' = 'Launched a detached Windows Update runner.'
+    '40' = 'Identified orphaned MSI/MSP cache files in C:\Windows\Installer.'
+    '41' = 'Cleared old Defender scan caches to reclaim disk space.'
+    '42' = 'Identified superseded installer caches in ProgramData\Package Cache.'
+    '43' = 'Swept UWP LocalCache folders and reset the Microsoft Store cache.'
+    '44' = 'Optionally launched a Malwarebytes quick scan if installed.'
+    '45' = 'Disabled prefetcher on SSD systems; kept SysMain for memory compression.'
+    '46' = 'Set Delivery Optimization to LAN-only to stop peer uploads.'
+    '47' = 'Checked CapabilityAccessManager WAL file size and reported status.'
+    '49' = 'Disabled AutoRun on all drives to block USB/CD malware.'
+    '50' = 'Audited context menu shell extensions.'
+    '51' = 'Audited installed programs for orphaned uninstall entries.'
+    '52' = 'Set five non-essential services to Manual or Disabled.'
+    '54' = 'Applied HKCU privacy and Start Menu tweaks.'
+    '55' = 'Enabled RSS, normalized auto-tuning, and set CUBIC congestion provider.'
+    '56' = 'Audited seven security controls (WebClient, WPAD, LAPS, ScriptBlockLogging, UAC, SMB signing, BitLocker).'
+}
+
+
 
 # ============================================================
 # LOGGING ENGINE
@@ -690,19 +751,11 @@ function Invoke-NativeLive {
 
         $elapsedStr = if ($elapsed.TotalHours -ge 1) { '{0:hh\:mm\:ss}' -f $elapsed } else { '{0:mm\:ss}' -f $elapsed }
 
-        if ($isRedirected) {
-            if (($now - $start).TotalSeconds % 15 -lt 0.3) {
-                $line = "  [$elapsedStr] $Label - $lastProgress$stallTag"
-                Write-Host $line -ForegroundColor DarkGray
-                try { Add-Content -LiteralPath $logFile -Value $line -Encoding UTF8 } catch {}
-            }
-        } else {
-            $spinIdx = ($spinIdx + 1) % $spinFrames.Length
-            $status = "  {0} {1}  [{2}]  {3}{4}" -f `
-                      $spinFrames[$spinIdx], $Label, $elapsedStr, $lastProgress, $stallTag
-            if ($null -eq $status) { $status = '' }
-            if ($status.Length -lt $lineWidth) { $status = $status.PadRight($lineWidth) }
-            [Console]::Write("`r" + $status)
+        # SIMPLE-HEARTBEAT-PROGRESS: 10-second heartbeat, no spinner
+        if (($now - $start).TotalSeconds % 10 -lt 0.5) {
+            $line = "  [$elapsedStr] $Label - $lastProgress$stallTag"
+            Write-Host $line -ForegroundColor DarkGray
+            try { Add-Content -LiteralPath $logFile -Value $line -Encoding UTF8 } catch {}
         }
     }
 
@@ -1873,6 +1926,7 @@ try {
     }
 } catch { }
 
+
 function Add-ReportStep {
     param(
         [Parameter(Mandatory)][string]$Number,
@@ -1880,7 +1934,7 @@ function Add-ReportStep {
         [Parameter(Mandatory)]
         [ValidateSet('OK','Skipped','Failed','Gated','DryRun','Warning','NoOp','Detached')]
         [string]$Status,
-        [string]$Detail = '',
+        [string]$Detail = '''''',
         [TimeSpan]$Duration = [TimeSpan]::Zero
     )
     [void]$Script:Report.Steps.Add([PSCustomObject]@{
@@ -2818,7 +2872,25 @@ try {
         # COM-based install: sortable, per-update control, download-then-install
         $comSession = New-Object -ComObject Microsoft.Update.Session
         $comSearcher = $comSession.CreateUpdateSearcher()
-        $comSearch = $comSearcher.Search("IsInstalled=0 and Type='Software'")
+        # WU-RETRY-LOGIC
+        $maxAttempts = 2
+        $attempt = 0
+        $comSearch = $null
+        while ($attempt -lt $maxAttempts) {
+            $attempt++
+            try {
+                $comSearch = $comSearcher.Search("IsInstalled=0 and Type='Software'")
+                break
+            } catch {
+                $errMsg = $_.Exception.Message
+                if ($attempt -lt $maxAttempts) {
+                    Write-Host ("  WUA search attempt {0} failed: {1} - retrying in 30s..." -f $attempt, $errMsg) -ForegroundColor Yellow
+                    Start-Sleep -Seconds 30
+                } else {
+                    throw
+                }
+            }
+        }
 
         # Filter by real WUA category GUIDs (stable across Windows versions
         # and languages; title text is localized and unreliable).
@@ -14170,7 +14242,8 @@ function Main {
                 $stepSw.Stop()
 
                 $rptName = if ($Script:StepNames.ContainsKey($stepNumStr)) { $Script:StepNames[$stepNumStr] } else { $stepName }
-                Add-ReportStep -Number $stepNumStr -Name $rptName -Status $stepStatus -Detail $stepDetail -Duration $stepSw.Elapsed
+                $rptDetail = if ($Script:StepDescriptions.ContainsKey($stepNumStr)) { $Script:StepDescriptions[$stepNumStr] } else { $stepDetail }
+                Add-ReportStep -Number $stepNumStr -Name $rptName -Status $stepStatus -Detail $rptDetail -Duration $stepSw.Elapsed
             } else {
                 Write-Log ("Step function {0} not found - skipping." -f $stepName) -Level WARN
                 $rptName = if ($Script:StepNames.ContainsKey($stepNumStr)) { $Script:StepNames[$stepNumStr] } else { $stepName }
