@@ -1,4 +1,4 @@
-﻿#Requires -RunAsAdministrator
+#Requires -RunAsAdministrator
 #Requires -Version 5.1
 <#
 .SYNOPSIS
@@ -139,11 +139,21 @@ $Script:ScriptName   = Split-Path -Leaf   $Script:ScriptPath
 $Script:RunStamp     = Get-Date -Format 'yyyyMMdd_HHmmss'
 $Script:LogFile      = Join-Path $Script:ScriptDir 'WinTune.log'
 
-# ---- Resolve the runner host once, at load time ----
-# Prefer pwsh.exe (PowerShell 7) when available so detached runners
-# use the same engine as the parent shell. Fall back to powershell.exe.
+# ---- Resolve hosts once, at load time ----
+# Two distinct variables:
+#   $Script:PowerShellExe       = parent host (whatever PowerShell
+#                                 the user launched WinTune with)
+#   $Script:RunnerPowerShellExe = host for all detached runner children.
+#                                 Always powershell.exe, because .NET
+#                                 Framework 4.8 honours the
+#                                 SchUseStrongCrypto / SystemDefaultTls
+#                                 registry values. .NET 8 (pwsh.exe)
+#                                 does not, and on Win11 24H2+ it fails
+#                                 the Akamai-fronted Microsoft Update
+#                                 TLS handshake (0x8024402C / 0x80072EE7).
 $__pwsh = Get-Command pwsh.exe -ErrorAction SilentlyContinue
-$Script:PowerShellExe = if ($__pwsh) { $__pwsh.Source } else { (Get-Command powershell.exe -ErrorAction Stop).Source }
+$Script:PowerShellExe       = if ($__pwsh) { $__pwsh.Source } else { (Get-Command powershell.exe -ErrorAction Stop).Source }
+$Script:RunnerPowerShellExe = (Get-Command powershell.exe -ErrorAction Stop).Source
 
 # ---- Log rotation: if the file is over 5 MB, rotate to timestamped file
 # ---- and keep the 3 most recent rotated logs. Never silently delete. ----
@@ -861,23 +871,19 @@ function Test-DetachedLaunchPrereqs {
     [OutputType([PSCustomObject])]
     param()
 
-    # 0. Self-heal: if $Script:PowerShellExe was never populated, resolve now.
-    #    This guards against the class of bug where the launch sites were
-    #    substituted to use $Script:PowerShellExe before the resolver was
-    #    inserted.
+    # 0. Self-heal: if $Script:RunnerPowerShellExe was never populated,
+    #    resolve to powershell.exe (the host the launch sites actually
+    #    use). Never fall back to pwsh.exe here, because .NET 8's TLS
+    #    stack does not honour the SchUseStrongCrypto registry fix and
+    #    will fail the Akamai-fronted Microsoft Update handshake.
     $__exe = $null
     try {
-        $__exe = $Script:PowerShellExe
+        $__exe = $Script:RunnerPowerShellExe
     } catch { }
     if ([string]::IsNullOrWhiteSpace($__exe)) {
         try {
-            $__pwshCmd = Get-Command pwsh.exe -ErrorAction SilentlyContinue
-            if ($__pwshCmd) {
-                $__exe = $__pwshCmd.Source
-            } else {
-                $__exe = (Get-Command powershell.exe -ErrorAction Stop).Source
-            }
-            $Script:PowerShellExe = $__exe
+            $__exe = (Get-Command powershell.exe -ErrorAction Stop).Source
+            $Script:RunnerPowerShellExe = $__exe
         } catch {
             return [PSCustomObject]@{ Ok = $false; Reason = ("Could not resolve runner host: {0}" -f $_.Exception.Message) }
         }
@@ -5478,7 +5484,7 @@ function Invoke-Step08b {
     }
 
     try {
-        $child = Start-Process -FilePath $Script:PowerShellExe -ArgumentList "-NoExit -NoProfile -ExecutionPolicy Bypass -File `"$runnerPath`"" -PassThru
+        $child = Start-Process -FilePath $Script:RunnerPowerShellExe -ArgumentList "-NoExit -NoProfile -ExecutionPolicy Bypass -File `"$runnerPath`"" -PassThru
 
         Write-Log ("  [OK] Child PowerShell launched (PID {0})." -f $child.Id) -Level OK
         Register-DetachedExitTracking -Child $child -Kind 'Drivers' -Note 'Step 8b'
@@ -5927,7 +5933,7 @@ function Invoke-Step11 {
 
     try {
         # Add-Type compiles the P/Invoke once per session; subsequent calls reuse it
-        if (-not ([System.Management.Automation.PSTypeName]'Win32.NativeMethods').Type) {
+        if (-not ('Win32.NativeMethods' -as [type])) {
             $signature = @'
 using System;
 using System.Runtime.InteropServices;
@@ -6074,7 +6080,7 @@ function Invoke-Step12 {
     }
 
     try {
-        $child = Start-Process -FilePath $Script:PowerShellExe -ArgumentList "-NoExit -NoProfile -ExecutionPolicy Bypass -File `"$runnerPath`"" -PassThru
+        $child = Start-Process -FilePath $Script:RunnerPowerShellExe -ArgumentList "-NoExit -NoProfile -ExecutionPolicy Bypass -File `"$runnerPath`"" -PassThru
 
         Write-Log ("  [OK] Child PowerShell launched (PID {0})." -f $child.Id) -Level OK
         Register-DetachedExitTracking -Child $child -Kind 'SFC/DISM' -Note 'Step 12'
@@ -7067,7 +7073,7 @@ function Invoke-Step22-UnreachableStub {
     Write-Log ("  Before: Total={0:N2} GB, Free={1:N2} GB, Cached={2:N2} GB" -f $beforeStats.TotalGB, $beforeStats.FreeGB, $beforeStats.CachedGB) -Level INFO
 
     # ---- Define P/Invoke types (once per session) ----
-    if (-not ([System.Management.Automation.PSTypeName]'Win32.PrivilegeHelper').Type) {
+    if (-not ('Win32.PrivilegeHelper' -as [type])) {
         $privTypeDef = @'
 using System;
 using System.Runtime.InteropServices;
@@ -7109,7 +7115,7 @@ namespace Win32 {
         }
     }
 
-    if (-not ([System.Management.Automation.PSTypeName]'Win32.MemoryManager').Type) {
+    if (-not ('Win32.MemoryManager' -as [type])) {
         $memTypeDef = @'
 using System;
 using System.Runtime.InteropServices;
@@ -8064,7 +8070,7 @@ function Invoke-Step26 {
     Write-Log ("Setting power mode overlay to: {0}" -f $overlayName) -Level INFO
 
     try {
-        if (-not ([System.Management.Automation.PSTypeName]'PowerModeHelper').Type) {
+        if (-not ('PowerModeHelper' -as [type])) {
             Add-Type -TypeDefinition @"
 using System;
 using System.Runtime.InteropServices;
@@ -8338,7 +8344,7 @@ function Invoke-Step27 {
 
     try {
         # Compile P/Invoke type once per session
-        if (-not ([System.Management.Automation.PSTypeName]'Native.Win32').Type) {
+        if (-not ('Native.Win32' -as [type])) {
             $signature = @'
 using System;
 using System.Runtime.InteropServices;
@@ -9472,7 +9478,7 @@ function Invoke-Step33 {
     }
 
     try {
-        $child = Start-Process -FilePath $Script:PowerShellExe -ArgumentList "-NoExit -NoProfile -ExecutionPolicy Bypass -File `"$runnerPath`"" -PassThru
+        $child = Start-Process -FilePath $Script:RunnerPowerShellExe -ArgumentList "-NoExit -NoProfile -ExecutionPolicy Bypass -File `"$runnerPath`"" -PassThru
 
         Write-Log ("  [OK] Child PowerShell launched (PID {0})." -f $child.Id) -Level OK
         Register-DetachedExitTracking -Child $child -Kind 'Winget' -Note 'Step 33'
@@ -10959,7 +10965,7 @@ function Invoke-Step39 {
 
     try {
         # No -Wait so this returns immediately. Child is independent.
-        $child = Start-Process -FilePath $Script:PowerShellExe -ArgumentList "-NoExit -NoProfile -ExecutionPolicy Bypass -File `"$runnerPath`"" -PassThru
+        $child = Start-Process -FilePath $Script:RunnerPowerShellExe -ArgumentList "-NoExit -NoProfile -ExecutionPolicy Bypass -File `"$runnerPath`"" -PassThru
 
         Write-Log ("  [OK] Child PowerShell launched (PID {0})." -f $child.Id) -Level OK
         Register-DetachedExitTracking -Child $child -Kind 'Windows Update' -Note 'Step 39'
