@@ -5644,6 +5644,16 @@ function Invoke-Step08b {
         throw ("Detached runner prereq failure: {0}" -f $__prereq.Reason)
     }
 
+    # [FIX-DETACHED-5A] cross-run guard
+    $__existing = @(Get-ExistingDetachedRunnerProcess -Kind 'Drivers')
+    if ($__existing.Count -gt 0) {
+        Write-Log ("  [SKIP] Drivers runner already active (PID {0}, started {1})." -f $__existing[0].Pid, $__existing[0].StartedAt) -Level WARN
+        Write-Log '  Close the existing window first, or wait for it to exit, then re-run.' -Level WARN
+        $Script:LastStepStatus = 'Skipped'
+        return
+    }
+
+    # [FIX-DETACHED-5A] cross-run guard
     $__existing = @(Get-ExistingDetachedRunnerProcess -Kind 'Drivers')
     if ($__existing.Count -gt 0) {
         Write-Log ("  [SKIP] Drivers runner already active (PID {0}, started {1})." -f $__existing[0].Pid, $__existing[0].StartedAt) -Level WARN
@@ -6290,6 +6300,16 @@ function Invoke-Step12 {
         throw ("Detached runner prereq failure: {0}" -f $__prereq.Reason)
     }
 
+    # [FIX-DETACHED-5B] cross-run guard
+    $__existing = @(Get-ExistingDetachedRunnerProcess -Kind 'SFC/DISM')
+    if ($__existing.Count -gt 0) {
+        Write-Log ("  [SKIP] SFC/DISM runner already active (PID {0}, started {1})." -f $__existing[0].Pid, $__existing[0].StartedAt) -Level WARN
+        Write-Log '  Close the existing window first, or wait for it to exit, then re-run.' -Level WARN
+        $Script:LastStepStatus = 'Skipped'
+        return
+    }
+
+    # [FIX-DETACHED-5B] cross-run guard
     $__existing = @(Get-ExistingDetachedRunnerProcess -Kind 'SFC/DISM')
     if ($__existing.Count -gt 0) {
         Write-Log ("  [SKIP] SFC/DISM runner already active (PID {0}, started {1})." -f $__existing[0].Pid, $__existing[0].StartedAt) -Level WARN
@@ -9547,6 +9567,16 @@ function Invoke-Step33 {
         throw ("Detached runner prereq failure: {0}" -f $__prereq.Reason)
     }
 
+    # [FIX-DETACHED-5C] cross-run guard
+    $__existing = @(Get-ExistingDetachedRunnerProcess -Kind 'Winget')
+    if ($__existing.Count -gt 0) {
+        Write-Log ("  [SKIP] Winget runner already active (PID {0}, started {1})." -f $__existing[0].Pid, $__existing[0].StartedAt) -Level WARN
+        Write-Log '  Close the existing window first, or wait for it to exit, then re-run.' -Level WARN
+        $Script:LastStepStatus = 'Skipped'
+        return
+    }
+
+    # [FIX-DETACHED-5C] cross-run guard
     $__existing = @(Get-ExistingDetachedRunnerProcess -Kind 'Winget')
     if ($__existing.Count -gt 0) {
         Write-Log ("  [SKIP] Winget runner already active (PID {0}, started {1})." -f $__existing[0].Pid, $__existing[0].StartedAt) -Level WARN
@@ -9969,6 +9999,10 @@ function Invoke-Step35 {
 
     $removedCount = 0
     $failedCount  = 0
+    # [FIX-REG-35] $skippedCount is incremented by the orphaned-staging
+    # branch added in Fix-SilentFailures.ps1, but was never initialized.
+    # StrictMode Latest throws "variable cannot be retrieved" on read.
+    $skippedCount = 0
 
     foreach ($pkg in $removable) {
         Write-Log ("  Removing: {0}" -f $pkg.DisplayName) -Level INFO
@@ -10005,10 +10039,19 @@ function Invoke-Step35 {
     # ============================================================
     # Verdict
     # ============================================================
-    Write-Log ("Removal summary: {0} removed, {1} failed" -f $removedCount, $failedCount) -Level INFO
+    Write-Log ("Removal summary: {0} removed, {1} skipped (orphaned staging), {2} failed" `
+        -f $removedCount, $skippedCount, $failedCount) -Level INFO
 
     if ($failedCount -eq 0) {
-        Write-Log '[SUCCESS] Step 35: All bloatware candidates removed.' -Level OK
+        if ($removedCount -gt 0) {
+            Write-Log ('[SUCCESS] Step 35: {0} removed, {1} orphaned staging entries skipped.' `
+                -f $removedCount, $skippedCount) -Level OK
+        } elseif ($skippedCount -gt 0) {
+            Write-Log ('[INFO] Step 35: {0} candidate(s) were orphaned staging entries (no action needed).' `
+                -f $skippedCount) -Level INFO
+        } else {
+            Write-Log '[SUCCESS] Step 35: No action needed.' -Level OK
+        }
     } else {
         Write-Log '[WARNING] Step 35: Some packages could not be removed.' -Level WARN
     }
@@ -11038,6 +11081,16 @@ function Invoke-Step39 {
         throw ("Detached runner prereq failure: {0}" -f $__prereq.Reason)
     }
 
+    # [FIX-DETACHED-5D] cross-run guard
+    $__existing = @(Get-ExistingDetachedRunnerProcess -Kind 'Windows Update')
+    if ($__existing.Count -gt 0) {
+        Write-Log ("  [SKIP] Windows Update runner already active (PID {0}, started {1})." -f $__existing[0].Pid, $__existing[0].StartedAt) -Level WARN
+        Write-Log '  Close the existing window first, or wait for it to exit, then re-run.' -Level WARN
+        $Script:LastStepStatus = 'Skipped'
+        return
+    }
+
+    # [FIX-DETACHED-5D] cross-run guard
     $__existing = @(Get-ExistingDetachedRunnerProcess -Kind 'Windows Update')
     if ($__existing.Count -gt 0) {
         Write-Log ("  [SKIP] Windows Update runner already active (PID {0}, started {1})." -f $__existing[0].Pid, $__existing[0].StartedAt) -Level WARN
