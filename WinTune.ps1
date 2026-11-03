@@ -5225,6 +5225,47 @@ try {
     $eligible = @($eligible | Sort-Object -Property @{Expression = { [int64]$_.Row.SizeMB }})
     $skipped  = @($skipped  | Sort-Object -Property @{Expression = { [int64]$_.Row.SizeMB }})
 
+    # [FIX-GENERIC-1] If ZERO drivers are eligible AND some were skipped
+    # only because they were stale, auto-bump the stale threshold to the
+    # newest skipped date + 30 days. One-shot adjustment for this run only.
+    if ($eligible.Count -eq 0 -and $skipped.Count -gt 0) {
+        $staleSkips = @($skipped | Where-Object { $_.Reason -match 'Too stale' })
+        if ($staleSkips.Count -gt 0) {
+            $ages = @()
+            foreach ($s in $staleSkips) {
+                if ($s.Reason -match '\(\s*([0-9,]+)\s+days') {
+                    $ages += [int]($Matches[1] -replace ',', '')
+                }
+            }
+            if ($ages.Count -gt 0) {
+                $newestStaleDays = ($ages | Measure-Object -Minimum).Minimum
+                $bumpedThreshold = $newestStaleDays + 30
+                DR-Log ("  [AUTO] All candidates are stale (newest = {0} days). " +
+                        "Bumping threshold {1} -> {2} for this run." -f
+                        $newestStaleDays, $maxStaleDays, $bumpedThreshold) 'WARN'
+                DR-Log '  [AUTO] One-shot adjustment; each run re-evaluates.' 'INFO'
+                $maxStaleDays = $bumpedThreshold
+                foreach ($s in $staleSkips) {
+                    $verdict = DR-TestCandidate -Update $s.Update
+                    if ($verdict.Pass) {
+                        $eligible += [PSCustomObject]@{ Update = $s.Update; Row = $s.Row }
+                        DR-Log ("  [AUTO-PROMOTED] {0}" -f $s.Row.Title) 'WARN'
+                    }
+                }
+                $byKey = @{}
+                foreach ($item in $eligible) {
+                    $key = '{0}|{1}|{2}' -f $item.Row.Class, $item.Row.Model, $item.Row.Vendor
+                    if (-not $byKey.ContainsKey($key) -or
+                        $item.Row.AgeDays -lt $byKey[$key].Row.AgeDays) {
+                        $byKey[$key] = $item
+                    }
+                }
+                $eligible = @($byKey.Values | Sort-Object -Property @{Expression = { [int64]$_.Row.SizeMB }})
+                $skipped  = @($skipped | Where-Object { $_.Reason -notmatch 'Too stale' })
+            }
+        }
+    }
+
     DR-Section 'Summary'
     DR-Log ("Eligible: {0}" -f $eligible.Count) 'OK'
     DR-Log ("Skipped:  {0}" -f $skipped.Count)  'INFO'
@@ -10540,7 +10581,12 @@ function Get-PersistenceClassification {
     #>
     param([string]$FilePath)
 
-    if ([string]::IsNullOrWhiteSpace($FilePath)) { return 'Disable' }
+    # [FIX-GENERIC-2] Empty/unparseable path should default to Keep, not
+    # Disable. Legitimate COM-handler scheduled tasks (OneDrive Update,
+    # Office ClickToRun, Edge Update) and corrupted startup entries both
+    # hit this branch. Refusing to disable something we cannot inspect is
+    # the safe behavior for a heterogeneous fleet.
+    if ([string]::IsNullOrWhiteSpace($FilePath)) { return 'Keep' }
 
     # Normalize: strip ALL quotes (leading, trailing, embedded), then trim,
     # then extract the .exe path from any trailing arguments.
@@ -10615,6 +10661,25 @@ function Get-PersistenceClassification {
 
             # Common productivity (avoid breaking)
             # ---- Document / archive / utility tools ----
+            # [FIX-GENERIC-3] Expanded for fleet genericity. Users who
+            # install Adobe, Foxit, 7-Zip, WinRAR, Notepad++, VLC,
+            # TeamViewer, etc. expect their persistence entries to survive
+            # -AllowPersistenceAction and -AllowContextMenuAction. Only
+            # publishers NOT listed below become disable candidates.
+            'Adobe', 'Foxit', 'Foxit Software'
+            'Igor Pavlov', '7-Zip'
+            'win.rar', 'RARLAB'
+            'Nico Mak Computing', 'WinZip'
+            'Tracker Software', 'PDF-XChange'
+            'Artifex', 'GPL Ghostscript'
+            'Irfan Skiljan', 'IrfanView'
+            'Notepad++', 'Don Ho'
+            'Sublime HQ'
+            'TortoiseSVN', 'TortoiseGit'
+            'The Git Development Community'
+            'JetBrains'
+            'VideoLAN'
+            'TeamViewer', 'AnyDesk', 'LogMeIn'
 
             # Browsers (auto-launch entries)
             'Chrome', 'Microsoft Edge', 'Edge'
@@ -13891,11 +13956,20 @@ function Invoke-Step56 {
 
     # ---- 1. WebClient (WebDAV) ----
     Write-Log 'Audit 1/7: WebClient (WebDAV / NTLM relay)' -Level INFO
+    # [FIX-GENERIC-4] Skip -DisableWebClient on domain-joined PCs. WebDAV
+    # and SharePoint (\\server\path) depend on it in many corporate
+    # environments. Warn instead of break.
+    $__domainJoined56 = $false
+    try { $__domainJoined56 = [bool](Get-CimInstance Win32_ComputerSystem -EA SilentlyContinue).PartOfDomain } catch { }
     $wcSvc = Get-Service -Name 'WebClient' -ErrorAction SilentlyContinue
     if ($wcSvc) {
         $wcStart = (Get-CimInstance Win32_Service -Filter "Name='WebClient'" -ErrorAction SilentlyContinue).StartMode
         Write-Log ("  Current state: {0} / {1}" -f $wcSvc.Status, $wcStart) -Level INFO
-        if ($wcStart -ne 'Disabled' -and $Script:DisableWebClient) {
+        if ($__domainJoined56 -and $Script:DisableWebClient -and $wcStart -ne 'Disabled') {
+            Write-Log '  [SKIP] Domain-joined PC detected. Skipping WebClient disable.' -Level WARN
+            Write-Log '         WebDAV/SharePoint depend on WebClient on managed networks.' -Level WARN
+            Write-Log '         To override, disable it manually:  sc config WebClient start= disabled' -Level WARN
+        } elseif ($wcStart -ne 'Disabled' -and $Script:DisableWebClient) {
             try {
                 Set-Service -Name 'WebClient' -StartupType Disabled -ErrorAction Stop
                 if ($wcSvc.Status -eq 'Running') { Stop-Service -Name 'WebClient' -Force -ErrorAction SilentlyContinue }
