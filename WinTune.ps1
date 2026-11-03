@@ -97,11 +97,11 @@ param(
     [switch]$AllowContextMenuAction,                           # Step 50 - disable non-essential context menu handlers
     [switch]$AllowProgramAuditAction,                         # Step 51 - remove orphaned program registry entries
 
-    # ---- New in v3.4 (driver updates) ----
+    # ---- New in v3.4 (driver updates) - [FIX-DRV-STALE-PARAM] MaxStale=2555 (7yr) ----
     [switch]$AllowDriverUpdates,                               # Step 8b - install drivers that pass safety gates
     [int]$DriverMinAgeDays = 30,                               # Step 8b - minimum driver age in days
     [int]$DriverMaxSizeMB = 2048,                              # Step 8b - max driver size (skip corrupt manifests)
-    [int]$DriverMaxStaleDays = 1825,                           # Step 8b - max driver age (stale threshold)
+    [int]$DriverMaxStaleDays = 2555,                           # Step 8b - max driver age (stale threshold)
 
     # ---- New in v3.5 (winget policy) ----
     [switch]$AllowUnknownPackageVersions,                       # Step 33 - pass --include-unknown to winget
@@ -235,7 +235,7 @@ $Script:AddWpadHostsEntry        = $AddWpadHostsEntry.IsPresent
 $Script:EnableScriptBlockLogging = $EnableScriptBlockLogging.IsPresent
 $Script:AllowContextMenuAction = $AllowContextMenuAction.IsPresent
 $Script:AllowProgramAuditAction = $AllowProgramAuditAction.IsPresent
-# ---- New in v3.4 (driver updates) ----
+# ---- New in v3.4 (driver updates) - [FIX-DRV-STALE-PARAM] MaxStale=2555 (7yr) ----
 $Script:AllowDriverUpdates = $AllowDriverUpdates.IsPresent
 $Script:DriverMinAgeDays = $DriverMinAgeDays
 $Script:DriverMaxSizeMB = $DriverMaxSizeMB
@@ -1153,47 +1153,113 @@ function Wait-DetachedRunners {
 # SFC/DISM window accumulation across runs.
 $Script:RunnerKindMarkerFile = Join-Path $Script:ScriptDir 'WinTune.runners.json'
 
-function Get-ExistingDetachedRunnerProcess {
+function Get-ExistingDetachedRunnerProcess {  # [FIX-KIND-CRASH-GET]
+    # Never throws. Under Set-StrictMode Latest, `$t.Kind` aborts for
+    # any element that is $null, a scalar, or missing the Kind property.
+    # All property access goes through PSObject.Properties so we degrade
+    # to "no existing runner" instead of crashing the caller's step.
     param([Parameter(Mandatory)][string]$Kind)
-    if (-not (Test-Path -LiteralPath $Script:RunnerKindMarkerFile)) { return @() }
-    try {
-        $tracked = Get-Content -LiteralPath $Script:RunnerKindMarkerFile -Raw -EA Stop | ConvertFrom-Json
-    } catch { return @() }
-    if (-not $tracked) { return @() }
 
     $live = @()
-    foreach ($t in @($tracked)) {
-        if ($t.Kind -ne $Kind) { continue }
-        $p = Get-Process -Id $t.Pid -EA SilentlyContinue
-        if ($p -and -not $p.HasExited) {
-            $live += [PSCustomObject]@{ Pid = [int]$t.Pid; Kind = $t.Kind; StartedAt = $t.StartedAt; Note = $t.Note }
+    try {
+        if (-not (Test-Path -LiteralPath $Script:RunnerKindMarkerFile)) { return $live }
+
+        $rawText = Get-Content -LiteralPath $Script:RunnerKindMarkerFile -Raw -EA Stop
+        if ([string]::IsNullOrWhiteSpace($rawText)) { return $live }
+
+        $tracked = $rawText | ConvertFrom-Json
+        if (-not $tracked) { return $live }
+
+        foreach ($t in @($tracked)) {
+            if ($null -eq $t) { continue }
+
+            $tKind = ''
+            try {
+                if ($t.PSObject.Properties['Kind'] -and $t.Kind) {
+                    $tKind = [string]$t.Kind
+                }
+            } catch { }
+            if ($tKind -ne $Kind) { continue }
+
+            $tPid = 0
+            try {
+                if ($t.PSObject.Properties['Pid'] -and $null -ne $t.Pid) {
+                    $tPid = [int]$t.Pid
+                }
+            } catch { }
+            if ($tPid -le 0) { continue }
+
+            $p = Get-Process -Id $tPid -EA SilentlyContinue
+            if ($p -and -not $p.HasExited) {
+                $live += [PSCustomObject]@{
+                    Pid       = $tPid
+                    Kind      = $tKind
+                    StartedAt = if ($t.PSObject.Properties['StartedAt'] -and $t.StartedAt) { [string]$t.StartedAt } else { '' }
+                    Note      = if ($t.PSObject.Properties['Note']      -and $t.Note)      { [string]$t.Note }      else { '' }
+                }
+            }
         }
+    } catch {
+        Write-Log ("  [WARN] Runner kind check failed: {0}" -f $_.Exception.Message) -Level WARN
     }
     return $live
 }
 
-function Register-TrackedRunnerKind {
+function Register-TrackedRunnerKind {  # [FIX-KIND-CRASH-REG]
+    # Never throws. Reads existing entries with strictmode-safe property
+    # access; on any parse error starts fresh. Writes JSON as an array
+    # even for single elements (PS 5.1 unwraps otherwise).
     param(
-        [Parameter(Mandatory)][int]$Pid,
+        [Parameter(Mandatory)][int]$RunnerPid,
         [Parameter(Mandatory)][string]$Kind,
         [string]$Note = ''
     )
+
     $entry = [PSCustomObject]@{
-        Pid       = $Pid
+        Pid       = $RunnerPid
         Kind      = $Kind
         Note      = $Note
         StartedAt = (Get-Date).ToString('o')
     }
+
     $existing = @()
-    if (Test-Path -LiteralPath $Script:RunnerKindMarkerFile) {
-        try {
-            $raw = Get-Content -LiteralPath $Script:RunnerKindMarkerFile -Raw -EA SilentlyContinue
-            if ($raw) { $existing = @($raw | ConvertFrom-Json | Where-Object { (Get-Process -Id $_.Pid -EA SilentlyContinue) }) }
-        } catch { }
+    try {
+        if (Test-Path -LiteralPath $Script:RunnerKindMarkerFile) {
+            $rawText = Get-Content -LiteralPath $Script:RunnerKindMarkerFile -Raw -EA Stop
+            if (-not [string]::IsNullOrWhiteSpace($rawText)) {
+                $tracked = $rawText | ConvertFrom-Json
+                if ($tracked) {
+                    foreach ($t in @($tracked)) {
+                        if ($null -eq $t) { continue }
+                        $tPid = 0
+                        try {
+                            if ($t.PSObject.Properties['Pid'] -and $null -ne $t.Pid) {
+                                $tPid = [int]$t.Pid
+                            }
+                        } catch { }
+                        if ($tPid -le 0) { continue }
+                        $p = Get-Process -Id $tPid -EA SilentlyContinue
+                        if ($p -and -not $p.HasExited) {
+                            $existing += $t
+                        }
+                    }
+                }
+            }
+        }
+    } catch {
+        # Corrupt file - start fresh
+        $existing = @()
     }
+
     $all = @($existing) + $entry
     try {
-        $all | ConvertTo-Json -Compress | Set-Content -LiteralPath $Script:RunnerKindMarkerFile -Encoding UTF8 -EA Stop
+        # PS 5.1's ConvertTo-Json -InputObject @($all) still unwraps
+        # 1-element arrays to a bare object. Detect and re-wrap.
+        $json = ConvertTo-Json -InputObject $all -Compress -Depth 5
+        if (-not ($json.TrimStart() -match '^\[')) {
+            $json = "[$json]"
+        }
+        Set-Content -LiteralPath $Script:RunnerKindMarkerFile -Value $json -Encoding UTF8 -EA Stop
     } catch {
         Write-Log ("  [WARN] Could not persist runner tracking: {0}" -f $_.Exception.Message) -Level WARN
     }
@@ -4972,7 +5038,7 @@ $logFile  = if ($env:FC_LOG_DIR) { Join-Path $env:FC_LOG_DIR 'WinTune_Drivers.lo
 $allowInstall = ($env:FC_ALLOW_DRIVER_UPDATES -eq '1')
 $minAgeDays   = if ($env:FC_DRIVER_MIN_AGE_DAYS) { [int]$env:FC_DRIVER_MIN_AGE_DAYS } else { 30 }
 $maxSizeMB    = if ($env:FC_DRIVER_MAX_SIZE_MB)   { [int]$env:FC_DRIVER_MAX_SIZE_MB }   else { 2048 }
-$maxStaleDays = if ($env:FC_DRIVER_MAX_STALE_DAYS) { [int]$env:FC_DRIVER_MAX_STALE_DAYS } else { 1825 }
+$maxStaleDays = if ($env:FC_DRIVER_MAX_STALE_DAYS) { [int]$env:FC_DRIVER_MAX_STALE_DAYS } else { 2555 }  # [FIX-DRV-STALE-RUNNER]
 
 function DR-Log {
     param([string]$Message, [string]$Level = 'INFO')
@@ -5351,18 +5417,54 @@ try {
             $code   = if ($result.PSObject.Properties['ResultCode']) { [int]$result.ResultCode } else { -1 }
             $hres   = if ($result.PSObject.Properties['HResult'])    { [int]$result.HResult }    else { 0 }
 
-            # Try to extract per-update HResult (more specific than aggregate)
-            $perUpdateHResult = 0
+            # [FIX-DRV-HRESULT] Iterate every per-update result so the
+            # real reason surfaces even when WUA collapses the batch to
+            # a generic 0x80240022 aggregate.
+            $perUpdateResults = @()
             try {
-                if ($result.PSObject.Properties['Updates'] -and $result.Updates.Count -gt 0) {
-                    $ur = $result.GetUpdateResult(0)
-                    if ($ur -and $ur.PSObject.Properties['HResult']) {
-                        $perUpdateHResult = [int]$ur.HResult
+                $updCount = 1
+                try {
+                    if ($result.PSObject.Properties['Updates']) {
+                        $updCount = [int]$result.Updates.Count
                     }
+                } catch { }
+                if ($updCount -le 0) { $updCount = 1 }
+                for ($uj = 0; $uj -lt $updCount; $uj++) {
+                    try {
+                        $ur = $result.GetUpdateResult($uj)
+                        if ($ur) {
+                            $urCode = if ($ur.PSObject.Properties['ResultCode']) { [int]$ur.ResultCode } else { -1 }
+                            $urHr   = if ($ur.PSObject.Properties['HResult'])    { [int]$ur.HResult }    else { 0 }
+                            $perUpdateResults += [PSCustomObject]@{
+                                Index      = $uj
+                                ResultCode = $urCode
+                                HResult    = $urHr
+                            }
+                        }
+                    } catch { }
                 }
             } catch { }
 
-            # Use the per-update HResult if available, else the aggregate
+            # Log every per-update HResult as hex so the user can grep for it
+            foreach ($ur in $perUpdateResults) {
+                if ($ur.HResult -ne 0) {
+                    $unsigned = if ($ur.HResult -lt 0) { [int64]$ur.HResult + 4294967296 } else { [int64]$ur.HResult }
+                    DR-Log ("    [diag] update #{0}: ResultCode={1}, HResult=0x{2:X8}" -f $ur.Index, $ur.ResultCode, $unsigned) 'INFO'
+                }
+            }
+
+            # Prefer a per-update HResult that differs from the aggregate
+            # (more specific than the batch-level code)
+            $perUpdateHResult = 0
+            foreach ($ur in $perUpdateResults) {
+                if ($ur.HResult -ne 0 -and $ur.HResult -ne $hres) {
+                    $perUpdateHResult = $ur.HResult
+                    break
+                }
+            }
+            if ($perUpdateHResult -eq 0 -and $perUpdateResults.Count -gt 0) {
+                $perUpdateHResult = $perUpdateResults[0].HResult
+            }
             $effectiveHResult = if ($perUpdateHResult -ne 0) { $perUpdateHResult } else { $hres }
 
             # Classify by HResult first (more specific than ResultCode)
@@ -5374,17 +5476,27 @@ try {
             #   0x8024000B = WU_E_CALL_CANCELLED       - cancelled
             $skipReason = $null
             if ($effectiveHResult -ne 0) {
+                # [FIX-DRV-HRESULT-2] Extended driver failure codes. Many of
+                # these surface via the generic 0x80240022 aggregate; adding
+                # them here classifies them as SKIP (not FAIL) and gives the
+                # user a specific next step.
                 switch ($effectiveHResult) {
                     -2145124329 { $skipReason = 'Not applicable to this system (0x80240017)' }                    # WU_E_NOT_APPLICABLE
                     -2145124320 { $skipReason = 'Another install in progress (0x80240020)' }                       # WU_E_INSTALL_NOT_ALLOWED
                     -2145124307 { $skipReason = 'Reboot required before install (0x8024002D)' }                    # WU_E_SOURCE_ABSENT
                     -2144796149 { $skipReason = 'User logon required (0x800F020B)' }                               # WU_E_USER_LOGON_REQUIRED
                     -2145124341 { $skipReason = 'Call cancelled (0x8024000B)' }                                    # WU_E_CALL_CANCELLED
-                    -2145124318 { $skipReason = 'All updates failed to install (0x80240022 WU_E_ALL_UPDATES_FAILED) - likely a signed-package or applicability issue; try installing manually via Windows Update' }
+                    -2145124318 { $skipReason = 'All updates failed (0x80240022) - check CBS.log and setupapi.dev.log, or install manually via Windows Update' }
                     -2145124302 { $skipReason = 'Update not applicable to current OS version (0x80240032)' }       # WU_E_INVALID_OPERATION
                     -2147024891 { $skipReason = 'Access denied (0x80070005) - run as SYSTEM or elevated' }         # E_ACCESSDENIED
                     -2147023436 { $skipReason = 'Timeout (0x800705B4) - driver download/install exceeded WUA timeout' } # ERROR_TIMEOUT
                     -2145124322 { $skipReason = 'WU service stopped (0x8024001E WU_E_SERVICE_STOP) - transient; retry the step' } # WU_E_SERVICE_STOP
+                    # Driver-specific failures (most commonly surfaced via 0x80240022 aggregate)
+                    -2147024637 { $skipReason = 'A newer driver is already installed (0x80070103 WU_E_DRIVER_ALREADY_INSTALLED)' }
+                    -2147024894 { $skipReason = 'Driver payload not found (0x80070002 ERROR_FILE_NOT_FOUND)' }
+                    -2146500026 { $skipReason = 'Driver setup failed (0x800F0246) - check setupapi.dev.log' }
+                    -2146500025 { $skipReason = 'Driver payload missing from WU cache (0x800F0247)' }
+                    -2146500093 { $skipReason = 'Driver signature validation failed (0x800F0203)' }
                 }
             }
 
@@ -5545,7 +5657,7 @@ function Invoke-Step08b {
 
         Write-Log ("  [OK] Child PowerShell launched (PID {0})." -f $child.Id) -Level OK
         Register-DetachedExitTracking -Child $child -Kind 'Drivers' -Note 'Step 8b'
-        Register-TrackedRunnerKind -Pid $child.Id -Kind 'Drivers' -Note 'Step 8b'
+        Register-TrackedRunnerKind -RunnerPid $child.Id -Kind 'Drivers' -Note 'Step 8b'
         Write-Log '  WinTune will continue; driver audit runs independently.' -Level INFO
         Write-Log '  Look for the new window: "WinTune - Driver Update Runner"' -Level INFO
 
@@ -6191,7 +6303,7 @@ function Invoke-Step12 {
 
         Write-Log ("  [OK] Child PowerShell launched (PID {0})." -f $child.Id) -Level OK
         Register-DetachedExitTracking -Child $child -Kind 'SFC/DISM' -Note 'Step 12'
-        Register-TrackedRunnerKind -Pid $child.Id -Kind 'SFC/DISM' -Note 'Step 12'
+        Register-TrackedRunnerKind -RunnerPid $child.Id -Kind 'SFC/DISM' -Note 'Step 12'
         Add-ReportRunner -Kind 'SFC/DISM' -RunnerPid $child.Id -Note 'Step 12'
         Write-Log '  WinTune will continue; repairs run independently.' -Level INFO
         Write-Log '  Look for the new window: "WinTune - SFC / DISM Repair"' -Level INFO
@@ -9448,7 +9560,7 @@ function Invoke-Step33 {
 
         Write-Log ("  [OK] Child PowerShell launched (PID {0})." -f $child.Id) -Level OK
         Register-DetachedExitTracking -Child $child -Kind 'Winget' -Note 'Step 33'
-        Register-TrackedRunnerKind -Pid $child.Id -Kind 'Winget' -Note 'Step 33'
+        Register-TrackedRunnerKind -RunnerPid $child.Id -Kind 'Winget' -Note 'Step 33'
         Add-ReportRunner -Kind 'Winget' -RunnerPid $child.Id -Note 'Step 33'
         Write-Log '  WinTune will continue; winget upgrade runs independently.' -Level INFO
         Write-Log '  Look for the new window: "WinTune - Winget Upgrade (Full Detail Mode)"' -Level INFO
@@ -10940,7 +11052,11 @@ function Invoke-Step39 {
 
         Write-Log ("  [OK] Child PowerShell launched (PID {0})." -f $child.Id) -Level OK
         Register-DetachedExitTracking -Child $child -Kind 'Windows Update' -Note 'Step 39'
-        Register-TrackedRunnerKind -Pid $child.Id -Kind 'Windows Update' -Note 'Step 39'
+        # [FIX-PID-PARAM-3] Tracking is best-effort. A failure here must
+        # never abort the launch block, because the child is already
+        # running by this point.
+        try { Register-TrackedRunnerKind -RunnerPid $child.Id -Kind 'Windows Update' -Note 'Step 39' }
+        catch { Write-Log ("  [WARN] Cross-run tracking failed: {0}" -f $_.Exception.Message) -Level WARN }
         Add-ReportRunner -Kind 'Windows Update' -RunnerPid $child.Id -Note 'Step 39'
         Write-Log '  WinTune will continue; Windows Update runs independently.' -Level INFO
         Write-Log '  Look for the new window with the banner: WinTune - Windows Update Installer' -Level INFO
@@ -14069,11 +14185,26 @@ function Invoke-PostCheck {
     Write-Host '  [2] If Step 32 was enabled, review Defender ASR Audit events.' -ForegroundColor Gray
     Write-Host '  [3] Reboot only if a specific configuration change requires it.' -ForegroundColor Gray
 
-    # ---- Reboot flag (set by Step 23) ----
+    # ---- Reboot flag (dynamic reasons) ----
+    # [FIX-POSTCHECK-REBOOT] The old block hardcoded "Step 23 (network
+    # reset)" even when the reboot was triggered by Step 45, CBS pending,
+    # or Windows Update. Print the actual reasons instead.
     if ($Script:RebootRequired) {
+        $__rebootReasons = @()
+        try {
+            if ($Script:RebootReasons -and @($Script:RebootReasons).Count -gt 0) {
+                $__rebootReasons = @($Script:RebootReasons)
+            }
+        } catch { }
+        if ($__rebootReasons.Count -eq 0) {
+            $__rebootReasons = @('(reason not recorded)')
+        }
         Write-Host ''
-        Write-Host '[REBOOT REQUIRED] Step 23 (network reset) modified the Winsock catalog.' -ForegroundColor Yellow
-        Write-Host '                  Restart your PC to apply the changes.' -ForegroundColor Yellow
+        Write-Host '[REBOOT REQUIRED]' -ForegroundColor Yellow
+        foreach ($__r in $__rebootReasons) {
+            Write-Host ("  - {0}" -f $__r) -ForegroundColor Yellow
+        }
+        Write-Host '  Restart your PC to apply the changes.' -ForegroundColor Yellow
     }
 
 
