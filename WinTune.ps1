@@ -136,6 +136,10 @@ param(
     [switch]$AllowWslInstall,                                   # Step 59 - install WSL
     [switch]$AllowDevDriveEnable,                               # Step 59 - enable Dev Drive capability
 
+    # [FIX-CONFIG-PARAM] Optional JSON config file for per-machine
+    # overrides. CLI parameters always win over config-file values.
+    [string]$ConfigFile = '',
+
     # ---- Detached runner tracking ----
     [switch]$WaitForDetached,                                   # Wait indefinitely for all children before PostCheck
     [switch]$AllowScheduledTaskAction,
@@ -153,6 +157,40 @@ param(
     [int]$PackageCacheMinSizeMB  = 5,                           # Step 42 - minimum folder size
     [int]$PackageCacheMinTotalMB = 100                          # Step 42 - minimum total candidate size
 )
+
+# ---- [FIX-CONFIG-LOAD] Load optional JSON config before Preset ----
+if ($ConfigFile -and (Test-Path -LiteralPath $ConfigFile)) {
+    try {
+        $__cfg = Get-Content -LiteralPath $ConfigFile -Raw -ErrorAction Stop | ConvertFrom-Json
+        foreach ($__prop in $__cfg.PSObject.Properties) {
+            $__name = $__prop.Name
+            $__val  = $__prop.Value
+            if ($PSBoundParameters.ContainsKey($__name)) {
+                # CLI explicitly set this — CLI wins
+                continue
+            }
+            $__cur = Get-Variable -Name $__name -Scope Local -ErrorAction SilentlyContinue
+            if (-not $__cur) {
+                Write-Warning "Config: unknown parameter '$__name' — skipped"
+                continue
+            }
+            if ($__cur.Value -is [System.Management.Automation.SwitchParameter]) {
+                Set-Variable -Name $__name -Value ([switch]([bool]$__val)) -Scope Local
+            } elseif ($__cur.Value -is [array]) {
+                Set-Variable -Name $__name -Value @($__val) -Scope Local
+            } else {
+                Set-Variable -Name $__name -Value $__val -Scope Local
+            }
+            $PSBoundParameters[$__name] = (Get-Variable -Name $__name -Scope Local).Value
+            Write-Host ("  [CONFIG] {0} = {1}" -f $__name, ($__val -join ',')) -ForegroundColor DarkGray
+        }
+        Write-Host ("  [CONFIG] Loaded {0} override(s) from {1}" -f $__cfg.PSObject.Properties.Count, $ConfigFile) -ForegroundColor DarkGray
+    } catch {
+        Write-Warning "Config file load failed: $($_.Exception.Message) — continuing with defaults"
+    }
+} elseif ($ConfigFile) {
+    Write-Warning "Config file not found: $ConfigFile — continuing with defaults"
+}
 
 # ---- B1 fix: shadow the reserved $Profile automatic variable ----
 # [FIX-B1-COMMENT] Public CLI accepts -Preset (not -Profile);
