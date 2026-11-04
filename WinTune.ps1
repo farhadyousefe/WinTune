@@ -2298,6 +2298,12 @@ try {
             WG-Log 'Installing App Installer (MSIX bundle)...' 'STEP'
             Add-AppxPackage -Path $tempFile -ErrorAction Stop
             Remove-Item -LiteralPath $tempFile -Force -ErrorAction SilentlyContinue
+            # [FIX-WINGET-INSTALLED] Mark install as succeeded so the
+            # Store fallback below does not fire on a fresh install.
+            # Without this, a clean GitHub install of App Installer
+            # immediately opened the Store page and exited 1, forcing
+            # a second run before the auto-install actually took effect.
+            $installed = $true
         } catch {
             WG-Log ("GitHub method failed: {0}" -f $_.Exception.Message) 'WARN'
         }
