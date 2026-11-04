@@ -135,7 +135,8 @@ param(
 )
 
 # ---- B1 fix: shadow the reserved $Profile automatic variable ----
-# Public CLI still accepts -Profile; internal logic uses $Script:PresetName.
+# [FIX-B1-COMMENT] Public CLI accepts -Preset (not -Profile);
+# internal logic uses $Script:PresetName.
 if ($PSBoundParameters.ContainsKey('Preset')) { $Script:PresetName = [string]$Preset } else { $Script:PresetName = '' }
 
 Set-StrictMode -Version Latest
@@ -145,7 +146,8 @@ $ProgressPreference   = 'Continue'
 # ============================================================
 # GLOBAL CONFIGURATION
 # ============================================================
-$Script:Version      = '1.0.0'
+# [FIX-VERSION-SCHEME] Bumped to match parameter-phase comments (v3.7).
+$Script:Version      = '3.7.0'
 $Script:ScriptPath   = $MyInvocation.MyCommand.Path
 $Script:ScriptDir    = Split-Path -Parent $Script:ScriptPath
 $Script:ScriptName   = Split-Path -Leaf   $Script:ScriptPath
@@ -279,8 +281,15 @@ switch ($Script:PresetName.ToLowerInvariant()) {
         'full' {
             $SkipSteps = @()
         }
+        # [FIX-WEEKLY-PRESET] Weekly = cheap recurring maintenance.
+        # Skip only heavy/slow/one-time/gated steps so the weekly run
+        # actually does useful recurring work instead of mirroring 'quick'.
+        #   Skipped:  12-15 (DISM/SFC), 18 (DriverStore audit),
+        #             21 (Prefetch, gated anyway), 22 (standby, no-op),
+        #             23 (Network reset, gated), 24 (SSD optimize, long),
+        #             29 (SMBv1, one-time), 36 (Search defrag, heavy).
         'weekly' {
-            $SkipSteps = @(4,5,6,9,12,13,14,15,18,19,20,21,22,23,24,25,26,29,30,31,32,33,34,35,36,37,38,39)
+            $SkipSteps = @(12,13,14,15,18,21,22,23,24,29,36)
         }
     }
 }
@@ -7869,7 +7878,9 @@ Write-Log '    2. Click "System Restore..."' -Level INFO
 Write-Log '    3. Select the "WinTune_PreChange" entry' -Level INFO
 Write-Log '    4. Follow the wizard (5-15 minutes)' -Level INFO
 Write-Log '' -Level INFO
-Write-Log '  Retention: managed by Windows via the VSS cap (Step 17, 3%).' -Level INFO
+# [FIX-STEP25-VSS-1] Step 17 now uses a fixed-GB tier (3 GB <=500GB,
+# 5 GB >500GB), not a percentage. Old "(Step 17, 3%)" was stale.
+Write-Log '  Retention: managed by Windows via the VSS tier cap (see Step 17).' -Level INFO
 Write-Log '  Process time: 30-90 seconds.' -Level INFO
 Write-Log '' -Level INFO
 
@@ -7970,7 +7981,13 @@ if (-not (Confirm-Action -Query 'Create a pre-change restore point?')) {
 
             if ($capDiag) {
                 Write-Log ("  [DIAG] VSS storage: {0}" -f $capDiag) -Level INFO
-                Write-Log '  [DIAG] Most likely cause: the 5 GB VSS cap from Step 17 is already full,' -Level INFO
+                # [FIX-STEP25-VSS-2] Compute the actual cap for this drive.
+                $__capGB = 3
+                try {
+                    $__d = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$env:SystemDrive'" -EA SilentlyContinue
+                    if ($__d -and $__d.Size -gt 500GB) { $__capGB = 5 }
+                } catch { }
+                Write-Log ("  [DIAG] Most likely cause: the {0} GB VSS cap from Step 17 is already full," -f $__capGB) -Level INFO
                 Write-Log '         so Windows silently pruned the oldest restore point to fit the new one.' -Level INFO
                 Write-Log '  [DIAG] Fix: increase the cap with:' -Level INFO
                 Write-Log '         vssadmin resize shadowstorage /for=C: /on=C: /maxsize=10GB' -Level INFO
