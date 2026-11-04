@@ -2616,13 +2616,15 @@ function Reset-WUCache {
         while ((Get-Date) -lt $deadline) {
             $wu = Get-Service -Name wuauserv -ErrorAction SilentlyContinue
             if ($wu -and $wu.Status -eq 'Running') {
-                return $true
+                # [FIX-RESETWU-HASHTABLE] Return hashtable so caller can
+                # log WHY the reset failed, not just "didn't work."
+                return @{ Ok = $true; Reason = 'reset complete; wuauserv running' }
             }
             Start-Sleep -Seconds 2
         }
-        return $false
+        return @{ Ok = $false; Reason = 'wuauserv did not reach Running within 30s after reset' }
     } catch {
-        return $false
+        return @{ Ok = $false; Reason = $_.Exception.Message }
     }
 }
 
@@ -2737,6 +2739,10 @@ try {
 
     $available = @()
     $scanWarn  = @()
+    # [FIX-WU-SCANFLAG] Track whether the scan actually failed so we
+    # don't claim "no updates available" when the real answer is
+    # "couldn't scan."
+    $Script:__wuScanFailed = $false
 
     try {
         $available = @(
@@ -2749,30 +2755,51 @@ try {
         # Known WUA COM error - reset cache and retry once
         if ($errMsg -match 'Value does not fall within the expected range') {
             WU-Log 'This is a known Windows Update Agent state issue.' 'WARN'
-            WU-Log 'Resetting Windows Update cache (stops services, clears caches)...' 'STEP'
+            # [FIX-WU-SCAN-RESILIENCE] Try the lightweight recovery first:
+            # just sleep and retry. Step 1 already stopped and restarted
+            # wuauserv/dosvc/bits/cryptsvc minutes ago, and a fresh cache
+            # was just created. A heavy Reset-WUCache here is both
+            # unnecessary and prone to failing because the freshly-created
+            # SoftwareDistribution folder is held open by the restarted
+            # services. Only fall back to a hard reset if the light retry
+            # also fails.
+            WU-Log 'Sleeping 30s to let the WU agent settle, then retrying...' 'STEP'
+            Start-Sleep -Seconds 30
 
-            $resetResult = Reset-WUCache
-            $resetOk    = if ($resetResult -is [hashtable]) { $resetResult.Ok } else { [bool]$resetResult }
-            $resetWhy   = if ($resetResult -is [hashtable] -and $resetResult.Reason) { $resetResult.Reason } else { '(no reason)' }
+            $__scanSucceeded = $false
+            try {
+                $available = @(
+                    Get-WindowsUpdate -WarningVariable scanWarn -WarningAction SilentlyContinue
+                )
+                WU-Log ("Retry succeeded. Found {0} update(s)." -f $available.Count) 'OK'
+                $__scanSucceeded = $true
+            } catch {
+                WU-Log ("Retry after 30s sleep also failed: {0}" -f $_.Exception.Message) 'WARN'
+                WU-Log 'Attempting hard cache reset as last resort...' 'STEP'
 
-            if ($resetOk) {
-                WU-Log 'Cache reset complete. Retrying scan in 5 seconds...' 'STEP'
-                Start-Sleep -Seconds 5
+                $resetResult = Reset-WUCache
+                $resetOk    = if ($resetResult -is [hashtable]) { $resetResult.Ok } else { [bool]$resetResult }
+                $resetWhy   = if ($resetResult -is [hashtable] -and $resetResult.Reason) { $resetResult.Reason } else { '(no reason provided)' }
 
-                try {
-                    $available = @(
-                        Get-WindowsUpdate -WarningVariable scanWarn -WarningAction SilentlyContinue
-                    )
-                    WU-Log ("Retry succeeded. Found {0} update(s)." -f $available.Count) 'OK'
-                } catch {
-                    WU-Log ("Retry after cache reset also failed: {0}" -f $_.Exception.Message) 'ERROR'
-                    WU-Log 'Windows Update scan failed after cache reset.' 'ERROR'
-                    WU-Log 'Run Windows Update manually: Settings -> Windows Update' 'INFO'
+                if ($resetOk) {
+                    WU-Log 'Cache reset complete. Retrying scan in 5 seconds...' 'STEP'
+                    Start-Sleep -Seconds 5
+                    try {
+                        $available = @(
+                            Get-WindowsUpdate -WarningVariable scanWarn -WarningAction SilentlyContinue
+                        )
+                        WU-Log ("Retry after reset succeeded. Found {0} update(s)." -f $available.Count) 'OK'
+                        $__scanSucceeded = $true
+                    } catch {
+                        WU-Log ("Final retry after cache reset failed: {0}" -f $_.Exception.Message) 'ERROR'
+                    }
+                } else {
+                    WU-Log ("Cache reset did not complete: {0}" -f $resetWhy) 'WARN'
                 }
-            } else {
-                WU-Log ("Cache reset did not complete: {0}" -f $resetWhy) 'WARN'
-                WU-Log 'Scan failed and cache reset did not complete.' 'ERROR'
-                WU-Log 'Run Windows Update manually: Settings -> Windows Update' 'INFO'
+            }
+
+            if (-not $__scanSucceeded) {
+                $Script:__wuScanFailed = $true
             }
         }
     }
@@ -2791,9 +2818,19 @@ try {
     # is a different dataset and would create false reporting.
     if ($available.Count -eq 0) {
         WU-Log '' 'INFO'
-        WU-Log 'No available updates returned by Windows Update Agent.' 'OK'
-        WU-Log 'If this is unexpected, run Windows Update manually:' 'INFO'
-        WU-Log '  Settings -> Windows Update -> Check for updates' 'INFO'
+        # [FIX-WU-NOUPDATE-MSG] Distinguish "scan failed" from
+        # "scan succeeded and returned nothing." These are not
+        # the same and the previous message was misleading.
+        if ($Script:__wuScanFailed) {
+            WU-Log 'Scan did not complete — update availability is UNKNOWN.' 'WARN'
+            WU-Log 'This is not the same as "no updates available."' 'WARN'
+            WU-Log 'Run Windows Update manually to check:' 'INFO'
+            WU-Log '  Settings -> Windows Update -> Check for updates' 'INFO'
+        } else {
+            WU-Log 'No available updates returned by Windows Update Agent.' 'OK'
+            WU-Log 'If this is unexpected, run Windows Update manually:' 'INFO'
+            WU-Log '  Settings -> Windows Update -> Check for updates' 'INFO'
+        }
     }
     # Filter out driver updates from the display (they have no KB).
     # Drivers are handled separately (audit-only) â€” not auto-installed.
@@ -5533,11 +5570,19 @@ try {
                     $downloader.Updates = $coll
                     $dlResult = $downloader.Download()
 
+                    # [FIX-DRV-HRESULT-RUNSPACE] WUA can return HRESULTs
+                    # like 0x8024401E (2149842974) which exceed
+                    # [int32]::MaxValue. Wrap them to the signed
+                    # equivalent. Same for ResultCode for consistency.
                     if ($dlResult.PSObject.Properties['ResultCode']) {
-                        $result.ResultCode = [int]$dlResult.ResultCode
+                        $__rc = [int64]$dlResult.ResultCode
+                        if ($__rc -gt [int]::MaxValue) { $__rc -= 0x100000000 }
+                        $result.ResultCode = [int]$__rc
                     }
                     if ($dlResult.PSObject.Properties['HResult']) {
-                        $result.HResult = [int]$dlResult.HResult
+                        $__hr = [int64]$dlResult.HResult
+                        if ($__hr -gt [int]::MaxValue) { $__hr -= 0x100000000 }
+                        $result.HResult = [int]$__hr
                     }
                     $result.Ok = ($result.ResultCode -eq 2 -or $result.ResultCode -eq 3)
                 } catch {
@@ -5598,14 +5643,19 @@ try {
                 # exception text carries the HResult as "Exception from
                 # HRESULT: 0xNNNNNNNN" - parse it out so the log line
                 # stops printing 0x00000000 next to a real error code.
-                if ($dlResult -and $dlResult.HResult -and [int64]$dlResult.HResult -ne 0) {
-                    $dlHres = [int64]$dlResult.HResult
+                # [FIX-DRV-HRESULT-DL] Normalize the failure HRESULT to
+                # an unsigned 32-bit value so 0x{0:X8} formatting works
+                # and no cast throws on large values. This was the actual
+                # crash site: [int32][Convert]::ToUInt32("8024401E", 16)
+                # threw "Value was either too large or too small for an
+                # Int32" and escaped to the outer catch as a fatal.
+                $__dlHresU = [uint32]0
+                if ($dlResult -and $dlResult.PSObject.Properties['HResult'] -and [int64]$dlResult.HResult -ne 0) {
+                    $__dlHresU = [uint32]([int64]$dlResult.HResult -band 0xFFFFFFFFL)
                 } elseif ($dlResult -and $dlResult.Error -and $dlResult.Error -match 'HRESULT:\s*0x([0-9A-Fa-f]{8})') {
-                    # Cast back to signed int so the skip switch below matches
-                    $dlHres = [int32][Convert]::ToUInt32($matches[1], 16)
-                } else {
-                    $dlHres = 0
+                    $__dlHresU = [Convert]::ToUInt32($matches[1], 16)
                 }
+                $dlHres = $__dlHresU
 
                 $errText = if ($dlResult -and $dlResult.Error) { $dlResult.Error } else { '(no error text)' }
                 DR-Log ("  [FAIL] Download failed (0x{0:X8}) - {1}" -f $dlHres, $errText) 'ERROR'
@@ -5622,8 +5672,13 @@ try {
             $result = $installer.Install()
 
             # Extract aggregate result
-            $code   = if ($result.PSObject.Properties['ResultCode']) { [int]$result.ResultCode } else { -1 }
-            $hres   = if ($result.PSObject.Properties['HResult'])    { [int]$result.HResult }    else { 0 }
+            # [FIX-DRV-HRESULT-INST] Same guard for the install result.
+            $__codeRaw = if ($result.PSObject.Properties['ResultCode']) { [int64]$result.ResultCode } else { -1 }
+            if ($__codeRaw -gt [int]::MaxValue) { $__codeRaw -= 0x100000000 }
+            $code = [int]$__codeRaw
+            $__hresRaw = if ($result.PSObject.Properties['HResult']) { [int64]$result.HResult } else { 0 }
+            if ($__hresRaw -gt [int]::MaxValue) { $__hresRaw -= 0x100000000 }
+            $hres = [int]$__hresRaw
 
             # [FIX-DRV-HRESULT] Iterate every per-update result so the
             # real reason surfaces even when WUA collapses the batch to
@@ -5641,8 +5696,13 @@ try {
                     try {
                         $ur = $result.GetUpdateResult($uj)
                         if ($ur) {
-                            $urCode = if ($ur.PSObject.Properties['ResultCode']) { [int]$ur.ResultCode } else { -1 }
-                            $urHr   = if ($ur.PSObject.Properties['HResult'])    { [int]$ur.HResult }    else { 0 }
+                            # [FIX-DRV-HRESULT-PERUPD] Same safe wrap.
+                            $__urcRaw = if ($ur.PSObject.Properties['ResultCode']) { [int64]$ur.ResultCode } else { -1 }
+                            if ($__urcRaw -gt [int]::MaxValue) { $__urcRaw -= 0x100000000 }
+                            $__urhRaw = if ($ur.PSObject.Properties['HResult']) { [int64]$ur.HResult } else { 0 }
+                            if ($__urhRaw -gt [int]::MaxValue) { $__urhRaw -= 0x100000000 }
+                            $urCode = [int]$__urcRaw
+                            $urHr   = [int]$__urhRaw
                             $perUpdateResults += [PSCustomObject]@{
                                 Index      = $uj
                                 ResultCode = $urCode
@@ -13560,7 +13620,11 @@ function Write-HtmlReport {
             if ($Script:DetachedRunners -and $Script:DetachedRunners.ContainsKey($r.Pid)) {
                 $t = $Script:DetachedRunners[$r.Pid]
                 if ($null -ne $t.ExitCode) {
-                    $exitInfo = ('0x{0:X8} ({1})' -f [uint32]$t.ExitCode, $t.ExitCode)
+                    # [FIX-EXITCODE-HTML] Same mask as PostCheck — avoid
+                    # the [uint32] cast exception on STATUS_CONTROL_C_EXIT
+                    # and similar negative ExitCodes.
+                    $__tExitU = [uint32]([int64]$t.ExitCode -band 0xFFFFFFFFL)
+                    $exitInfo = ('0x{0:X8} ({1})' -f $__tExitU, $t.ExitCode)
                     $exitCls  = if ($t.ExitCode -eq 0) { 'st-ok' } else { 'st-warn' }
                 } else {
                     $exitInfo = 'running'
@@ -14408,8 +14472,14 @@ function Invoke-PostCheck {
                 $r = $Script:DetachedRunners[$rPid]
                 if ($null -ne $r.ExitCode) {
                     $lvl = if ($r.ExitCode -eq 0) { 'OK' } else { 'WARN' }
+                    # [FIX-EXITCODE-UNSIGNED] [uint32] cast throws on
+                    # negative ExitCodes (e.g. -1073741510 = 0xC000013A
+                    # = STATUS_CONTROL_C_EXIT, seen when a detached
+                    # child is closed via Ctrl+C). Mask to unsigned
+                    # 32-bit before display.
+                    $__exitU = [uint32]([int64]$r.ExitCode -band 0xFFFFFFFFL)
                     Write-Log ("  PID {0} ({1}/{2}): exit 0x{3:X8} ({4})" -f `
-                        $rPid, $r.Kind, $r.Note, [uint32]$r.ExitCode, $r.ExitCode) -Level $lvl
+                        $rPid, $r.Kind, $r.Note, $__exitU, $r.ExitCode) -Level $lvl
                 } else {
                     Write-Log ("  PID {0} ({1}/{2}): still running" -f `
                         $rPid, $r.Kind, $r.Note) -Level WARN
