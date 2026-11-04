@@ -116,6 +116,12 @@ param(
     [switch]$AllowTcpTuning,                                    # Step 55 - TCP performance tuning
     [switch]$AllowVbsAudit,                                     # Step 24 enhancement - VBS/HVCI audit
 
+    # ---- New in v3.8 (Advanced tweaks) ----
+    [switch]$AllowHibernationOff,                               # Step 57 - disable hibernation (desktops)
+    [switch]$AllowModernStandbyOff,                             # Step 57 - disable modern standby (requires reboot)
+    [switch]$AllowHpetOff,                                      # Step 57 - disable HPET (for low-latency gaming)
+    [switch]$AllowRegistryBackup,                               # Step 57 - enable periodic registry backups
+
     # ---- Detached runner tracking ----
     [switch]$WaitForDetached,                                   # Wait indefinitely for all children before PostCheck
     [switch]$AllowScheduledTaskAction,
@@ -249,6 +255,10 @@ $Script:AllowServiceTrim   = $AllowServiceTrim.IsPresent
 $Script:AllowPrivacyTweaks = $AllowPrivacyTweaks.IsPresent
 $Script:AllowTcpTuning     = $AllowTcpTuning.IsPresent
 $Script:AllowVbsAudit      = $AllowVbsAudit.IsPresent
+$Script:AllowHibernationOff = $AllowHibernationOff.IsPresent
+$Script:AllowModernStandbyOff = $AllowModernStandbyOff.IsPresent
+$Script:AllowHpetOff = $AllowHpetOff.IsPresent
+$Script:AllowRegistryBackup = $AllowRegistryBackup.IsPresent
 $Script:RollbackMode       = $Rollback.IsPresent
 $Script:InRollbackMode   = $false
 
@@ -391,6 +401,7 @@ $Script:StepNames = @{
     54 = 'Privacy and Start Menu Tweaks'
     55 = 'TCP Performance Tuning'
     56 = 'Security Posture Audits'
+    57 = 'Advanced System Tweaks'
     '1b' = 'SSD Fullness Check'
     '8b' = 'Driver Update Audit + Install (Detached)'
 }
@@ -453,6 +464,7 @@ $Script:StepDescriptions = @{
     '54' = 'Applied HKCU privacy and Start Menu tweaks.'
     '55' = 'Enabled RSS, normalized auto-tuning, and set CUBIC congestion provider.'
     '56' = 'Audited seven security controls (WebClient, WPAD, LAPS, ScriptBlockLogging, UAC, SMB signing, BitLocker).'
+    '57' = 'Applied advanced tweaks (hibernation, HPET, modern standby, registry backup).'
 }
 
 
@@ -13075,6 +13087,14 @@ function Invoke-Step54 {
         [PSCustomObject]@{ Path = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager'; Name = 'SystemPaneSuggestionsEnabled';      Value = 0; Type = 'DWord' }
         [PSCustomObject]@{ Path = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager'; Name = 'SilentInstalledAppsEnabled';        Value = 0; Type = 'DWord' }
         [PSCustomObject]@{ Path = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search';               Name = 'AllowCortana';                      Value = 0; Type = 'DWord' }
+
+        # [FIX-EXTRA-STEP54] UI clutter and privacy additions
+        [PSCustomObject]@{ Path = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced';      Name = 'ShowSyncProviderNotifications';     Value = 0; Type = 'DWord' }
+        [PSCustomObject]@{ Path = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager'; Name = 'SubscribedContent-338389Enabled';   Value = 0; Type = 'DWord' }
+        [PSCustomObject]@{ Path = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager'; Name = 'SubscribedContent-310093Enabled';   Value = 0; Type = 'DWord' }
+        [PSCustomObject]@{ Path = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Feeds';                  Name = 'ShellFeedsTaskbarViewMode';         Value = 2; Type = 'DWord' }
+        [PSCustomObject]@{ Path = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Search';                 Name = 'SearchboxTaskbarMode';              Value = 0; Type = 'DWord' }
+        [PSCustomObject]@{ Path = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System';                       Name = 'AllowClipboardHistory';             Value = 0; Type = 'DWord' }
     )
 
     $applied = 0; $skipped = 0; $failed = 0
@@ -13565,7 +13585,102 @@ function Invoke-Step55 {
     } else {
         Write-Log 'Step 55 complete. No changes needed.' -Level OK
     }
+    # [FIX-EXTRA-STEP55] Disable Network Throttling
+    Write-Log 'Disabling Network Throttling...' -Level INFO
+    $throttlePath = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile'
+    try {
+        if (-not (Test-Path -LiteralPath $throttlePath)) { New-Item -Path $throttlePath -Force | Out-Null }
+        New-ItemProperty -Path $throttlePath -Name 'NetworkThrottlingIndex' -Value 0xFFFFFFFF -PropertyType DWord -Force -ErrorAction Stop | Out-Null
+        Write-Log '  [OK] Network Throttling disabled (0xFFFFFFFF).' -Level OK
+    } catch {
+        Write-Log ("  [WARN] Could not disable Network Throttling: {0}" -f $_.Exception.Message) -Level WARN
+    }
+
     Write-Log '  Rollback: netsh int tcp reset' -Level INFO
+}
+
+# ============================================================
+# STEP 57: Advanced System Tweaks
+# ============================================================
+function Invoke-Step57 {
+    <#
+    .SYNOPSIS
+        Applies advanced, gated system tweaks (hibernation, modern
+        standby, HPET, registry backups).
+    #>
+    [CmdletBinding()]
+    param()
+
+    Write-Log 'STEP 57: Advanced System Tweaks' -Level STEP
+    Write-Log ('-' * 60) -Level STEP
+
+    $applied = $false
+
+    # 1. Hibernation
+    if ($Script:AllowHibernationOff) {
+        $isLaptop = (Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue)
+        if (-not $isLaptop) {
+            Write-Log 'Disabling hibernation (desktop PC detected)...' -Level INFO
+            $null = & powercfg.exe /hibernate off 2>&1
+            if ($LASTEXITCODE -eq 0) {
+                Write-Log '  [OK] Hibernation disabled (reclaimed hiberfil.sys).' -Level OK
+                $applied = $true
+            } else {
+                Write-Log '  [WARN] powercfg failed to disable hibernation.' -Level WARN
+            }
+        } else {
+            Write-Log '  [SKIP] Laptop detected - hibernation left enabled (safety).' -Level INFO
+        }
+    }
+
+    # 2. Modern Standby
+    if ($Script:AllowModernStandbyOff) {
+        Write-Log 'Disabling Modern Standby (S0ix)...' -Level INFO
+        $msPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\Power'
+        try {
+            if (-not (Test-Path -LiteralPath $msPath)) { New-Item -Path $msPath -Force | Out-Null }
+            New-ItemProperty -Path $msPath -Name 'PlatformAoAcOverride' -Value 0 -PropertyType DWord -Force -ErrorAction Stop | Out-Null
+            Write-Log '  [OK] Modern Standby disabled (requires reboot).' -Level OK
+            $Script:RebootRequired = $true
+            if ($Script:RebootReasons -notcontains 'Step 57 (Modern Standby)') {
+                $Script:RebootReasons += 'Step 57 (Modern Standby)'
+            }
+            $applied = $true
+        } catch {
+            Write-Log ("  [WARN] Could not disable Modern Standby: {0}" -f $_.Exception.Message) -Level WARN
+        }
+    }
+
+    # 3. HPET (High Precision Event Timer)
+    if ($Script:AllowHpetOff) {
+        Write-Log 'Disabling HPET (High Precision Event Timer)...' -Level INFO
+        $null = & bcdedit.exe /deletevalue useplatformclock 2>&1
+        # Return code 0 means success. If it's 1, the value was already absent.
+        if ($LASTEXITCODE -eq 0 -or $LASTEXITCODE -eq 1) {
+            Write-Log '  [OK] HPET disabled via bcdedit.' -Level OK
+            $applied = $true
+        } else {
+            Write-Log ("  [WARN] bcdedit returned exit code {0}." -f $LASTEXITCODE) -Level WARN
+        }
+    }
+
+    # 4. Registry Backups
+    if ($Script:AllowRegistryBackup) {
+        Write-Log 'Enabling Registry Periodic Backups...' -Level INFO
+        try {
+            Enable-ScheduledTask -TaskPath '\Microsoft\Windows\Registry\' -TaskName 'RegIdleBackup' -ErrorAction Stop | Out-Null
+            Write-Log '  [OK] Registry backup task enabled.' -Level OK
+            $applied = $true
+        } catch {
+            Write-Log ("  [WARN] Could not enable Registry backup task: {0}" -f $_.Exception.Message) -Level WARN
+        }
+    }
+
+    if (-not $applied) {
+        Write-Log 'No advanced tweaks requested or applicable.' -Level INFO
+    }
+
+    Write-Log 'Step 57 complete.' -Level OK
 }
 
 # ============================================================
@@ -14890,6 +15005,7 @@ function Main {
         'Invoke-Step54'
         'Invoke-Step55'
         'Invoke-Step56'
+        'Invoke-Step57'
             )
 
         for ($i = 0; $i -lt $stepFunctions.Count; $i++) {
