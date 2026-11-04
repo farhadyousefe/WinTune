@@ -35,9 +35,7 @@ set "WT_FEATURE_UPDATE_DELAY_DAYS=30"
 rem ============================================================
 rem  Windows Update runner retry policy (Step 39 detached child):
 rem    WT_WU_MAX_RETRIES - max install attempts per update (default 3, cap 10)
-rem    Retries only fire for TRANSIENT failures (busy, service stopped,
-rem    timeout, aborted). Permanent failures (not applicable, signature
-rem    error, payload missing) give up immediately.
+rem    Retries only fire for TRANSIENT failures. Permanent failures give up immediately.
 rem    Set to 1 to disable retries entirely.
 rem    Backoff: 30s, 60s, 90s, ... (30 * (attempt-1) seconds).
 set "WT_WU_MAX_RETRIES=3"
@@ -90,7 +88,7 @@ echo    - Defender scan caches
 echo    - Superseded Package Cache folders             [GATED]
 echo    - Safe-listed UWP LocalCache folders
 echo.
-echo  PERFORMANCE (Steps 10-11, 24-28, 45-47, 49, 52, 54-55):
+echo  PERFORMANCE (Steps 10-11, 24-28, 45-47, 49, 52, 54-55, 57):
 echo    - Telemetry services to Manual + 14 tasks disabled
 echo    - Advertising ID off
 echo    - Taskbar End-Task on; Game DVR recording off
@@ -103,8 +101,9 @@ echo    - Prefetcher disabled on all-SSD (SysMain stays running)
 echo    - Delivery Optimization set to LAN-only
 echo    - CapabilityAccessManager WAL audit
 echo    - Safe service trim (5 services)
-echo    - Privacy + Start Menu hardening
-echo    - TCP tuning: RSS + auto-tune + CUBIC (skipped if VPN active)
+echo    - Privacy + Start Menu hardening + UI clutter off
+echo    - TCP tuning: RSS + auto-tune + CUBIC + Network Throttling off
+echo    - Advanced tweaks (Hibernation off, HPET off, etc.)
 echo.
 echo  SECURITY HARDENING (Steps 29-32, 49, 56):
 echo    - SMBv1 disabled (feature + registry)
@@ -171,6 +170,7 @@ echo  - Step 40: Delete orphaned Windows Installer MSI/MSP files
 echo  - Step 42: Delete superseded Package Cache folders
 echo  - Step 50: Disable non-essential context menu handlers
 echo  - Step 51: Delete orphaned uninstall registry entries
+echo  - Step 57: Disable Hibernation / HPET / Modern Standby (if enabled)
 echo.
 echo  Each has size/age or signature gates, but they are IRREVERSIBLE.
 echo  To run audit-only, remove the corresponding flags from the
@@ -178,6 +178,7 @@ echo  powershell.exe command below:
 echo    -AllowInstallerCleanup  -AllowPackageCacheCleanup
 echo    -AllowProgramAuditAction  -RemoveBloatware
 echo    -AllowPersistenceAction  -AllowContextMenuAction
+echo    -AllowHibernationOff  -AllowModernStandbyOff  -AllowHpetOff
 echo.
 echo ------------------------------------------------------------
 echo  NOT INCLUDED IN THIS RUN (add flags manually if needed)
@@ -195,7 +196,6 @@ timeout /t 5 /nobreak >nul
 
 rem ============================================================
 rem  Build the argument string
-rem  (Driver gates use WT_ vars if set, otherwise ps1 default)
 rem ============================================================
 set "WT_ARGS="
 set "WT_ARGS=%WT_ARGS% -Preset Full -YesToAll"
@@ -210,6 +210,7 @@ set "WT_ARGS=%WT_ARGS% -AllowProgramAuditAction -AllowDriverUpdates"
 set "WT_ARGS=%WT_ARGS% -AllowServiceTrim -AllowPrivacyTweaks -AllowTcpTuning"
 set "WT_ARGS=%WT_ARGS% -AllowVbsAudit -AllowUnknownPackageVersions"
 set "WT_ARGS=%WT_ARGS% -DisableWebClient -AddWpadHostsEntry -EnableScriptBlockLogging"
+set "WT_ARGS=%WT_ARGS% -AllowHibernationOff -AllowModernStandbyOff -AllowHpetOff -AllowRegistryBackup"
 
 if not "%WT_DRIVER_MAX_SIZE_MB%"==""    set "WT_ARGS=%WT_ARGS% -DriverMaxSizeMB %WT_DRIVER_MAX_SIZE_MB%"
 if not "%WT_DRIVER_MAX_STALE_DAYS%"=="" set "WT_ARGS=%WT_ARGS% -DriverMaxStaleDays %WT_DRIVER_MAX_STALE_DAYS%"
@@ -223,9 +224,7 @@ if not "%WT_FEATURE_UPDATE_DELAY_DAYS%"=="" set "WT_ARGS=%WT_ARGS% -FeatureUpdat
 
 rem ============================================================
 rem  Promote WT_WU_MAX_RETRIES to env var that the WU runner
-rem  actually reads. This is different from the WT_ARGS pattern
-rem  because the WU runner is a detached child - it doesn't see
-rem  WinTune.ps1's parameters, only env vars inherited at launch.
+rem  actually reads.
 rem ============================================================
 if not "%WT_WU_MAX_RETRIES%"=="" set "FC_WU_MAX_RETRIES=%WT_WU_MAX_RETRIES%"
 
