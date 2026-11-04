@@ -6049,6 +6049,12 @@ function Invoke-Step10 {
         @{ Path = '\Microsoft\Windows\Feedback\Siuf\';                             Name = 'DmClient' }
         @{ Path = '\Microsoft\Windows\Feedback\Siuf\';                             Name = 'DmClientOnScenarioDownload' }
         @{ Path = '\Microsoft\Windows\Windows Error Reporting\';                   Name = 'QueueReporting' }
+        # [FIX-STEP10-EXTRA] Four more telemetry/gaming tasks commonly
+        # disabled by debloat tools. All are safe to disable.
+        @{ Path = '\Microsoft\Windows\DiskDiagnostic\';                            Name = 'Microsoft-Windows-DiskDiagnosticDataCollector' }
+        @{ Path = '\Microsoft\Windows\Maintenance\';                               Name = 'WinSAT' }
+        @{ Path = '\Microsoft\Windows\Power Efficiency Diagnostics\';              Name = 'AnalyzeSystem' }
+        @{ Path = '\Microsoft\Windows\Application Experience\';                    Name = 'PcaPatchDbTask' }
     )
 
     $tasksDisabled = 0
