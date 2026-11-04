@@ -2979,63 +2979,140 @@ try {
                 }
             }
 
-            # Install
+            # Install with retry
             WU-Log ("Installing: {0}" -f $item.Title) 'STEP'
-            try {
-                $instColl = New-Object -ComObject Microsoft.Update.UpdateColl
-                [void]$instColl.Add($u)
-                $installer = $comSession.CreateUpdateInstaller()
-                $installer.Updates = $instColl
-                $installer.AttemptCloseAppsIfNecessary = $true
-                $installer.ForceQuiet = $true
-                $res = $installer.Install()
 
-                $code = [int]$res.ResultCode
-                $hres = [int]$res.HResult
+            # [FIX-WU-RETRY] Per-update retry with transient-error
+            # detection. The old code was one-shot: a transient
+            # 0x80240020 (another install in progress) or 0x8024001E
+            # (WU service stopped) meant the update was skipped and
+            # the run moved on. Users had to manually re-run WinTune
+            # to pick up the update on the second attempt.
+            #
+            # New behavior: retry transient failures up to N times
+            # with linear backoff. Permanent failures (not applicable,
+            # signature failure, payload missing) give up immediately.
+            # Reboot-pending results stop retries for that update —
+            # no amount of retrying will help without a reboot.
+            #
+            # Tunable via FC_WU_MAX_RETRIES (default 3, cap 10).
+            # Set to 1 to disable retries entirely.
+            $__wuMaxRetries = 3
+            if ($env:FC_WU_MAX_RETRIES) {
+                try { $__wuMaxRetries = [int]$env:FC_WU_MAX_RETRIES } catch { }
+            }
+            if ($__wuMaxRetries -lt 1)  { $__wuMaxRetries = 1 }
+            if ($__wuMaxRetries -gt 10) { $__wuMaxRetries = 10 }
 
-                # Classify result
-                $resultText = switch ($code) {
-                    2 { 'Installed' }
-                    3 { 'InstalledWithErrors' }
-                    4 {
-                        switch ($hres) {
-                            -2145124329 { 'SkippedNotApplicable' }
-                            -2145124307 { 'SkippedRebootRequired' }
-                            -2145124320 { 'SkippedBusy' }
-                            default     { 'Failed' }
+            $__attempt = 0
+            $__finalResultText = 'Failed'
+            $__finalHres = 0
+            $__finalCode = -1
+            $__finalRebootRequired = $false
+
+            while ($__attempt -lt $__wuMaxRetries) {
+                $__attempt++
+                if ($__attempt -gt 1) {
+                    $__backoff = 30 * ($__attempt - 1)
+                    WU-Log ("  Retrying (attempt {0}/{1}) after {2}s backoff..." -f $__attempt, $__wuMaxRetries, $__backoff) 'STEP'
+                    Start-Sleep -Seconds $__backoff
+                }
+
+                try {
+                    $instColl = New-Object -ComObject Microsoft.Update.UpdateColl
+                    [void]$instColl.Add($u)
+                    $installer = $comSession.CreateUpdateInstaller()
+                    $installer.Updates = $instColl
+                    $installer.AttemptCloseAppsIfNecessary = $true
+                    $installer.ForceQuiet = $true
+                    $res = $installer.Install()
+
+                    $code = [int]$res.ResultCode
+                    $hres = [int]$res.HResult
+
+                    $resultText = switch ($code) {
+                        2 { 'Installed' }
+                        3 { 'InstalledWithErrors' }
+                        4 {
+                            switch ($hres) {
+                                -2145124329 { 'SkippedNotApplicable' }
+                                -2145124307 { 'SkippedRebootRequired' }
+                                -2145124320 { 'SkippedBusy' }
+                                default     { 'Failed' }
+                            }
                         }
+                        5 { 'Aborted' }
+                        default { 'Unknown' }
                     }
-                    5 { 'Aborted' }
-                    default { 'Unknown' }
+
+                    $__finalResultText = $resultText
+                    $__finalHres = $hres
+                    $__finalCode = $code
+                    $__finalRebootRequired = [bool]$res.RebootRequired
+
+                    $__p = if ($__attempt -gt 1) { "[attempt $__attempt/$__wuMaxRetries] " } else { '' }
+                    switch ($resultText) {
+                        'Installed'             { WU-Log ("  {0}[OK] Installed: {1}" -f $__p, $item.Title) 'OK' }
+                        'InstalledWithErrors'   { WU-Log ("  {0}[WARN] Installed with errors: {1}" -f $__p, $item.Title) 'WARN' }
+                        'SkippedNotApplicable'  { WU-Log ("  {0}[SKIP] Not applicable: {1}" -f $__p, $item.Title) 'WARN' }
+                        'SkippedRebootRequired' { WU-Log ("  {0}[SKIP] Reboot required: {1}" -f $__p, $item.Title) 'WARN' }
+                        'SkippedBusy'           { WU-Log ("  {0}[SKIP] Busy: {1}" -f $__p, $item.Title) 'WARN' }
+                        'Failed'                { WU-Log ("  {0}[FAIL] Failed (0x{1:X8}): {2}" -f $__p, $hres, $item.Title) 'ERROR' }
+                        'Aborted'               { WU-Log ("  {0}[FAIL] Aborted: {1}" -f $__p, $item.Title) 'ERROR' }
+                        default                 { WU-Log ("  {0}[WARN] Unknown result code {1} for {2}" -f $__p, $code, $item.Title) 'WARN' }
+                    }
+
+                    if ($res.RebootRequired) {
+                        WU-Log '  [INFO] Reboot required after this update.' 'WARN'
+                    }
+                } catch {
+                    WU-Log ("  [FAIL] {0}: {1}" -f $item.Title, $_.Exception.Message) 'ERROR'
+                    $__finalResultText = 'Failed'
+                    $__finalHres = 0
+                    $__finalCode = -1
                 }
 
-                $installResult += [PSCustomObject]@{
-                    Title        = $item.Title
-                    KBArticleIDs = @($item.KB)
-                    Result       = $resultText
+                # Success -> stop retrying
+                if ($__finalResultText -match '^Installed') { break }
+
+                # Reboot pending -> stop (retry cannot help without reboot)
+                if ($__finalRebootRequired) {
+                    if ($__attempt -lt $__wuMaxRetries) {
+                        WU-Log ("  Reboot pending - stopping retries for {0}" -f $item.Title) 'WARN'
+                    }
+                    break
                 }
 
-                switch ($resultText) {
-                    'Installed'             { WU-Log ("  [OK] Installed: {0}" -f $item.Title) 'OK' }
-                    'InstalledWithErrors'   { WU-Log ("  [WARN] Installed with errors: {0}" -f $item.Title) 'WARN' }
-                    'SkippedNotApplicable'  { WU-Log ("  [SKIP] Not applicable: {0}" -f $item.Title) 'WARN' }
-                    'SkippedRebootRequired' { WU-Log ("  [SKIP] Reboot required: {0}" -f $item.Title) 'WARN' }
-                    'SkippedBusy'           { WU-Log ("  [SKIP] Busy: {0}" -f $item.Title) 'WARN' }
-                    'Failed'                { WU-Log ("  [FAIL] Failed (0x{0:X8}): {1}" -f $hres, $item.Title) 'ERROR' }
-                    'Aborted'               { WU-Log ("  [FAIL] Aborted: {0}" -f $item.Title) 'ERROR' }
-                    default                 { WU-Log ("  [WARN] Unknown result code {0} for {1}" -f $code, $item.Title) 'WARN' }
+                # Decide retry-worthiness
+                $__isTransient = $false
+                if ($__finalResultText -eq 'SkippedBusy') { $__isTransient = $true }
+                if ($__finalResultText -match 'Failed|Aborted|Unknown') {
+                    $__transientHres = @(
+                        -2145124320,   # 0x80240020 WU_E_INSTALL_NOT_ALLOWED
+                        -2145124322,   # 0x8024001E WU_E_SERVICE_STOP
+                        -2145124341,   # 0x8024000B WU_E_CALL_CANCELLED
+                        -2147023436,   # 0x800705B4 ERROR_TIMEOUT
+                        -2147023431,   # 0x800705B9 ERROR_NO_SYSTEM_RESOURCES
+                        -2147024891,   # 0x80070005 E_ACCESSDENIED
+                        0              # unknown HResult from exception path
+                    )
+                    if ($__transientHres -contains $__finalHres) { $__isTransient = $true }
+                    if ($__finalResultText -eq 'Aborted' -and $__finalCode -eq 5) { $__isTransient = $true }
                 }
 
-                if ($res.RebootRequired) {
-                    WU-Log '  [INFO] Reboot required after this update.' 'WARN'
+                if (-not $__isTransient) { break }
+                if ($__attempt -ge $__wuMaxRetries) {
+                    WU-Log ("  Retries exhausted ({0}/{1}) - giving up on {2}" -f $__attempt, $__wuMaxRetries, $item.Title) 'WARN'
+                    break
                 }
-            } catch {
-                WU-Log ("  [FAIL] {0}: {1}" -f $item.Title, $_.Exception.Message) 'ERROR'
-                $installResult += [PSCustomObject]@{
-                    Title        = $item.Title
-                    KBArticleIDs = @($item.KB)
-                    Result       = 'Failed'
-                }
+            }
+
+            # Record the final result once (after all retries)
+            $installResult += [PSCustomObject]@{
+                Title        = $item.Title
+                KBArticleIDs = @($item.KB)
+                Result       = $__finalResultText
+                Attempts     = $__attempt
             }
         }
 
