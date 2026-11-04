@@ -131,6 +131,11 @@ param(
     [switch]$AllowFastStartupOff,                               # Step 57 - disable Fast Startup (HiberbootEnabled=0)
     [switch]$AllowGamingTweaks,                                 # Step 57 - enable HAGS + Game Mode
 
+    # [FIX-TIER3-PARAMS] Sandbox / WSL / Dev Drive (Step 59)
+    [switch]$AllowSandboxInstall,                               # Step 59 - enable Windows Sandbox
+    [switch]$AllowWslInstall,                                   # Step 59 - install WSL
+    [switch]$AllowDevDriveEnable,                               # Step 59 - enable Dev Drive capability
+
     # ---- Detached runner tracking ----
     [switch]$WaitForDetached,                                   # Wait indefinitely for all children before PostCheck
     [switch]$AllowScheduledTaskAction,
@@ -271,6 +276,9 @@ $Script:AllowRegistryBackup = $AllowRegistryBackup.IsPresent
 $Script:AllowDnsBenchmark = $AllowDnsBenchmark.IsPresent
 $Script:AllowFastStartupOff = $AllowFastStartupOff.IsPresent
 $Script:AllowGamingTweaks = $AllowGamingTweaks.IsPresent
+$Script:AllowSandboxInstall = $AllowSandboxInstall.IsPresent
+$Script:AllowWslInstall = $AllowWslInstall.IsPresent
+$Script:AllowDevDriveEnable = $AllowDevDriveEnable.IsPresent
 $Script:RollbackMode       = $Rollback.IsPresent
 $Script:InRollbackMode   = $false
 
@@ -415,6 +423,7 @@ $Script:StepNames = @{
     56 = 'Security Posture Audits'
     57 = 'Advanced System Tweaks'
     58 = 'DNS Resolver Benchmark'
+    59 = 'Sandbox / WSL / Dev Drive Audit'
     '1b' = 'SSD Fullness Check'
     '8b' = 'Driver Update Audit + Install (Detached)'
 }
@@ -479,6 +488,7 @@ $Script:StepDescriptions = @{
     '56' = 'Audited seven security controls (WebClient, WPAD, LAPS, ScriptBlockLogging, UAC, SMB signing, BitLocker).'
     '57' = 'Applied advanced tweaks (hibernation, HPET, modern standby, registry backup).'
     '58' = 'Benchmarked DNS resolvers and switched to the fastest (home/SMB only).'
+    '59' = 'Audited and optionally enabled Windows Sandbox, WSL, and Dev Drive capability.'
 }
 
 
@@ -13903,6 +13913,101 @@ function Invoke-Step58 {
 }
 
 # ============================================================
+# STEP 59: Sandbox / WSL / Dev Drive Audit
+# ============================================================
+function Invoke-Step59 {
+    <#
+    .SYNOPSIS
+        Audits and optionally enables Windows Sandbox, WSL, and Dev Drive.
+    #>
+    [CmdletBinding()]
+    param()
+
+    Write-Log 'STEP 59: Sandbox / WSL / Dev Drive Audit' -Level STEP
+    Write-Log ('-' * 60) -Level STEP
+
+    if ($Script:DryRun) {
+        Write-Log 'Would audit Sandbox/WSL/DevDrive and optionally enable.' -Level PREVIEW
+        return
+    }
+
+    # ---- Audit current state ----
+    Write-Log 'Current feature state:' -Level INFO
+    $features = @(
+        @{ Feature = 'Containers-DisposableClientVM';      Label = 'Windows Sandbox' }
+        @{ Feature = 'Microsoft-Windows-Subsystem-Linux';  Label = 'WSL' }
+        @{ Feature = 'VirtualMachinePlatform';             Label = 'VM Platform' }
+    )
+    foreach ($f in $features) {
+        try {
+            $__feat = Get-WindowsOptionalFeature -Online -FeatureName $f.Feature -ErrorAction Stop
+            $__state = if ($__feat.State -eq 'Enabled') { 'Enabled' } else { 'Not installed' }
+            Write-Log ("    {0,-18} : {1}" -f $f.Label, $__state) -Level INFO
+        } catch {
+            Write-Log ("    {0,-18} : query failed" -f $f.Label) -Level DEBUG
+        }
+    }
+
+    # Dev Drive state
+    try {
+        $__devDriveReg = Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DevDrive' -ErrorAction SilentlyContinue
+        $__devDriveState = if ($__devDriveReg) { 'Configured' } else { 'Not configured' }
+        Write-Log ("    {0,-18} : {1}" -f 'Dev Drive', $__devDriveState) -Level INFO
+    } catch { }
+
+    # ---- Optional enable ----
+    if ($Script:AllowSandboxInstall) {
+        Write-Log 'Enabling Windows Sandbox...' -Level INFO
+        try {
+            $__r = Enable-WindowsOptionalFeature -Online -FeatureName 'Containers-DisposableClientVM' -All -NoRestart -ErrorAction Stop
+            Write-Log '  [OK] Windows Sandbox enabling (reboot required).' -Level OK
+            $Script:RebootRequired = $true
+            if ($Script:RebootReasons -notcontains 'Step 59 (Sandbox)') {
+                $Script:RebootReasons += 'Step 59 (Sandbox)'
+            }
+        } catch {
+            Write-Log ("  [WARN] Could not enable Sandbox: {0}" -f $_.Exception.Message) -Level WARN
+        }
+    }
+
+    if ($Script:AllowWslInstall) {
+        Write-Log 'Installing WSL...' -Level INFO
+        try {
+            $__out = & wsl.exe --install --no-launch 2>&1
+            if ($LASTEXITCODE -eq 0) {
+                Write-Log '  [OK] WSL install initiated (reboot may be required).' -Level OK
+                $Script:RebootRequired = $true
+                if ($Script:RebootReasons -notcontains 'Step 59 (WSL)') {
+                    $Script:RebootReasons += 'Step 59 (WSL)'
+                }
+            } else {
+                Write-Log ("  [WARN] wsl --install returned exit {0}" -f $LASTEXITCODE) -Level WARN
+            }
+        } catch {
+            Write-Log ("  [WARN] wsl install failed: {0}" -f $_.Exception.Message) -Level WARN
+        }
+    }
+
+    if ($Script:AllowDevDriveEnable) {
+        Write-Log 'Enabling Dev Drive capability...' -Level INFO
+        try {
+            $__ddPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DevDrive'
+            if (-not (Test-Path -LiteralPath $__ddPath)) { New-Item -Path $__ddPath -Force | Out-Null }
+            New-ItemProperty -Path $__ddPath -Name 'TrustedVolumeOptOut' -Value 0 -PropertyType DWord -Force -ErrorAction Stop | Out-Null
+            Write-Log '  [OK] Dev Drive capability enabled (format a volume as ReFS to use).' -Level OK
+        } catch {
+            Write-Log ("  [WARN] Could not enable Dev Drive: {0}" -f $_.Exception.Message) -Level WARN
+        }
+    }
+
+    if (-not ($Script:AllowSandboxInstall -or $Script:AllowWslInstall -or $Script:AllowDevDriveEnable)) {
+        Write-Log 'No enable requested (audit-only mode). Add -AllowSandboxInstall / -AllowWslInstall / -AllowDevDriveEnable to enable.' -Level INFO
+    }
+
+    Write-Log 'Step 59 complete.' -Level OK
+}
+
+# ============================================================
 # HTML REPORT GENERATOR
 # ============================================================
 function Write-HtmlReport {
@@ -15226,6 +15331,7 @@ function Main {
         'Invoke-Step56'
         'Invoke-Step57'
         'Invoke-Step58'
+        'Invoke-Step59'
             )
 
         for ($i = 0; $i -lt $stepFunctions.Count; $i++) {
