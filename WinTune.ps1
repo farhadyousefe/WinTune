@@ -14515,15 +14515,23 @@ function Invoke-PostCheck {
                     $__s = $Script:Report.Steps[$__i]
                     if ($__s.Number -ne $__stepNum -or $__s.Status -ne 'Detached') { continue }
                     $__newStatus = if ($__r.ExitCode -eq 0) { 'OK' } else { 'Failed' }
+                    # [FIX-EXITCODE-RECONCILE] Mask to unsigned 32-bit for
+                    # display only. [uint32]$__r.ExitCode throws on negative
+                    # exit codes (e.g. -1073741510 = STATUS_CONTROL_C_EXIT,
+                    # seen when a detached child is closed via Ctrl+C or
+                    # the window's X button). The -band operation converts
+                    # the signed negative to its unsigned representation
+                    # without changing the underlying meaning.
+                    $__exitU = [uint32]([int64]$__r.ExitCode -band 0xFFFFFFFFL)
                     $__newDetail = if ($__r.ExitCode -eq 0) {
                         'Detached runner exited 0 - see child log for details'
                     } else {
-                        ('Detached runner exited 0x{0:X8} - see child log' -f [uint32]$__r.ExitCode)
+                        ('Detached runner exited 0x{0:X8} - see child log' -f $__exitU)
                     }
                     $__s.Status = $__newStatus
                     $__s.Detail = $__newDetail
                     Write-Log ("  [RECONCILE] Step {0}: Detached -> {1} (exit 0x{2:X8})" -f `
-                        $__stepNum, $__newStatus, [uint32]$__r.ExitCode) -Level INFO
+                        $__stepNum, $__newStatus, $__exitU) -Level INFO
                     break
                 }
             }
