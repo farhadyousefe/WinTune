@@ -13329,6 +13329,18 @@ function Write-HtmlReport {
         } else { [TimeSpan]::Zero }
         $durationText = '{0:mm\:ss}' -f $duration
 
+        # [FIX-SELFTEST-STEPTIME] Pre-compute Total Step Time with a
+        # null-safe guard. Measure-Object on empty input has no .Sum
+        # property, which throws under StrictMode Latest. This never
+        # triggered before SelfTest began calling Write-HtmlReport
+        # with zero steps.
+        $__totalStepMs = [int64]0
+        try {
+            $__mObj = $Script:Report.Steps | Measure-Object -Property DurationMs -Sum -ErrorAction SilentlyContinue
+            if ($__mObj -and $null -ne $__mObj.Sum) { $__totalStepMs = [int64]$__mObj.Sum }
+        } catch { }
+        $totalStepTime = '{0:N1}s' -f ($__totalStepMs / 1000.0)
+
         # ---- HTML escaping helper ----
         $enc = {
             param([string]$s)
@@ -13562,7 +13574,7 @@ function Write-HtmlReport {
     <h2>Summary</h2>
     <div class="grid">
       <div class="card"><div class="label">Total Steps</div><div class="value metric">$totalCount</div></div>
-      <div class="card"><div class="label">Total Step Time</div><div class="value metric">$(($Script:Report.Steps | Measure-Object -Property DurationMs -Sum).Sum | ForEach-Object { '{0:N1}s' -f ($_ / 1000) })</div></div>
+      <div class="card"><div class="label">Total Step Time</div><div class="value metric">$totalStepTime</div></div>
       <div class="card"><div class="label">OK</div><div class="value metric" style="color:#0a7">$okCount</div></div>
       <div class="card"><div class="label">Skipped</div><div class="value metric" style="color:#94a3b8">$skipCount</div></div>
       <div class="card"><div class="label">Gated</div><div class="value metric" style="color:#d46b08">$gatedCount</div></div>
@@ -14635,15 +14647,20 @@ function Main {
     } finally {
         # ---- Cleanup (ORDER: report + lock release FIRST, pause LAST) ----
 
-        # ---- Generate HTML report (skip in rollback mode) ----
-        if (-not $Script:InRollbackMode) {
+        # ---- Generate HTML report (skip in rollback + SelfTest modes) ----
+        # [FIX-SELFTEST-REPORT] SelfTest returns before the dispatcher
+        # runs, so $Script:Report.Steps is empty and the report has no
+        # meaningful content. Skip generation to avoid noise.
+        if ($Script:SelfTest) {
+            Write-Host 'SelfTest mode - skipping HTML report generation.' -ForegroundColor DarkGray
+        } elseif ($Script:InRollbackMode) {
+            Write-Host 'Rollback mode - skipping HTML report generation.' -ForegroundColor DarkGray
+        } else {
             try {
                 Write-HtmlReport
             } catch {
                 Write-Log ("HTML report generation threw: {0}" -f $_.Exception.Message) -Level WARN
             }
-        } else {
-            Write-Host 'Rollback mode - skipping HTML report generation.' -ForegroundColor DarkGray
         }
 
         Exit-ScriptLock
