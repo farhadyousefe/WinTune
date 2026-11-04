@@ -35,10 +35,25 @@ set "WT_FEATURE_UPDATE_DELAY_DAYS=30"
 rem ============================================================
 rem  Windows Update runner retry policy (Step 39 detached child):
 rem    WT_WU_MAX_RETRIES - max install attempts per update (default 3, cap 10)
-rem    Retries only fire for TRANSIENT failures. Permanent failures give up immediately.
+rem    Retries only fire for TRANSIENT failures (busy, service stopped,
+rem    timeout, aborted). Permanent failures (not applicable, signature
+rem    error, payload missing) give up immediately.
 rem    Set to 1 to disable retries entirely.
 rem    Backoff: 30s, 60s, 90s, ... (30 * (attempt-1) seconds).
 set "WT_WU_MAX_RETRIES=3"
+
+rem  Optional JSON config file (per-machine overrides).
+rem    Blank = no config file. CLI args in WT_ARGS always win over
+rem    config-file values. Example: set "WT_CONFIG_FILE=%SCRIPT_DIR%\WinTune.weekly.json"
+set "WT_CONFIG_FILE="
+
+rem  Tier 3 opt-ins (higher-impact - leave blank unless wanted):
+rem    WT_ALLOW_SANDBOX_INSTALL - enables Windows Sandbox feature (reboot)
+rem    WT_ALLOW_WSL_INSTALL     - installs WSL (reboot may be required)
+rem    WT_ALLOW_DEV_DRIVE       - enables Dev Drive capability (format later)
+set "WT_ALLOW_SANDBOX_INSTALL="
+set "WT_ALLOW_WSL_INSTALL="
+set "WT_ALLOW_DEV_DRIVE="
 
 rem ============================================================
 rem  Verify prerequisites
@@ -65,6 +80,11 @@ echo ============================================================
 echo  Location : %SCRIPT_DIR%
 echo  Log      : %SCRIPT_DIR%\WinTune.log
 echo  Report   : %SCRIPT_DIR%\Reports\WinTune_Report_TIMESTAMP.html
+if not "%WT_CONFIG_FILE%"=="" (
+    echo  Config   : %WT_CONFIG_FILE%
+) else (
+    echo  Config   : none ^(edit WT_CONFIG_FILE at top of this .bat^)
+)
 echo.
 echo ------------------------------------------------------------
 echo  SAFETY NET FIRST - Step 25 creates a "WinTune_PreChange"
@@ -98,17 +118,24 @@ echo    - Transparency + animations off (ClearType kept)
 echo    - Windows 10-style context menu (Win11 only)
 echo    - Storage Sense weekly cleanup (Downloads protected)
 echo    - Prefetcher disabled on all-SSD (SysMain stays running)
+echo    - NTFS last-access timestamps disabled (fewer writes)
 echo    - Delivery Optimization set to LAN-only
 echo    - CapabilityAccessManager WAL audit
 echo    - Safe service trim (5 services)
 echo    - Privacy + Start Menu hardening + UI clutter off
+echo    - Start menu "Recommended" section hidden
 echo    - TCP tuning: RSS + auto-tune + CUBIC + Network Throttling off
-echo    - Advanced tweaks (Hibernation off, HPET off, etc.)
+echo    - Fast Startup disabled (full shutdown every time)
+echo    - Gaming tweaks: HAGS + Game Mode (if -AllowGamingTweaks)
+echo    - Advanced: Hibernation off, HPET off, Modern Standby off
+echo      (each gated - desktops only for hibernation)
+echo    - Registry Periodic Backups enabled
 echo.
 echo  SECURITY HARDENING (Steps 29-32, 49, 56):
 echo    - SMBv1 disabled (feature + registry)
 echo    - LLMNR + WPAD disabled (credential-theft vectors)
 echo    - DNS over HTTPS enabled
+echo    - DNS resolver benchmark + auto-select fastest     [NEW]
 echo    - Defender ASR rules in Audit mode (7 rules)
 echo    - AutoRun disabled on all drives
 echo    - WebClient disabled (skipped on domain-joined)
@@ -128,11 +155,35 @@ echo    - Step 19: startup programs inventory
 echo    - Step 20: scheduled tasks inventory
 echo    - Step 51: orphaned uninstall entries
 echo    - Step 56: security posture (UAC/SMB/BitLocker/LAPS/etc.)
+echo    - Step 59: Sandbox / WSL / Dev Drive availability     [NEW]
 echo.
 echo  Detached windows: Steps 8b/12/33/39 launch in their own
 echo  visible windows. WinTune continues immediately. See their
 echo  logs at WinTune_Drivers.log, WinTune_SfcDism.log,
 echo  WinTune_Winget.log, WinTune_WU.log in %SCRIPT_DIR%.
+echo.
+echo ------------------------------------------------------------
+echo  NEW STEPS IN THIS BATCH:
+echo    Step 57 - Fast Startup + Gaming (HAGS + Game Mode)
+echo    Step 58 - DNS resolver benchmark + auto-select
+echo    Step 59 - Sandbox / WSL / Dev Drive audit + optional enable
+echo.
+echo  Tier 3 opt-ins (edit top of this .bat to enable):
+if "%WT_ALLOW_SANDBOX_INSTALL%"=="" (
+    echo    Sandbox install  : OFF ^(audit-only^)
+) else (
+    echo    Sandbox install  : %WT_ALLOW_SANDBOX_INSTALL%
+)
+if "%WT_ALLOW_WSL_INSTALL%"=="" (
+    echo    WSL install      : OFF ^(audit-only^)
+) else (
+    echo    WSL install      : %WT_ALLOW_WSL_INSTALL%
+)
+if "%WT_ALLOW_DEV_DRIVE%"=="" (
+    echo    Dev Drive enable : OFF ^(audit-only^)
+) else (
+    echo    Dev Drive enable : %WT_ALLOW_DEV_DRIVE%
+)
 echo.
 echo ------------------------------------------------------------
 echo  CURRENT TUNING GATES (edit at top of this .bat to override)
@@ -170,7 +221,8 @@ echo  - Step 40: Delete orphaned Windows Installer MSI/MSP files
 echo  - Step 42: Delete superseded Package Cache folders
 echo  - Step 50: Disable non-essential context menu handlers
 echo  - Step 51: Delete orphaned uninstall registry entries
-echo  - Step 57: Disable Hibernation / HPET / Modern Standby (if enabled)
+echo  - Step 57: Hibernation / HPET / Modern Standby / Fast Startup
+echo             (each gated; desktops only for hibernation)
 echo.
 echo  Each has size/age or signature gates, but they are IRREVERSIBLE.
 echo  To run audit-only, remove the corresponding flags from the
@@ -179,6 +231,7 @@ echo    -AllowInstallerCleanup  -AllowPackageCacheCleanup
 echo    -AllowProgramAuditAction  -RemoveBloatware
 echo    -AllowPersistenceAction  -AllowContextMenuAction
 echo    -AllowHibernationOff  -AllowModernStandbyOff  -AllowHpetOff
+echo    -AllowFastStartupOff  -AllowGamingTweaks
 echo.
 echo ------------------------------------------------------------
 echo  NOT INCLUDED IN THIS RUN (add flags manually if needed)
@@ -211,6 +264,15 @@ set "WT_ARGS=%WT_ARGS% -AllowServiceTrim -AllowPrivacyTweaks -AllowTcpTuning"
 set "WT_ARGS=%WT_ARGS% -AllowVbsAudit -AllowUnknownPackageVersions"
 set "WT_ARGS=%WT_ARGS% -DisableWebClient -AddWpadHostsEntry -EnableScriptBlockLogging"
 set "WT_ARGS=%WT_ARGS% -AllowHibernationOff -AllowModernStandbyOff -AllowHpetOff -AllowRegistryBackup"
+
+rem  New in this batch:
+set "WT_ARGS=%WT_ARGS% -AllowDnsBenchmark -AllowFastStartupOff -AllowGamingTweaks"
+
+rem  Tier 3 opt-ins (only if set at top of .bat):
+if not "%WT_ALLOW_SANDBOX_INSTALL%"=="" set "WT_ARGS=%WT_ARGS% -AllowSandboxInstall"
+if not "%WT_ALLOW_WSL_INSTALL%"==""     set "WT_ARGS=%WT_ARGS% -AllowWslInstall"
+if not "%WT_ALLOW_DEV_DRIVE%"==""       set "WT_ARGS=%WT_ARGS% -AllowDevDriveEnable"
+if not "%WT_CONFIG_FILE%"==""           set "WT_ARGS=%WT_ARGS% -ConfigFile ""%WT_CONFIG_FILE%"""
 
 if not "%WT_DRIVER_MAX_SIZE_MB%"==""    set "WT_ARGS=%WT_ARGS% -DriverMaxSizeMB %WT_DRIVER_MAX_SIZE_MB%"
 if not "%WT_DRIVER_MAX_STALE_DAYS%"=="" set "WT_ARGS=%WT_ARGS% -DriverMaxStaleDays %WT_DRIVER_MAX_STALE_DAYS%"
