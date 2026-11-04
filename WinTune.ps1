@@ -12167,6 +12167,21 @@ function Invoke-Step45 {
         Write-Log ("  [WARN] Could not determine OS build: {0}" -f $_.Exception.Message) -Level WARN
     }
 
+    # [FIX-TIER1-NTFS-ACCESS] Disable NTFS last-access timestamp
+    # updates. Reduces disk writes on read-heavy workloads with no
+    # user-visible downside — last-access is already disabled by
+    # default on most modern Windows systems (value 0x80000003
+    # means "user managed, disabled"). Setting to 1 makes it
+    # explicit and fleet-consistent.
+    try {
+        $__fsPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem'
+        if (-not (Test-Path -LiteralPath $__fsPath)) { New-Item -Path $__fsPath -Force | Out-Null }
+        New-ItemProperty -Path $__fsPath -Name 'NtfsDisableLastAccessUpdate' -Value 1 -PropertyType DWord -Force -ErrorAction Stop | Out-Null
+        Write-Log '  [OK] NTFS last-access timestamps disabled.' -Level OK
+    } catch {
+        Write-Log ("  [WARN] Could not disable NTFS last-access: {0}" -f $_.Exception.Message) -Level WARN
+    }
+
     # ============================================================
     # Windows 11 path (build >= 22000)
     # Leave SysMain running to preserve memory compression.
@@ -13095,6 +13110,9 @@ function Invoke-Step54 {
         [PSCustomObject]@{ Path = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Feeds';                  Name = 'ShellFeedsTaskbarViewMode';         Value = 2; Type = 'DWord' }
         [PSCustomObject]@{ Path = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Search';                 Name = 'SearchboxTaskbarMode';              Value = 0; Type = 'DWord' }
         [PSCustomObject]@{ Path = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System';                       Name = 'AllowClipboardHistory';             Value = 0; Type = 'DWord' }
+
+        # [FIX-TIER1-START-MENU] Hide the "Recommended" block from Start menu
+        [PSCustomObject]@{ Path = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Explorer';                     Name = 'HideRecommendedSection';            Value = 1; Type = 'DWord' }
     )
 
     $applied = 0; $skipped = 0; $failed = 0
