@@ -122,6 +122,11 @@ param(
     [switch]$AllowHpetOff,                                      # Step 57 - disable HPET (for low-latency gaming)
     [switch]$AllowRegistryBackup,                               # Step 57 - enable periodic registry backups
 
+    # ---- New in v3.9 (DNS benchmark) ----
+    # [FIX-DNSBENCH-PARAM] Benchmark well-known DNS resolvers and
+    # optionally switch to the fastest. Skips on domain-joined PCs.
+    [switch]$AllowDnsBenchmark,                                 # Step 58 - DNS resolver benchmark
+
     # ---- Detached runner tracking ----
     [switch]$WaitForDetached,                                   # Wait indefinitely for all children before PostCheck
     [switch]$AllowScheduledTaskAction,
@@ -259,6 +264,7 @@ $Script:AllowHibernationOff = $AllowHibernationOff.IsPresent
 $Script:AllowModernStandbyOff = $AllowModernStandbyOff.IsPresent
 $Script:AllowHpetOff = $AllowHpetOff.IsPresent
 $Script:AllowRegistryBackup = $AllowRegistryBackup.IsPresent
+$Script:AllowDnsBenchmark = $AllowDnsBenchmark.IsPresent
 $Script:RollbackMode       = $Rollback.IsPresent
 $Script:InRollbackMode   = $false
 
@@ -402,6 +408,7 @@ $Script:StepNames = @{
     55 = 'TCP Performance Tuning'
     56 = 'Security Posture Audits'
     57 = 'Advanced System Tweaks'
+    58 = 'DNS Resolver Benchmark'
     '1b' = 'SSD Fullness Check'
     '8b' = 'Driver Update Audit + Install (Detached)'
 }
@@ -465,6 +472,7 @@ $Script:StepDescriptions = @{
     '55' = 'Enabled RSS, normalized auto-tuning, and set CUBIC congestion provider.'
     '56' = 'Audited seven security controls (WebClient, WPAD, LAPS, ScriptBlockLogging, UAC, SMB signing, BitLocker).'
     '57' = 'Applied advanced tweaks (hibernation, HPET, modern standby, registry backup).'
+    '58' = 'Benchmarked DNS resolvers and switched to the fastest (home/SMB only).'
 }
 
 
@@ -13702,6 +13710,152 @@ function Invoke-Step57 {
 }
 
 # ============================================================
+# STEP 58: DNS Resolver Benchmark
+# ============================================================
+function Invoke-Step58 {
+    <#
+    .SYNOPSIS
+        Benchmarks well-known DNS resolvers and optionally switches
+        to the fastest one.
+    .DESCRIPTION
+        Tests latency against Cloudflare, Google, Quad9, OpenDNS,
+        and AdGuard. Uses Resolve-DnsName with -QuickTimeout against
+        three stable canary domains. Applies the fastest resolver
+        only if it's meaningfully faster than current (or if current
+        is a private router IP).
+
+        Skips on domain-joined PCs. Requires -AllowDnsBenchmark.
+    #>
+    [CmdletBinding()]
+    param()
+
+    Write-Log 'STEP 58: DNS Resolver Benchmark' -Level STEP
+    Write-Log ('-' * 60) -Level STEP
+
+    if (-not $Script:AllowDnsBenchmark) {
+        Write-Log 'Step 58 blocked: -AllowDnsBenchmark flag was not supplied.' -Level INFO
+        return
+    }
+
+    $__isDomain = $false
+    try { $__isDomain = [bool](Get-CimInstance Win32_ComputerSystem -EA SilentlyContinue).PartOfDomain } catch { }
+    if ($__isDomain) {
+        Write-Log 'Step 58 skipped: domain-joined (DNS managed by AD).' -Level INFO
+        return
+    }
+
+    if ($Script:DryRun) {
+        Write-Log 'Would benchmark DNS resolvers and optionally switch.' -Level PREVIEW
+        return
+    }
+
+    $resolvers = @(
+        @{ Name = 'Cloudflare'; Primary = '1.1.1.1';         Secondary = '1.0.0.1' }
+        @{ Name = 'Google';     Primary = '8.8.8.8';         Secondary = '8.8.4.4' }
+        @{ Name = 'Quad9';      Primary = '9.9.9.9';         Secondary = '149.112.112.112' }
+        @{ Name = 'OpenDNS';    Primary = '208.67.222.222';  Secondary = '208.67.220.220' }
+        @{ Name = 'AdGuard';    Primary = '94.140.14.14';    Secondary = '94.140.15.15' }
+    )
+    $testNames = @('www.microsoft.com', 'www.github.com', 'www.google.com')
+
+    Write-Log 'Benchmarking DNS resolvers (3 queries per resolver)...' -Level INFO
+    $results = @()
+
+    foreach ($r in $resolvers) {
+        $times = @()
+        foreach ($n in $testNames) {
+            try {
+                $t = Measure-Command {
+                    Resolve-DnsName -Name $n -Server $r.Primary -DnsOnly -QuickTimeout -ErrorAction SilentlyContinue | Out-Null
+                }
+                $times += $t.TotalMilliseconds
+            } catch { }
+        }
+        if ($times.Count -gt 0) {
+            $avg = ($times | Measure-Object -Average).Average
+            $results += [PSCustomObject]@{
+                Name = $r.Name; Primary = $r.Primary; Secondary = $r.Secondary; AvgMs = [math]::Round($avg, 1)
+            }
+        }
+    }
+
+    if ($results.Count -eq 0) {
+        Write-Log 'No resolvers responded — skipping DNS config.' -Level WARN
+        return
+    }
+
+    $results = @($results | Sort-Object AvgMs)
+    Write-Log '  Results (fastest first):' -Level INFO
+    foreach ($r in $results) {
+        Write-Log ("    {0,-12} {1,6:N1} ms  ({2})" -f $r.Name, $r.AvgMs, $r.Primary) -Level INFO
+    }
+
+    # ---- Get current DNS ----
+    $adapters = @(Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' })
+    $currentDns = @()
+    foreach ($a in $adapters) {
+        $dns = Get-DnsClientServerAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue
+        if ($dns -and $dns.ServerAddresses) {
+            $currentDns += $dns.ServerAddresses
+        }
+    }
+    Write-Log ("  Current DNS: {0}" -f ($currentDns -join ', ')) -Level INFO
+
+    $best = $results[0]
+    Write-Log ("  Fastest: {0} ({1} ms, {2})" -f $best.Name, $best.AvgMs, $best.Primary) -Level OK
+
+    # ---- Decide whether to switch ----
+    $applyBest = $false
+    if ($currentDns.Count -eq 0) {
+        $applyBest = $true
+        Write-Log '  No current DNS configured — will apply fastest.' -Level INFO
+    } else {
+        foreach ($d in $currentDns) {
+            if ($d -match '^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|127\.)') {
+                $applyBest = $true
+                Write-Log ("  Current DNS {0} is a private router address — switching." -f $d) -Level INFO
+                break
+            }
+        }
+        if (-not $applyBest) {
+            Write-Log '  Current DNS is already public — leaving unchanged.' -Level INFO
+            Write-Log 'Step 58 complete.' -Level OK
+            return
+        }
+    }
+
+    if (-not (Confirm-Action -Query ("Switch DNS to {0} ({1}, {2})?" -f $best.Name, $best.Primary, $best.Secondary))) {
+        Write-Log 'Step 58: DNS change declined by user.' -Level WARN
+        return
+    }
+
+    # ---- Apply ----
+    $appliedCount = 0
+    foreach ($a in $adapters) {
+        try {
+            Set-DnsClientServerAddress -InterfaceIndex $a.ifIndex -ServerAddresses @($best.Primary, $best.Secondary) -ErrorAction Stop
+            Write-Log ("  [OK] {0}: DNS -> {1}, {2}" -f $a.Name, $best.Primary, $best.Secondary) -Level OK
+            Add-RollbackEntry -Step 58 -Type 'NetworkDns' -Data @{
+                AdapterIndex = $a.ifIndex
+                AdapterName  = $a.Name
+                PreviousDns  = $currentDns
+            }
+            $appliedCount++
+        } catch {
+            Write-Log ("  [WARN] {0}: {1}" -f $a.Name, $_.Exception.Message) -Level WARN
+        }
+    }
+
+    if ($appliedCount -gt 0) {
+        $null = & ipconfig.exe /flushdns 2>&1
+        Write-Log '  [OK] DNS cache flushed.' -Level OK
+        Write-Log ("Step 58 complete. Applied {0} to {1} adapter(s)." -f $best.Name, $appliedCount) -Level OK
+    } else {
+        Write-Log 'Step 58: no adapters updated.' -Level WARN
+    }
+}
+
+# ============================================================
 # HTML REPORT GENERATOR
 # ============================================================
 function Write-HtmlReport {
@@ -15024,6 +15178,7 @@ function Main {
         'Invoke-Step55'
         'Invoke-Step56'
         'Invoke-Step57'
+        'Invoke-Step58'
             )
 
         for ($i = 0; $i -lt $stepFunctions.Count; $i++) {
