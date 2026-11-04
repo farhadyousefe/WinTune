@@ -14164,6 +14164,34 @@ function Invoke-PostCheck {
                 }
             }
 
+            # [FIX-DETACHED-EXIT-REPORT] Reconcile harvested exit codes
+            # back into the report step rows. Without this, steps 8b/12/33/39
+            # remain 'Detached' in the HTML report even after their child
+            # process exits with a non-zero code, permanently understating
+            # failures from the longest-running steps.
+            foreach ($rPid in $Script:DetachedRunners.Keys) {
+                $__r = $Script:DetachedRunners[$rPid]
+                if ($null -eq $__r.ExitCode) { continue }
+                $__stepNum = $null
+                if ($__r.Note -match 'Step\s+(\S+)') { $__stepNum = $Matches[1] }
+                if (-not $__stepNum) { continue }
+                for ($__i = 0; $__i -lt $Script:Report.Steps.Count; $__i++) {
+                    $__s = $Script:Report.Steps[$__i]
+                    if ($__s.Number -ne $__stepNum -or $__s.Status -ne 'Detached') { continue }
+                    $__newStatus = if ($__r.ExitCode -eq 0) { 'OK' } else { 'Failed' }
+                    $__newDetail = if ($__r.ExitCode -eq 0) {
+                        'Detached runner exited 0 - see child log for details'
+                    } else {
+                        ('Detached runner exited 0x{0:X8} - see child log' -f [uint32]$__r.ExitCode)
+                    }
+                    $__s.Status = $__newStatus
+                    $__s.Detail = $__newDetail
+                    Write-Log ("  [RECONCILE] Step {0}: Detached -> {1} (exit 0x{2:X8})" -f `
+                        $__stepNum, $__newStatus, [uint32]$__r.ExitCode) -Level INFO
+                    break
+                }
+            }
+
             Write-Log 'Detached runner exit codes:' -Level INFO
             foreach ($rPid in $Script:DetachedRunners.Keys) {
                 $r = $Script:DetachedRunners[$rPid]
