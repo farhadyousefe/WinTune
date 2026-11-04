@@ -3039,7 +3039,25 @@ try {
             }
         }
 
-        $installOk = $true
+        # [FIX-WU-EXITCODE-A] Compute $installOk from actual results.
+        # Previously $installOk = $true fired unconditionally after the
+        # install loop, only proving the try block didn't throw. A batch
+        # where every update aborted still set it to $true, and the
+        # runner then claimed success and exited 0.
+        $__fail = @($installResult | Where-Object {
+            $_.Result -match 'Failed|Error|Aborted|Unknown'
+        }).Count
+        if ($__fail -gt 0) {
+            $installOk = $false
+        } elseif ($installResult.Count -gt 0 -or $comList.Count -eq 0) {
+            # Either we recorded results (all success/skip, since fail=0)
+            # or there was nothing to install. Both are clean outcomes.
+            $installOk = $true
+        } else {
+            # Candidates existed but no results recorded — the loop
+            # never produced an outcome. Treat as failure.
+            $installOk = $false
+        }
     } catch {
         WU-Log ("Install failed: {0}" -f $_.Exception.Message) 'ERROR'
         WU-Log 'This may be a temporary network or catalog issue. Re-run when ready.' 'INFO'
@@ -3094,12 +3112,20 @@ try {
             WU-Log ('{0,-14} {1,-12} {2}' -f $r.Result, $kb, $title) 'INFO'
         }
 
-        $okCount   = @($uniqueResults | Where-Object { $_.Result -match 'Installed|Succeeded' }).Count
-        $failCount = @($uniqueResults | Where-Object { $_.Result -match 'Failed|Error' }).Count
-        $pendCount = @($uniqueResults | Where-Object { $_.Result -match 'Pending|Downloaded' }).Count
+        # [FIX-WU-EXITCODE-B] Correct count buckets. Old 'Installed|Succeeded'
+        # regex also matched InstalledWithErrors (double-counted as both
+        # success and failure). Old 'Failed|Error' missed 'Aborted'
+        # entirely, so an aborted update vanished from the summary.
+        $okCount      = @($uniqueResults | Where-Object { $_.Result -eq 'Installed' }).Count
+        $partialCount = @($uniqueResults | Where-Object { $_.Result -eq 'InstalledWithErrors' }).Count
+        $skipCount    = @($uniqueResults | Where-Object { $_.Result -match '^Skipped' }).Count
+        $failCount    = @($uniqueResults | Where-Object {
+            $_.Result -match 'Failed|Error|Aborted|Unknown'
+        }).Count
 
         WU-Log '' 'INFO'
-        WU-Log ("Summary: {0} installed, {1} failed, {2} pending" -f $okCount, $failCount, $pendCount) 'INFO'
+        WU-Log ("Summary: {0} installed, {1} installed-with-errors, {2} skipped, {3} failed/aborted" `
+                -f $okCount, $partialCount, $skipCount, $failCount) 'INFO'
     }
 
     try {
@@ -3113,14 +3139,22 @@ try {
         WU-Log 'Could not determine reboot status.' 'INFO'
     }
 
+    # [FIX-WU-EXITCODE-C] Final exit code reflects install outcome,
+    # not just "did we finish the loop". Parent reconciliation
+    # (Fix-DetachedExitReport) uses exit code to decide step status
+    # in the HTML report. Without this, aborted installs still show
+    # as Step 39 OK.
     if ($installOk) {
         WU-Log 'Windows Update runner finished successfully.' 'OK'
+        $__wuExitCode = 0
     } else {
-        WU-Log 'Windows Update runner finished with warnings.' 'WARN'
+        WU-Log 'Windows Update runner finished with failures - see summary above.' 'WARN'
+        $__wuExitCode = 1
     }
 
     Pause-Exit
     try { Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue } catch { }
+    exit $__wuExitCode
 } catch {
     WU-Log "FATAL: $($_.Exception.Message)" 'ERROR'
     Pause-Exit
