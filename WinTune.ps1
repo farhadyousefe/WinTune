@@ -1416,6 +1416,27 @@ function Test-Environment {
         Write-Log "Windows build $build is below the tested baseline (19041+). Some steps may fail." -Level WARN
     }
 
+    # [FIX-WIN10-EOL] Windows 10 reached end of support on Oct 14, 2025.
+    # Consumer ESU ended Oct 13, 2026. Any build < 22000 is a Win10
+    # machine that is (as of Nov 2026) no longer receiving security
+    # updates through normal channels. This is not a bug in WinTune —
+    # WinTune will still run — but the OS itself is the real problem.
+    if ($build -ge 18362 -and $build -lt 22000) {
+        Write-Log '============================================================' -Level WARN
+        Write-Log ' WINDOWS 10 IS OUT OF SUPPORT (EOL Oct 14, 2025)' -Level WARN
+        Write-Log '============================================================' -Level WARN
+        Write-Log '  Consumer ESU ended Oct 13, 2026. Enterprise ESU continues' -Level WARN
+        Write-Log '  through Oct 2028 for organizations that enrolled.' -Level WARN
+        Write-Log '' -Level WARN
+        Write-Log '  WinTune will continue to run, but a maintenance tool can' -Level WARN
+        Write-Log '  only do so much on an unpatched OS. The real fix is:' -Level WARN
+        Write-Log '    - Upgrade to Windows 11 (check PC Health Check first), or' -Level WARN
+        Write-Log '    - Enroll in Windows 10 ESU if you are on Enterprise/Education' -Level WARN
+        Write-Log '' -Level WARN
+        Write-Log '  Continuing with maintenance run.' -Level WARN
+        Write-Log '============================================================' -Level WARN
+    }
+
     # ---- SKU detection ----
     try {
         $skuNum = [int]$os.OperatingSystemSKU
