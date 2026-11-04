@@ -3455,7 +3455,10 @@ function Invoke-Step01 {
 
     # ---- Pre-flight: report any active DO jobs before we disturb them ----
     try {
-        $doJobs = @(Get-DeliveryOptimizationStatus -ErrorAction SilentlyContinue)
+        # [FIX-DO-WARN-1] Suppress the Warning-stream "No active Delivery
+        # Optimization jobs" message. Empty queue is a normal state, not
+        # a problem worth warning about.
+        $doJobs = @(Get-DeliveryOptimizationStatus -ErrorAction SilentlyContinue -WarningAction SilentlyContinue)
         if ($doJobs.Count -gt 0) {
             $active = @($doJobs | Where-Object { $_.Status -eq 'Caching' -or $_.Status -eq 'Downloading' })
             if ($active.Count -gt 0) {
@@ -3708,8 +3711,17 @@ function Invoke-Step01 {
                     $stillPending += $svc
                 }
             }
-            if ($stillPending.Count -eq 0) { break }
+            # [FIX-STEP1-SVCCK] Assign $pending BEFORE the break check.
+            # The old order was:
+            #   if ($stillPending.Count -eq 0) { break }   # breaks first
+            #   $pending = $stillPending                    # never runs
+            # so when all services reached Running, $pending retained
+            # the ORIGINAL candidate list and the post-loop check
+            # `if ($pending.Count -eq 0)` was false → "still not Running
+            # after 45s" fired on every run (with ~0s elapsed, as the
+            # log timestamps show).
             $pending = $stillPending
+            if ($pending.Count -eq 0) { break }
             Start-Sleep -Milliseconds 500
         }
 
@@ -3725,7 +3737,8 @@ function Invoke-Step01 {
     Write-Log 'Verifying Delivery Optimization cache is empty...' -Level INFO
     try {
         Start-Sleep -Seconds 2
-        $remaining = @(Get-DeliveryOptimizationStatus -ErrorAction SilentlyContinue)
+        # [FIX-DO-WARN-2] Same warning suppression as the pre-flight check.
+        $remaining = @(Get-DeliveryOptimizationStatus -ErrorAction SilentlyContinue -WarningAction SilentlyContinue)
         if ($remaining.Count -eq 0) {
             Write-Log '  [OK] DO cache is empty - no residual jobs.' -Level OK
         } else {
@@ -9957,10 +9970,17 @@ function Invoke-Step34 {
     # ============================================================
     Write-Log 'Clearing font cache databases...' -Level INFO
 
+    # [FIX-STEP34-PATHS] Also scan modern Win11 24H2+ font cache locations.
+    # The FontCache service on newer builds may stage .dat files under
+    # ProgramData and the user's LOCALAPPDATA in addition to the legacy
+    # ServiceProfiles\LocalService path. Adding these is harmless — a
+    # missing path just logs "Path not present" and skips.
     $fontCachePaths = @(
         (Join-Path $env:SystemRoot 'ServiceProfiles\LocalService\AppData\Local\FontCache')
         (Join-Path $env:SystemRoot 'ServiceProfiles\LocalService\AppData\Local\FontCache\FontCache-S-1-5-18')
         (Join-Path $env:SystemRoot 'ServiceProfiles\LocalService\AppData\Local\FontCache\FontCache-S-1-5-21')
+        (Join-Path $env:ProgramData 'Microsoft\Windows\FontCache')
+        (Join-Path $env:LOCALAPPDATA 'FontCache')
     )
 
     $deletedCount = 0
@@ -9993,7 +10013,15 @@ function Invoke-Step34 {
     }
 
     $freedMB = [math]::Round($bytesFreed / 1MB, 2)
-    Write-Log ("  Deleted {0} font cache files ({1} failed), reclaimed {2:N2} MB" -f $deletedCount, $failedCount, $freedMB) -Level INFO
+    # [FIX-STEP34-MSG] Distinguish "cache already clean" from "deleted 0
+    # due to file locks". The two cases have different meanings and
+    # different fixes, so collapsing them into "Deleted 0" makes the
+    # log look like a silent failure when it's actually a success.
+    if ($deletedCount -eq 0 -and $failedCount -eq 0) {
+        Write-Log '  Font cache already clean — no .dat files to delete.' -Level INFO
+    } else {
+        Write-Log ("  Deleted {0} font cache files ({1} failed), reclaimed {2:N2} MB" -f $deletedCount, $failedCount, $freedMB) -Level INFO
+    }
 
     # ============================================================
     # 3. Restart FontCache service
@@ -13418,10 +13446,43 @@ function Invoke-Step55 {
     }
 
     # ---- Congestion provider (build-gated + support-gated) ----
+    # [FIX-STEP55-VPN] Skip CUBIC when a VPN process is running. VPN
+    # clients (Proton, OpenVPN, WireGuard, NordVPN, ExpressVPN, etc.)
+    # reset TCP global parameters on start/stop to keep their tunnels
+    # isolated from host tuning. Attempting to set CUBIC while a VPN
+    # is active succeeds at the kernel level but is reverted within
+    # milliseconds, producing a misleading WARN on every run. Better
+    # to skip cleanly and let the user know why.
+    $__vpnRunning = $false
+    $__vpnProcNames = @(
+        'ProtonVPN.NrptWatchdog'
+        'ProtonVPN.Launcher'
+        'ProtonVPN.Client'
+        'protonvpn-service'
+        'openvpn'
+        'wireguard'
+        'nordvpn-service'
+        'ExpressVPNService'
+        'mullvad'
+        'warp-svc'
+        'vpnagent'
+        'vpnui'
+    )
+    foreach ($__vp in $__vpnProcNames) {
+        if (Get-Process -Name $__vp -ErrorAction SilentlyContinue) {
+            $__vpnRunning = $true
+            Write-Log ("  [SKIP] CUBIC skipped — VPN process '{0}' is active (resets TCP globals)." -f $__vp) -Level INFO
+            break
+        }
+    }
+
     $build = 0
     try { $build = [int](Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).BuildNumber } catch { }
 
-    if ($build -lt 22000) {
+    if ($__vpnRunning) {
+        # Nothing to do — the current provider is VPN-managed.
+        Write-Log '  Congestion provider left at current setting (VPN-managed).' -Level INFO
+    } elseif ($build -lt 22000) {
         # Legacy syntax path for Windows 10
         if ($ccState -match 'cubic') {
             Write-Log '  Congestion provider already CUBIC.' -Level DEBUG
@@ -14509,7 +14570,8 @@ function Invoke-PostCheck {
     $activeConsumptionGB = 0.0
     try {
         # Delivery Optimization active/paused jobs
-        $doJobs = @(Get-DeliveryOptimizationStatus -ErrorAction SilentlyContinue | Where-Object { $_.Status -in 'Caching','Downloading','Paused' })
+        # [FIX-DO-WARN-3] Same warning suppression for PostCheck's DO query.
+        $doJobs = @(Get-DeliveryOptimizationStatus -ErrorAction SilentlyContinue -WarningAction SilentlyContinue | Where-Object { $_.Status -in 'Caching','Downloading','Paused' })
         if ($doJobs.Count -gt 0) {
             $doBytes = ($doJobs | Measure-Object -Property TotalBytesDownloaded -Sum).Sum
             if ($doBytes) { $activeConsumptionGB += [math]::Round($doBytes / 1GB, 2) }
