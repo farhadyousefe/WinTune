@@ -2905,7 +2905,18 @@ try {
             if (-not $matchedCategory) { continue }
 
             $kb = if ($u.PSObject.Properties['KB'] -and -not [string]::IsNullOrWhiteSpace($u.KB)) { $u.KB } else { '' }
-            $sizeMB = [int64]$u.MaxDownloadSize / 1MB
+            # [FIX-WU-SIZE] MaxDownloadSize can return 0 or 0xFFFFFFFFFFFFFFFF
+            # (uint64 max) for updates whose size is not yet resolved.
+            # Casting uint64 max to int64 overflows to -1, which divided
+            # by 1MB looks like ~92 GB. Treat 0 and huge values as
+            # "unknown size" (0) rather than "suspiciously large" so we
+            # don't skip legitimate updates on bogus metadata.
+            $__rawSize = [uint64]$u.MaxDownloadSize
+            if ($__rawSize -eq 0 -or $__rawSize -gt 10GB) {
+                $sizeMB = [int64]0
+            } else {
+                $sizeMB = [int64]($__rawSize / 1MB)
+            }
 
             $comList += [PSCustomObject]@{
                 Update   = $u
@@ -2916,8 +2927,13 @@ try {
             }
         }
 
-        # Sort ascending by size - smallest first
-        $comList = @($comList | Sort-Object -Property @{Expression = { [int64]$_.SizeMB }})
+        # Sort ascending by size - smallest first.
+        # [FIX-WU-SIZE-SORT] Unknown sizes (0) sort last so we don't
+        # preempt the small well-known installs with a "try and see"
+        # candidate that may fail late.
+        $comList = @($comList | Sort-Object -Property @{
+            Expression = { if ([int64]$_.SizeMB -eq 0) { [int64]::MaxValue } else { [int64]$_.SizeMB } }
+        })
         # Safety gate: skip suspiciously large updates (>10 GB)
         # Real Windows updates are < 5 GB; anything larger is a corrupted manifest
         $preGateCount = $comList.Count
@@ -5316,12 +5332,50 @@ try {
 
     DR-Section 'Audit'
 
+    # [FIX-DRV-DEDUP] Deduplicate BEFORE applying the gates.
+    #
+    # The old flow: gate every raw candidate, add passers to $eligible,
+    # then deduplicate $eligible keeping the newest. Bug: if WU offers
+    # an old driver (e.g. 4 years old) and a new one (18 days old), the
+    # new one fails the MinAge gate and goes into $skipped; the old one
+    # passes and gets installed. That defeats the entire purpose of the
+    # MinAge gate: we're not updating to the newest; we're falling back
+    # to an ancient driver just because the current one is "too new".
+    #
+    # The new flow: pick the newest candidate per Class|Model|Vendor
+    # first, then run gates on that representative. If the newest
+    # version fails any gate, skip the device entirely for this run.
+    # That matches the intent: "only ship drivers that WU's rollout
+    # telemetry has validated."
+    $allRows = @()
+    foreach ($u in $allDrivers) {
+        $allRows += [PSCustomObject]@{ Update = $u; Row = (DR-FormatRow -Update $u) }
+    }
+
+    $byKey = @{}
+    foreach ($item in $allRows) {
+        $key = '{0}|{1}|{2}' -f $item.Row.Class, $item.Row.Model, $item.Row.Vendor
+        if (-not $byKey.ContainsKey($key)) {
+            $byKey[$key] = $item
+        } else {
+            if ($item.Row.AgeDays -lt $byKey[$key].Row.AgeDays) {
+                $byKey[$key] = $item
+            }
+        }
+    }
+    $deduped = @($byKey.Values)
+    $removedCount = $allRows.Count - $deduped.Count
+    if ($removedCount -gt 0) {
+        DR-Log ("  (deduplicated {0} duplicate entry(ies) before gates)" -f $removedCount) 'INFO'
+    }
+
     $eligible = @()
     $skipped  = @()
 
-    foreach ($u in $allDrivers) {
+    foreach ($item in $deduped) {
+        $u   = $item.Update
+        $row = $item.Row
         $verdict = DR-TestCandidate -Update $u
-        $row     = DR-FormatRow -Update $u
 
         if ($verdict.Pass) {
             $eligible += [PSCustomObject]@{ Update = $u; Row = $row }
@@ -5332,27 +5386,6 @@ try {
             DR-Log ("  [{0,-12}] {1}  - {2}" -f $row.Class, $row.Title, $verdict.Reason) 'WARN'
             DR-Log '' 'INFO'
         }
-    }
-    # Deduplicate eligible drivers by (Class, Model, Vendor) - keep the newest.
-    # Windows Update sometimes offers the same driver twice with slightly
-    # different publish dates. Keep the newest - WUA would have superseded
-    # the older one, and the older install typically fails applicability.
-    $preDedupeCount = $eligible.Count
-    $byKey = @{}
-    foreach ($item in $eligible) {
-        $key = '{0}|{1}|{2}' -f $item.Row.Class, $item.Row.Model, $item.Row.Vendor
-        if (-not $byKey.ContainsKey($key)) {
-            $byKey[$key] = $item
-        } else {
-             if ($item.Row.AgeDays -lt $byKey[$key].Row.AgeDays) {
-                $byKey[$key] = $item
-            }
-        }
-    }
-    $eligible = @($byKey.Values)
-    $removedCount = $preDedupeCount - $eligible.Count
-    if ($removedCount -gt 0) {
-        DR-Log ("  (deduplicated {0} duplicate entry(ies))" -f $removedCount) 'INFO'
     }
     # Sort by size ascending (smallest first) - safer install order.
     # Small drivers finish fast; larger risky ones (display, audio) run last.
