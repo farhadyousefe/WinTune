@@ -14434,6 +14434,50 @@ function Main {
         # ---- Self-test routing ----
         if ($Script:SelfTest) {
             Write-Log '[SELF-TEST] Lock successfully acquired and verified.' -Level OK
+
+            # [FIX-SELFTEST-SCHEMA] Validate step tables + runner syntax.
+            $schemaErrors = @()
+
+            # 1. StepNames <-> StepDescriptions key-set parity
+            $namesKeys = @($Script:StepNames.Keys | ForEach-Object { [string]$_ })
+            $descsKeys = @($Script:StepDescriptions.Keys | ForEach-Object { [string]$_ })
+            foreach ($k in ($namesKeys | Where-Object { $_ -notin $descsKeys })) {
+                $schemaErrors += "StepNames key '$k' has no StepDescriptions entry"
+            }
+            foreach ($k in ($descsKeys | Where-Object { $_ -notin $namesKeys })) {
+                $schemaErrors += "StepDescriptions key '$k' has no StepNames entry"
+            }
+
+            # 2. Runner here-strings parse cleanly
+            $runners = @(
+                @{ Name = 'EmbeddedSfcDismRunner'; Text = $Script:EmbeddedSfcDismRunner }
+                @{ Name = 'EmbeddedWingetRunner';  Text = $Script:EmbeddedWingetRunner }
+                @{ Name = 'EmbeddedWuRunner';      Text = $Script:EmbeddedWuRunner }
+                @{ Name = 'EmbeddedDriverRunner';  Text = $Script:EmbeddedDriverRunner }
+            )
+            foreach ($r in $runners) {
+                if (-not $r.Text) {
+                    $schemaErrors += "Runner '$($r.Name)' is empty"
+                    continue
+                }
+                $parseErrs = $null
+                [void][System.Management.Automation.PSParser]::Tokenize($r.Text, [ref]$parseErrs)
+                if ($parseErrs.Count -gt 0) {
+                    $schemaErrors += "Runner '$($r.Name)' has $($parseErrs.Count) parse error(s): $($parseErrs[0].Message)"
+                } else {
+                    Write-Log ("[SELF-TEST] Runner '{0}' parses cleanly ({1} bytes)" -f $r.Name, $r.Text.Length) -Level OK
+                }
+            }
+
+            if ($schemaErrors.Count -eq 0) {
+                Write-Log '[SELF-TEST] Schema validation: PASS' -Level OK
+            } else {
+                foreach ($e in $schemaErrors) {
+                    Write-Log ("[SELF-TEST] {0}" -f $e) -Level ERROR
+                }
+                Write-Log ("[SELF-TEST] Schema validation: FAIL ({0} issue(s))" -f $schemaErrors.Count) -Level ERROR
+            }
+
             Write-Log '[SELF-TEST] Releasing lock and exiting cleanly.' -Level OK
             return
         }
