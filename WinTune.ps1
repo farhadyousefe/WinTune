@@ -127,6 +127,10 @@ param(
     # optionally switch to the fastest. Skips on domain-joined PCs.
     [switch]$AllowDnsBenchmark,                                 # Step 58 - DNS resolver benchmark
 
+    # [FIX-TIER2-PARAMS] Fast Startup + gaming toggles in Step 57
+    [switch]$AllowFastStartupOff,                               # Step 57 - disable Fast Startup (HiberbootEnabled=0)
+    [switch]$AllowGamingTweaks,                                 # Step 57 - enable HAGS + Game Mode
+
     # ---- Detached runner tracking ----
     [switch]$WaitForDetached,                                   # Wait indefinitely for all children before PostCheck
     [switch]$AllowScheduledTaskAction,
@@ -265,6 +269,8 @@ $Script:AllowModernStandbyOff = $AllowModernStandbyOff.IsPresent
 $Script:AllowHpetOff = $AllowHpetOff.IsPresent
 $Script:AllowRegistryBackup = $AllowRegistryBackup.IsPresent
 $Script:AllowDnsBenchmark = $AllowDnsBenchmark.IsPresent
+$Script:AllowFastStartupOff = $AllowFastStartupOff.IsPresent
+$Script:AllowGamingTweaks = $AllowGamingTweaks.IsPresent
 $Script:RollbackMode       = $Rollback.IsPresent
 $Script:InRollbackMode   = $false
 
@@ -13687,6 +13693,47 @@ function Invoke-Step57 {
             $applied = $true
         } else {
             Write-Log ("  [WARN] bcdedit returned exit code {0}." -f $LASTEXITCODE) -Level WARN
+        }
+    }
+
+    # [FIX-TIER2-FASTSTARTUP] Disable Fast Startup
+    if ($Script:AllowFastStartupOff) {
+        Write-Log 'Disabling Fast Startup...' -Level INFO
+        $__powerPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power'
+        try {
+            if (-not (Test-Path -LiteralPath $__powerPath)) { New-Item -Path $__powerPath -Force | Out-Null }
+            New-ItemProperty -Path $__powerPath -Name 'HiberbootEnabled' -Value 0 -PropertyType DWord -Force -ErrorAction Stop | Out-Null
+            Write-Log '  [OK] Fast Startup disabled.' -Level OK
+            $applied = $true
+        } catch {
+            Write-Log ("  [WARN] Could not disable Fast Startup: {0}" -f $_.Exception.Message) -Level WARN
+        }
+    }
+
+    # [FIX-TIER2-GAMING] Enable HAGS + Game Mode
+    if ($Script:AllowGamingTweaks) {
+        Write-Log 'Enabling gaming tweaks (HAGS + Game Mode)...' -Level INFO
+        $__hagsPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers'
+        $__gmPath   = 'HKCU:\Software\Microsoft\GameBar'
+        try {
+            if (-not (Test-Path -LiteralPath $__hagsPath)) { New-Item -Path $__hagsPath -Force | Out-Null }
+            New-ItemProperty -Path $__hagsPath -Name 'HwSchMode' -Value 2 -PropertyType DWord -Force -ErrorAction Stop | Out-Null
+            Write-Log '  [OK] HAGS enabled (HwSchMode = 2, reboot required).' -Level OK
+            if ($Script:RebootReasons -notcontains 'Step 57 (HAGS)') {
+                $Script:RebootReasons += 'Step 57 (HAGS)'
+            }
+            $Script:RebootRequired = $true
+            $applied = $true
+        } catch {
+            Write-Log ("  [WARN] Could not enable HAGS: {0}" -f $_.Exception.Message) -Level WARN
+        }
+        try {
+            if (-not (Test-Path -LiteralPath $__gmPath)) { New-Item -Path $__gmPath -Force | Out-Null }
+            New-ItemProperty -Path $__gmPath -Name 'AutoGameModeEnabled' -Value 1 -PropertyType DWord -Force -ErrorAction Stop | Out-Null
+            Write-Log '  [OK] Game Mode enabled.' -Level OK
+            $applied = $true
+        } catch {
+            Write-Log ("  [WARN] Could not enable Game Mode: {0}" -f $_.Exception.Message) -Level WARN
         }
     }
 
