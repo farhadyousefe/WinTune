@@ -11172,7 +11172,23 @@ function Invoke-Step38 {
                 if (-not (Test-Path -LiteralPath $approvedPath)) {
                     New-Item -Path $approvedPath -Force -ErrorAction Stop | Out-Null
                 }
-                $disabledBytes = [byte[]](0x03,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00)
+                # [FIX-STEP38-STARTUPBYTES] Preserve existing byte length.
+                # Modern Windows uses 12-byte StartupApproved entries
+                # (1-byte status + 11-byte FILETIME), but legacy-migrated
+                # entries (from pre-Win8 systems) are 8 bytes. Writing
+                # 12 bytes to an 8-byte slot causes Task Manager to
+                # misparse and may silently re-enable the entry. If a
+                # value already exists, keep its length and only flip
+                # byte[0] to 0x03 (disabled). If no value exists, write
+                # the modern 12-byte default.
+                $__existing = (Get-ItemProperty -Path $approvedPath -Name $e.Name -ErrorAction SilentlyContinue).($e.Name)
+                if ($__existing -is [byte[]] -and $__existing.Length -in @(8, 12)) {
+                    $disabledBytes = New-Object byte[] $__existing.Length
+                    [Array]::Copy($__existing, $disabledBytes, $__existing.Length)
+                    $disabledBytes[0] = 0x03
+                } else {
+                    $disabledBytes = [byte[]](0x03,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00)
+                }
                 New-ItemProperty -Path $approvedPath -Name $e.Name -Value $disabledBytes -PropertyType Binary -Force -ErrorAction Stop | Out-Null
 
                 # Record that WE disabled it, so a future run can detect user re-enable.
@@ -11760,10 +11776,22 @@ function Invoke-Step42 {
     # Extract "family" = first token before _ or - or a version-digit boundary
     function Get-FamilyKey {
         param([string]$Name)
-        # Match leading letters + optional first digit cluster
-        $m = [regex]::Match($Name, '^([A-Za-z]+(?:\.[A-Za-z0-9]+)?)')
-        if ($m.Success) { return $m.Groups[1].Value.ToLowerInvariant() }
-        return $Name.ToLowerInvariant()
+        # [FIX-STEP42-FAMILYKEY] Include the architecture token in the
+        # family key. Without it, Microsoft.VCRedist.2015.x64 and
+        # Microsoft.VCRedist.2015.x86 collapse to the same key, and the
+        # older one is deleted as "superseded" — even though x86 and
+        # x64 are separate installs. The $referencedNames protection
+        # doesn't catch this because VCRedist's UninstallString is
+        # usually "MsiExec.exe /X{GUID}" with no Package Cache path.
+        # Including arch splits the folders into separate single-folder
+        # groups, which are always kept (group.Count -lt 2 -> continue).
+        $stripped = $Name -replace '_[0-9a-fA-F]{8,}$', ''
+        $m = [regex]::Match($stripped, '^([A-Za-z]+(?:\.[A-Za-z0-9]+){0,3})')
+        $key = if ($m.Success) { $m.Groups[1].Value.ToLowerInvariant() } else { $stripped.ToLowerInvariant() }
+        if ($stripped -match '(?i)(x64|x86|arm64|amd64|i386)') {
+            $key += '|' + $Matches[1].ToLowerInvariant()
+        }
+        return $key
     }
 
     $groups = @{}
