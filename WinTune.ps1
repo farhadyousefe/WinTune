@@ -555,8 +555,8 @@ function Invoke-NativeLive {
     try { $isRedirected = [Console]::IsOutputRedirected } catch { }
 
     # ---- State ----
-    $spinFrames   = @('|','/','-','\')
-    $spinIdx      = 0
+    # [CLEAN-SFC-DEAD] Removed $spinFrames / $spinIdx — remnants of
+    # the old spinner, replaced by the 10s heartbeat below.
     $lastProgress = "$Label started"
     $lineWidth    = 110
     $lastLogTime  = Get-Date
@@ -802,27 +802,14 @@ function Invoke-NativeLive {
     }
 
     # Footer
-    # ---- Copy capture file into the log (Bug 3) ----
-    if ($captureFile -and (Test-Path -LiteralPath $captureFile)) {
-        try {
-            $captured = Get-Content -LiteralPath $captureFile -Raw -ErrorAction SilentlyContinue
-            if ($captured) {
-                Add-Content -LiteralPath $logFile -Value $captured -Encoding UTF8 -ErrorAction SilentlyContinue
-            }
-        } catch { }
-    }
-
+    # [CLEAN-SFC-CAPTURE] Removed the copy-capture-file block and the
+    # cleanup loop — $captureFile and $cmdScript were never defined
+    # anywhere in the runner, so both were always no-ops. Remnants of
+    # a prior iteration that used temp-file I/O.
     $duration = (Get-Date) - $start
     $footer = "--- $Label complete in [ $(([math]::Round($duration.TotalMinutes, 1))) min ] (Exit Code: $exitCode) ---"
     Write-Host $footer -ForegroundColor DarkGray
     try { Add-Content -LiteralPath $logFile -Value $footer -Encoding UTF8 } catch {}
-
-    # Cleanup temp files
-    foreach ($f in @($captureFile, $cmdScript)) {
-        if ($f -and (Test-Path -LiteralPath $f)) {
-            Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue
-        }
-    }
 
     return @{ ExitCode = $exitCode }
 }
@@ -5700,15 +5687,6 @@ function Invoke-Step08b {
         return
     }
 
-    # [FIX-DETACHED-5A] cross-run guard
-    $__existing = @(Get-ExistingDetachedRunnerProcess -Kind 'Drivers')
-    if ($__existing.Count -gt 0) {
-        Write-Log ("  [SKIP] Drivers runner already active (PID {0}, started {1})." -f $__existing[0].Pid, $__existing[0].StartedAt) -Level WARN
-        Write-Log '  Close the existing window first, or wait for it to exit, then re-run.' -Level WARN
-        $Script:LastStepStatus = 'Skipped'
-        return
-    }
-
     try {
         $child = Start-Process -FilePath $Script:RunnerPowerShellExe -ArgumentList "-NoExit -NoProfile -ExecutionPolicy Bypass -File `"$runnerPath`"" -PassThru
 
@@ -6345,15 +6323,6 @@ function Invoke-Step12 {
         Write-Log ("  [FAIL] Detached launch prerequisites failed: {0}" -f $__prereq.Reason) -Level ERROR
         Write-Log '  Step marked Failed (child could not start).' -Level ERROR
         throw ("Detached runner prereq failure: {0}" -f $__prereq.Reason)
-    }
-
-    # [FIX-DETACHED-5B] cross-run guard
-    $__existing = @(Get-ExistingDetachedRunnerProcess -Kind 'SFC/DISM')
-    if ($__existing.Count -gt 0) {
-        Write-Log ("  [SKIP] SFC/DISM runner already active (PID {0}, started {1})." -f $__existing[0].Pid, $__existing[0].StartedAt) -Level WARN
-        Write-Log '  Close the existing window first, or wait for it to exit, then re-run.' -Level WARN
-        $Script:LastStepStatus = 'Skipped'
-        return
     }
 
     # [FIX-DETACHED-5B] cross-run guard
@@ -9623,15 +9592,6 @@ function Invoke-Step33 {
         return
     }
 
-    # [FIX-DETACHED-5C] cross-run guard
-    $__existing = @(Get-ExistingDetachedRunnerProcess -Kind 'Winget')
-    if ($__existing.Count -gt 0) {
-        Write-Log ("  [SKIP] Winget runner already active (PID {0}, started {1})." -f $__existing[0].Pid, $__existing[0].StartedAt) -Level WARN
-        Write-Log '  Close the existing window first, or wait for it to exit, then re-run.' -Level WARN
-        $Script:LastStepStatus = 'Skipped'
-        return
-    }
-
     try {
         $child = Start-Process -FilePath $Script:RunnerPowerShellExe -ArgumentList "-NoExit -NoProfile -ExecutionPolicy Bypass -File `"$runnerPath`"" -PassThru
 
@@ -11150,15 +11110,6 @@ function Invoke-Step39 {
         Write-Log ("  [FAIL] Detached launch prerequisites failed: {0}" -f $__prereq.Reason) -Level ERROR
         Write-Log '  Step marked Failed (child could not start).' -Level ERROR
         throw ("Detached runner prereq failure: {0}" -f $__prereq.Reason)
-    }
-
-    # [FIX-DETACHED-5D] cross-run guard
-    $__existing = @(Get-ExistingDetachedRunnerProcess -Kind 'Windows Update')
-    if ($__existing.Count -gt 0) {
-        Write-Log ("  [SKIP] Windows Update runner already active (PID {0}, started {1})." -f $__existing[0].Pid, $__existing[0].StartedAt) -Level WARN
-        Write-Log '  Close the existing window first, or wait for it to exit, then re-run.' -Level WARN
-        $Script:LastStepStatus = 'Skipped'
-        return
     }
 
     # [FIX-DETACHED-5D] cross-run guard
