@@ -33,6 +33,19 @@ rem  Feature update deferral (default 30 days)
 set "WT_FEATURE_UPDATE_DELAY_DAYS=30"
 
 rem ============================================================
+rem  Windows Update runner retry policy (Step 39 detached child):
+rem    WT_WU_MAX_RETRIES - max install attempts per update (default 3, cap 10)
+rem    Retries only fire for TRANSIENT failures (busy, service stopped,
+rem    timeout, aborted). Permanent failures (not applicable, signature
+rem    error, payload missing) give up immediately — retrying them just
+rem    wastes 30-90s per attempt for no benefit. Reboot-pending results
+rem    stop retries for that update; no amount of retrying will help
+rem    without a reboot.
+rem    Set to 1 to disable retries entirely (one-shot per update).
+rem    Backoff: 30s, 60s, 90s, ... (30 * (attempt-1) seconds).
+set "WT_WU_MAX_RETRIES=3"
+
+rem ============================================================
 rem  Verify prerequisites
 rem ============================================================
 if not exist "%SCRIPT_DIR%\WinTune.ps1" (
@@ -67,6 +80,11 @@ echo    Installer orphan MB : %WT_INSTALLER_MIN_ORPHAN_MB%
 echo    Installer age days  : %WT_INSTALLER_MIN_AGE_DAYS%
 echo    Package cache MB    : %WT_PACKAGE_CACHE_MIN_TOTAL_MB% ^(total^)
 echo    Feature deferral    : %WT_FEATURE_UPDATE_DELAY_DAYS% days
+if "%WT_WU_MAX_RETRIES%"=="" (
+    echo    WU max retries      : ^(WinTune.ps1 default = 3^)
+) else (
+    echo    WU max retries      : %WT_WU_MAX_RETRIES% ^(transient failures only^)
+)
 echo.
 echo  Continuing in 5 seconds. Press Ctrl+C to abort.
 echo ============================================================
@@ -99,6 +117,17 @@ if not "%WT_PACKAGE_CACHE_MIN_AGE_DAYS%"=="" set "WT_ARGS=%WT_ARGS% -PackageCach
 if not "%WT_PACKAGE_CACHE_MIN_SIZE_MB%"==""  set "WT_ARGS=%WT_ARGS% -PackageCacheMinSizeMB %WT_PACKAGE_CACHE_MIN_SIZE_MB%"
 if not "%WT_PACKAGE_CACHE_MIN_TOTAL_MB%"=="" set "WT_ARGS=%WT_ARGS% -PackageCacheMinTotalMB %WT_PACKAGE_CACHE_MIN_TOTAL_MB%"
 if not "%WT_FEATURE_UPDATE_DELAY_DAYS%"=="" set "WT_ARGS=%WT_ARGS% -FeatureUpdateDelayDays %WT_FEATURE_UPDATE_DELAY_DAYS%"
+
+rem ============================================================
+rem  Promote WT_WU_MAX_RETRIES to env var that the WU runner
+rem  actually reads. This is different from the WT_ARGS pattern
+rem  because the WU runner is a detached child — it doesn't see
+rem  WinTune.ps1's parameters, only env vars inherited at launch.
+rem  Setting it here (before the powershell.exe launch below)
+rem  means the env var propagates down through WinTune.ps1 ->
+rem  Start-Process -> WU runner unchanged.
+rem ============================================================
+if not "%WT_WU_MAX_RETRIES%"=="" set "FC_WU_MAX_RETRIES=%WT_WU_MAX_RETRIES%"
 
 rem ============================================================
 rem  Launch
