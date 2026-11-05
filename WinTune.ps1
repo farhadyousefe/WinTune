@@ -13271,7 +13271,7 @@ function Invoke-Step54 {
         # [FIX-DSH-PROBE] On MDM-managed/Intune machines the Dsh key is
         # ACL-locked even for Administrators. Only include the DWORD if
         # the key is writable; otherwise Step 54 will WARN every run.
-        [PSCustomObject]@{ Path = 'HKLM:\SOFTWARE\Policies\Microsoft\Dsh';                                  Name = 'AllowNewsAndInterests';             Value = 0; Type = 'DWord'; Condition = 'DshWritable' }
+        [PSCustomObject]@{ Path = 'HKLM:\SOFTWARE\Policies\Microsoft\Dsh';                                  Name = 'AllowNewsAndInterests';             Value = 0; Type = 'DWord' }
         [PSCustomObject]@{ Path = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Search';                 Name = 'SearchboxTaskbarMode';              Value = 0; Type = 'DWord' }
         # [FIX-KEEP-CLIPBOARD] Clipboard history (Win+V) is a user
         # preference, not a security policy. Removed the previous
@@ -13284,31 +13284,7 @@ function Invoke-Step54 {
 
     $applied = 0; $skipped = 0; $failed = 0
 
-    # [FIX-DSH-PROBE] Probe whether the Dsh key is writable once, before
-    # the loop. Machines with MDM/Intune/anti-tamper protection return
-    # E_ACCESSDENIED for HKLM\SOFTWARE\Policies\Microsoft\Dsh even when
-    # elevated. Cache the result so Step 54 can skip gracefully.
-    $__dshWritable = $true
-    try {
-        $__dshTest = 'HKLM:\SOFTWARE\Policies\Microsoft\Dsh'
-        if (-not (Test-Path -LiteralPath $__dshTest)) {
-            New-Item -Path $__dshTest -Force -ErrorAction Stop | Out-Null
-        }
-        # Attempt a harmless write/delete cycle
-        New-ItemProperty -Path $__dshTest -Name '__wintune_probe' -Value 0 -PropertyType DWord -Force -ErrorAction Stop | Out-Null
-        Remove-ItemProperty -Path $__dshTest -Name '__wintune_probe' -Force -ErrorAction SilentlyContinue
-    } catch {
-        $__dshWritable = $false
-        Write-Log '  [INFO] Dsh policy key is ACL-protected (MDM/Intune/anti-tamper).' -Level INFO
-        Write-Log '         AllowNewsAndInterests will be skipped. Widgets button stays visible.' -Level INFO
-        Write-Log '         This is expected on managed machines; no action needed.' -Level INFO
-    }
-
     foreach ($t in $tweaks) {
-        # [FIX-DSH-PROBE] Skip DWORDs whose Condition gate isn't met
-        if ($t.PSObject.Properties['Condition'] -and $t.Condition -eq 'DshWritable' -and -not $__dshWritable) {
-            continue
-        }
         $existed = $false
         $originalValue = $null
         try {
@@ -13340,8 +13316,20 @@ function Invoke-Step54 {
             }
             $applied++
         } catch {
-            Write-Log ("  [WARN] Could not set {0}\{1}: {2}" -f $t.Path, $t.Name, $_.Exception.Message) -Level WARN
-            $failed++
+            # [FIX-DSH-GRACEFUL-V2] UCPD.sys (since July 2026 KB) protects
+            # specific value names under HKLM\Policies\Microsoft\Dsh.
+            # Writing AllowNewsAndInterests fails with E_ACCESSDENIED
+            # even for elevated Administrators. Detect that exact case
+            # and downgrade to INFO + skipped so the summary stays clean.
+            $__errMsg = $_.Exception.Message
+            if ($t.Path -match 'Policies\\Microsoft\\Dsh' -and
+                ($__errMsg -match 'unauthorized|denied|ACCESS_DENIED')) {
+                Write-Log ("  [INFO] {0}\{1} is UCPD-protected - skipped. Widgets stays visible." -f $t.Path, $t.Name) -Level INFO
+                $skipped++
+            } else {
+                Write-Log ("  [WARN] Could not set {0}\{1}: {2}" -f $t.Path, $t.Name, $__errMsg) -Level WARN
+                $failed++
+            }
         }
     }
 
