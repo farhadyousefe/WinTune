@@ -2753,12 +2753,14 @@ try {
     if (-not $module) {
         WU-Log 'PSWindowsUpdate not installed - installing from PSGallery...' 'STEP'
         try {
+            # [FIX-WU-INSTALLMODULE] Install-Module has no -AcceptLicense
+            # parameter. The -Force flag already implies non-interactive
+            # acceptance of the license prompt.
             Install-Module -Name PSWindowsUpdate `
                 -Scope CurrentUser `
                 -Force `
                 -AllowClobber `
                 -SkipPublisherCheck `
-                -AcceptLicense `
                 -Confirm:$false `
                 -ErrorAction Stop
             WU-Log 'PSWindowsUpdate installed.' 'OK'
@@ -8055,11 +8057,22 @@ function Invoke-Step24 {
             $hvciEnabled = $null
             $vbsRunning  = $null
 
+            # [FIX-STEP24-STRICTMODE] StrictMode-safe property access.
             if (Test-Path -LiteralPath $hvciPath) {
-                $hvciEnabled = (Get-ItemProperty -Path $hvciPath -Name 'Enabled' -ErrorAction SilentlyContinue).Enabled
+                try {
+                    $__hvciProps = Get-ItemProperty -Path $hvciPath -Name 'Enabled' -ErrorAction SilentlyContinue
+                    if ($__hvciProps -and $__hvciProps.PSObject.Properties['Enabled']) {
+                        $hvciEnabled = $__hvciProps.Enabled
+                    }
+                } catch { }
             }
             if (Test-Path -LiteralPath $vbsPath) {
-                $vbsRunning = (Get-ItemProperty -Path $vbsPath -Name 'EnableVirtualizationBasedSecurity' -ErrorAction SilentlyContinue).EnableVirtualizationBasedSecurity
+                try {
+                    $__vbsProps = Get-ItemProperty -Path $vbsPath -Name 'EnableVirtualizationBasedSecurity' -ErrorAction SilentlyContinue
+                    if ($__vbsProps -and $__vbsProps.PSObject.Properties['EnableVirtualizationBasedSecurity']) {
+                        $vbsRunning = $__vbsProps.EnableVirtualizationBasedSecurity
+                    }
+                } catch { }
             }
 
             Write-Log '  VBS / HVCI audit:' -Level INFO
@@ -11344,7 +11357,17 @@ function Invoke-Step38 {
                     New-Item -Path $markerPath -Force -ErrorAction SilentlyContinue | Out-Null
                 }
                 $markerName = '{0}_{1}' -f ($e.Location -replace '[\\/:*?"<>|]', '_'), $e.Name
-                $markerVal  = (Get-ItemProperty -Path $markerPath -Name $markerName -ErrorAction SilentlyContinue).$markerName
+                # [FIX-STEP38-MARKER] StrictMode-safe property access. The
+                # old `.(...).$markerName` pattern throws under StrictMode
+                # Latest when the property is absent (always true on first
+                # run). PSObject.Properties returns $null for missing keys.
+                $markerVal = $null
+                try {
+                    $__markerProps = Get-ItemProperty -Path $markerPath -Name $markerName -ErrorAction SilentlyContinue
+                    if ($__markerProps -and $__markerProps.PSObject.Properties[$markerName]) {
+                        $markerVal = $__markerProps.PSObject.Properties[$markerName].Value
+                    }
+                } catch { }
 
                 if ($markerVal -eq 'user-reenabled') {
                     Write-Log ("  [SKIP-REENABLED] {0} (user re-enabled since last run)" -f $e.Name) -Level INFO
