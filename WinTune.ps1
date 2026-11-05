@@ -5533,16 +5533,33 @@ try {
             if ($ages.Count -gt 0) {
                 $newestStaleDays = ($ages | Measure-Object -Minimum).Minimum
                 $bumpedThreshold = $newestStaleDays + 30
-                DR-Log ("  [AUTO] All candidates are stale (newest = {0} days). " +
-                        "Bumping threshold {1} -> {2} for this run." -f
-                        $newestStaleDays, $maxStaleDays, $bumpedThreshold) 'WARN'
-                DR-Log '  [AUTO] One-shot adjustment; each run re-evaluates.' 'INFO'
-                $maxStaleDays = $bumpedThreshold
-                foreach ($s in $staleSkips) {
-                    $verdict = DR-TestCandidate -Update $s.Update
-                    if ($verdict.Pass) {
-                        $eligible += [PSCustomObject]@{ Update = $s.Update; Row = $s.Row }
-                        DR-Log ("  [AUTO-PROMOTED] {0}" -f $s.Row.Title) 'WARN'
+                # [FIX-DRV-AUTOBUMP-V2] Two fixes:
+                #   (a) Extra parens around the concatenation so -f sees the
+                #       full string. Previously -f bound tighter than +,
+                #       leaving {0} as a literal in the output.
+                #   (b) Only bump if the newest stale driver is within 365
+                #       days of maxStaleDays. Beyond that, the driver is
+                #       almost certainly unapplicable - promoting a 7-year
+                #       old driver (observed HP USB 48.2.4483.1963 at 2707
+                #       days) just wastes a download cycle on WU_E_ALL_UPDATES_FAILED.
+                $__gapDays = $newestStaleDays - $maxStaleDays
+                if ($__gapDays -gt 365) {
+                    DR-Log (("  [AUTO] Newest stale driver is {0} days ({1} days over max). " +
+                             "Skipping auto-bump - too far over to be applicable.") -f
+                             $newestStaleDays, $__gapDays) 'INFO'
+                    DR-Log '  [AUTO] If you need this driver, install via Windows Update Optional Updates.' 'INFO'
+                } else {
+                    DR-Log (("  [AUTO] All candidates are stale (newest = {0} days, {1} over max). " +
+                             "Bumping threshold {2} -> {3} for this run.") -f
+                             $newestStaleDays, $__gapDays, $maxStaleDays, $bumpedThreshold) 'WARN'
+                    DR-Log '  [AUTO] One-shot adjustment; each run re-evaluates.' 'INFO'
+                    $maxStaleDays = $bumpedThreshold
+                    foreach ($s in $staleSkips) {
+                        $verdict = DR-TestCandidate -Update $s.Update
+                        if ($verdict.Pass) {
+                            $eligible += [PSCustomObject]@{ Update = $s.Update; Row = $s.Row }
+                            DR-Log ("  [AUTO-PROMOTED] {0}" -f $s.Row.Title) 'WARN'
+                        }
                     }
                 }
                 $byKey = @{}
