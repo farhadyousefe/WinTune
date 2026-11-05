@@ -5552,11 +5552,21 @@ try {
                 #       old driver (observed HP USB 48.2.4483.1963 at 2707
                 #       days) just wastes a download cycle on WU_E_ALL_UPDATES_FAILED.
                 $__gapDays = $newestStaleDays - $maxStaleDays
-                if ($__gapDays -gt 365) {
-                    DR-Log (("  [AUTO] Newest stale driver is {0} days ({1} days over max). " +
-                             "Skipping auto-bump - too far over to be applicable.") -f
+                # [FIX-DRV-AUTOBUMP-TIGHT] Tightened cap from 365 to 30 days.
+                # Previous version measured the GAP (how far past max), not the
+                # driver's absolute age. A 2707-day-old driver from 2019 only
+                # shows 152 days of gap because max is 2555, so the old 365-day
+                # cap let it through and the install failed with 0x80240022
+                # (WU_E_ALL_UPDATES_FAILED - catalog has it but can't serve it).
+                #
+                # 30-day cap = "auto-bump only when newest candidate is less than
+                # a month past our stale threshold." Anything older is genuinely
+                # ancient and will likely fail the same way.
+                if ($__gapDays -gt 30) {
+                    DR-Log (("  [AUTO] Newest stale driver is {0} days - {1} over max. " +
+                             "Too far over to be safely applicable; not auto-bumping.") -f
                              $newestStaleDays, $__gapDays) 'INFO'
-                    DR-Log '  [AUTO] If you need this driver, install via Windows Update Optional Updates.' 'INFO'
+                    DR-Log '  [AUTO] If you need this driver, install via Settings -> Windows Update -> Optional Updates.' 'INFO'
                 } else {
                     DR-Log (("  [AUTO] All candidates are stale (newest = {0} days, {1} over max). " +
                              "Bumping threshold {2} -> {3} for this run.") -f
