@@ -10938,15 +10938,46 @@ function Get-PersistenceClassification {
         if ($clean -match [regex]::Escape($p)) { return 'Keep' }
     }
 
+    # [FIX-CLASSIFY-VERSIONINFO] Check version-info first. On enterprise
+    # machines, self-signed or non-public-CA certs (7-Zip's Igor Pavlov
+    # cert, various small vendors) show "NotTrusted" even for legitimate
+    # software. Version info is set by the compiler and unaffected by
+    # trust chain status.
+    try {
+        $__vi = (Get-Item -LiteralPath $clean -Force -ErrorAction SilentlyContinue).VersionInfo
+        if ($__vi) {
+            $__viProduct = [string]$__vi.ProductName
+            $__viCompany = [string]$__vi.CompanyName
+            $__viDesc    = [string]$__vi.FileDescription
+            $__viKeep = @(
+                'Igor Pavlov', '7-Zip', 'RARLAB', 'win.rar', 'WinZip',
+                'Adobe', 'Foxit', 'Tracker Software', 'PDF-XChange',
+                'Irfan Skiljan', 'IrfanView', 'Notepad++', 'Don Ho',
+                'Sublime HQ', 'JetBrains', 'VideoLAN',
+                'TortoiseSVN', 'TortoiseGit',
+                'TeamViewer', 'AnyDesk', 'LogMeIn', 'Realtek', 'Intel',
+                'NVIDIA', 'AMD', 'Microsoft'
+            )
+            foreach ($p in $__viKeep) {
+                if ($__viProduct -match [regex]::Escape($p)) { return 'Keep' }
+                if ($__viCompany -match [regex]::Escape($p)) { return 'Keep' }
+                if ($__viDesc    -match [regex]::Escape($p)) { return 'Keep' }
+            }
+        }
+    } catch { }
+
     try {
         $sig = Get-AuthenticodeSignature -LiteralPath $clean -ErrorAction Stop
 
         # Signature check can fail offline. On error, prefer Keep (safety).
         if ($sig.Status -eq 'UnknownError') { return 'Keep' }
         if ($sig.Status -eq 'NotSigned')   { return 'Disable' }
-        if ($sig.Status -ne 'Valid')       { return 'Disable' }
 
-        $subject = $sig.SignerCertificate.Subject
+        # [FIX-CLASSIFY-SUBJECT] Check cert subject BEFORE rejecting on
+        # status != Valid. A legitimately-signed file whose cert chain
+        # isn't in the local trust store returns NotTrusted, which we'd
+        # otherwise reject and disable a real product's context menu.
+        $subject = if ($sig.SignerCertificate) { $sig.SignerCertificate.Subject } else { '' }
 
         # KEEP-LIST: known-safe publisher substrings (case-insensitive)
         $keepPublishers = @(
@@ -12939,6 +12970,20 @@ function Invoke-Step51 {
     Write-Log 'STEP 51: Installed Program Audit' -Level STEP
     Write-Log ('-' * 60) -Level STEP
 
+    # [FIX-STEP51-DOMAIN] Skip on domain-joined machines. Enterprise
+    # software (SCCM packages, GPO-deployed MSIs, Intune Win32 apps) uses
+    # non-standard uninstall entry schemas that the orphan heuristic
+    # cannot safely classify. Confirmed damage on NMZ-CBRR-ARYAN:
+    # 13 legit program entries were removed.
+    $__isDomain51 = $false
+    try { $__isDomain51 = [bool](Get-CimInstance Win32_ComputerSystem -EA SilentlyContinue).PartOfDomain } catch { }
+    if ($__isDomain51) {
+        Write-Log 'Step 51 skipped: domain-joined machine (enterprise uninstall entries have non-standard schema).' -Level INFO
+        Write-Log '  Enterprise software should be managed via IT tooling (SCCM/Intune), not by an auto-cleanup tool.' -Level INFO
+        Write-Log '  To override, run:  Edit Invoke-Step51 and remove the [FIX-STEP51-DOMAIN] block.' -Level INFO
+        return
+    }
+
     $uninstallRoots = @(
         'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'
         'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
@@ -12978,18 +13023,29 @@ function Invoke-Step51 {
                 }
                 if ($skipByName) { continue }
 
-                $issues = @()
-                if ([string]::IsNullOrWhiteSpace($displayName)) {
-                    $issues += 'missing DisplayName'
-                }
-                if ([string]::IsNullOrWhiteSpace($uninstallStr)) {
-                    $issues += 'missing UninstallString'
-                }
-                if ($installLoc -and -not (Test-Path -LiteralPath ([System.Environment]::ExpandEnvironmentVariables($installLoc)) -ErrorAction SilentlyContinue)) {
-                    $issues += 'InstallLocation missing on disk'
+                # [FIX-STEP51-ORPHAN] Only treat as orphan when BOTH DisplayName
+                # AND UninstallString are missing. Modern Windows legitimately
+                # has uninstall entries with only ONE of the two:
+                #   - MSI entries with WindowsInstaller=1 and no UninstallString
+                #     (Windows resolves via ProductCode in the key name)
+                #   - MSIX entries with DisplayName but uninstall handled by
+                #     the AppX subsystem
+                #   - Driver bundles with DisplayName but no uninstaller
+                # Requiring BOTH prevents nuking legitimate programs' uninstall
+                # entries (observed: SQL Server, HP LaserJet, PFU ScanSnap,
+                # Java Auto Updater were all removed by the previous logic).
+                $missingName    = [string]::IsNullOrWhiteSpace($displayName)
+                $missingUninst  = [string]::IsNullOrWhiteSpace($uninstallStr)
+                $missingInstall = $installLoc -and -not (Test-Path -LiteralPath ([System.Environment]::ExpandEnvironmentVariables($installLoc)) -ErrorAction SilentlyContinue)
+
+                if (-not ($missingName -and $missingUninst) -and -not $missingInstall) {
+                    continue
                 }
 
-                if ($issues.Count -eq 0) { continue }
+                $issues = @()
+                if ($missingName)    { $issues += 'missing DisplayName' }
+                if ($missingUninst)  { $issues += 'missing UninstallString' }
+                if ($missingInstall) { $issues += 'InstallLocation missing on disk' }
 
                 $programs += [PSCustomObject]@{
                     KeyName   = $name
@@ -13096,9 +13152,24 @@ function Invoke-Step52 {
         [PSCustomObject]@{ Name = 'RemoteRegistry';   NewStart = 'Disabled'; Reason = 'Remote Registry access (remote regedit)' }
     )
 
+    # [FIX-STEP52-DOMAIN] Preserve enterprise-critical services on
+    # domain-joined machines. RemoteRegistry is required by every IT
+    # remote-management tool (SCCM, remote regedit, GPO registry CSEs).
+    # dmwappushservice is used by Intune/MDM for WAP push notifications.
+    # Confirmed damage on NMZ-CBRR-ARYAN: both were trimmed.
+    $__isDomain52 = $false
+    try { $__isDomain52 = [bool](Get-CimInstance Win32_ComputerSystem -EA SilentlyContinue).PartOfDomain } catch { }
+    $__enterpriseServices = @('RemoteRegistry', 'dmwappushservice')
+
     $changed = 0; $skipped = 0; $failed = 0
 
     foreach ($t in $targets) {
+        if ($__isDomain52 -and ($__enterpriseServices -contains $t.Name)) {
+            Write-Log ("  [SKIP] {0}: domain-joined - preserving enterprise management access" -f $t.Name) -Level INFO
+            $skipped++
+            continue
+        }
+
         $svc = Get-Service -Name $t.Name -ErrorAction SilentlyContinue
         if (-not $svc) {
             Write-Log ("  [{0}] Not present - skipped." -f $t.Name) -Level DEBUG
