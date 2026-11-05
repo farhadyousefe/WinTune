@@ -126,7 +126,7 @@ echo    - Privacy + Start Menu hardening + UI clutter off
 echo    - Start menu "Recommended" section hidden
 echo    - TCP tuning: RSS + auto-tune + CUBIC + Network Throttling off
 echo    - Fast Startup disabled (full shutdown every time)
-echo    - Gaming tweaks: HAGS + Game Mode (if -AllowGamingTweaks)
+rem HAGS/Game Mode disabled 2026-11-05 - Outlook/Explorer hangs after enable; see commit ddbb848
 echo    - Advanced: Hibernation off, HPET off, Modern Standby off
 echo      (each gated - desktops only for hibernation)
 echo    - Registry Periodic Backups enabled
@@ -231,7 +231,7 @@ echo    -AllowInstallerCleanup  -AllowPackageCacheCleanup
 echo    -AllowProgramAuditAction  -RemoveBloatware
 echo    -AllowPersistenceAction  -AllowContextMenuAction
 echo    -AllowHibernationOff  -AllowModernStandbyOff  -AllowHpetOff
-echo    -AllowFastStartupOff  -AllowGamingTweaks
+echo    -AllowFastStartupOff
 echo.
 echo ------------------------------------------------------------
 echo  NOT INCLUDED IN THIS RUN (add flags manually if needed)
@@ -265,8 +265,9 @@ set "WT_ARGS=%WT_ARGS% -AllowVbsAudit -AllowUnknownPackageVersions"
 set "WT_ARGS=%WT_ARGS% -DisableWebClient -AddWpadHostsEntry -EnableScriptBlockLogging"
 set "WT_ARGS=%WT_ARGS% -AllowHibernationOff -AllowModernStandbyOff -AllowHpetOff -AllowRegistryBackup"
 
-rem  New in this batch:
-set "WT_ARGS=%WT_ARGS% -AllowDnsBenchmark -AllowFastStartupOff -AllowGamingTweaks"
+rem HAGS disabled 2026-11-05 for Outlook/Explorer hang diagnosis.
+set "WT_ARGS=%WT_ARGS% -AllowDnsBenchmark -AllowFastStartupOff"
+rem set "WT_ARGS=%WT_ARGS% -AllowGamingTweaks"
 
 rem  Tier 3 opt-ins (only if set at top of .bat):
 if not "%WT_ALLOW_SANDBOX_INSTALL%"=="" set "WT_ARGS=%WT_ARGS% -AllowSandboxInstall"
