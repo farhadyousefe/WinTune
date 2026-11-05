@@ -13169,11 +13169,11 @@ function Invoke-Step54 {
         [PSCustomObject]@{ Path = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced';      Name = 'ShowSyncProviderNotifications';     Value = 0; Type = 'DWord' }
         [PSCustomObject]@{ Path = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager'; Name = 'SubscribedContent-338389Enabled';   Value = 0; Type = 'DWord' }
         [PSCustomObject]@{ Path = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager'; Name = 'SubscribedContent-310093Enabled';   Value = 0; Type = 'DWord' }
-        # [FIX-STEP54-TASKBARDA] ShellFeedsTaskbarViewMode is a Win10 21H1
-        # value that fails on Win11 22H2+ (Feeds key is ACL-restricted and
-        # News & Interests was replaced by Widgets). TaskbarDa = 0 is the
-        # supported Win11 equivalent — hides the Widgets button cleanly.
-        [PSCustomObject]@{ Path = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced';      Name = 'TaskbarDa';                         Value = 0; Type = 'DWord' }
+        # [FIX-STEP54-DSH-POLICY] TaskbarDa cannot be written on Win11
+        # 24H2/25H2 (E_ACCESSDENIED - Microsoft anti-scripting ACL).
+        # Switched to the supported HKLM Dsh group policy, which hides
+        # Widgets on all Win11 builds without ACL restrictions.
+        [PSCustomObject]@{ Path = 'HKLM:\SOFTWARE\Policies\Microsoft\Dsh';                                  Name = 'AllowNewsAndInterests';             Value = 0; Type = 'DWord' }
         [PSCustomObject]@{ Path = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Search';                 Name = 'SearchboxTaskbarMode';              Value = 0; Type = 'DWord' }
         [PSCustomObject]@{ Path = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System';                       Name = 'AllowClipboardHistory';             Value = 0; Type = 'DWord' }
 
