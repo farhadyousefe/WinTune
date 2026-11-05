@@ -2921,6 +2921,10 @@ try {
         WU-Log ("  (filtered out {0} driver update(s) with no KB)" -f $filteredCount) 'INFO'
     }
 
+    # [FIX-WU-HONEST-MSG] The earlier WARN block correctly told the user
+    # the scan failed. Do not print "No updates available" here - that
+    # contradicts the WARN and misleads the user into thinking the agent
+    # actually confirmed zero updates.
     if ($available.Count -gt 0) {
         WU-Log ("Found {0} update record(s):" -f $available.Count) 'OK'
         WU-Log '' 'INFO'
@@ -2952,7 +2956,12 @@ try {
             WU-Log ('{0,-12:N1} {1,-14} {2}' -f $sizeMB, $kbIds, $title) 'INFO'
         }
     } else {
-        WU-Log 'No updates available at this time.' 'OK'
+        # [FIX-WU-HONEST-MSG] Distinguish scan-failed from scan-succeeded-empty.
+        if ($Script:__wuScanFailed) {
+            WU-Log 'No updates to install (scan did not complete — availability UNKNOWN).' 'WARN'
+        } else {
+            WU-Log 'No updates available at this time.' 'OK'
+        }
     }
 
 
