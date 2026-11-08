@@ -1832,12 +1832,26 @@ function Test-SafeDeletionTarget {
         # Only directories have children to check
         if (-not $item.PSIsContainer) { return $true }
 
-        # Check immediate children for reparse points
-        $children = Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue
-        foreach ($child in $children) {
-            if ($child.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
-                Write-Log ("  [WARN] Reparse point inside {0}: {1} - will not be followed" -f $Path, $child.Name) -Level WARN
+        # [FIX-AUD-15] Check ALL descendants for reparse points, not
+        # just immediate children. PS 5.1's Remove-Item -Recurse can
+        # traverse junctions in the tree, redirecting a delete far
+        # outside the intended path. Fail closed: refuse to greenlight
+        # a recursive delete if ANY descendant is a reparse point.
+        # For legitimate cleanup trees with reparse points, callers can
+        # pass -AllowReparsePoints after manual verification.
+        $descendants = Get-ChildItem -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue
+        $deepReparse = @($descendants | Where-Object {
+            $_.Attributes -band [System.IO.FileAttributes]::ReparsePoint
+        })
+        if ($deepReparse.Count -gt 0) {
+            if (-not $AllowReparsePoints) {
+                Write-Log ("  [SKIP] Refusing recursive delete: {0} reparse point(s) inside {1}" -f $deepReparse.Count, $Path) -Level WARN
+                foreach ($r in $deepReparse) {
+                    Write-Log ("    {0}" -f $r.FullName) -Level WARN
+                }
+                return $false
             }
+            Write-Log ("  [WARN] {0} reparse point(s) inside {1} - will not be followed" -f $deepReparse.Count, $Path) -Level WARN
         }
 
         return $true
@@ -2694,7 +2708,11 @@ function Pause-Exit {
 # ---- Embedded WUA cache reset helper (needed because this is a separate process) ----
 function Reset-WUCache {
     try {
-        foreach ($svc in 'wuauserv', 'bits', 'cryptsvc', 'appidsvc') {
+        # [FIX-AUD-2] AppIDSvc removed from the stop list. AppIDSvc
+        # enforces AppLocker policy; stopping it can disable application
+        # control on managed machines. It is not required for WU cache
+        # reset — the actual WU stack is wuauserv + bits + cryptsvc.
+        foreach ($svc in 'wuauserv', 'bits', 'cryptsvc') {
             try { Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue -WarningAction SilentlyContinue } catch { }
         }
         Start-Sleep -Seconds 3
@@ -2710,7 +2728,8 @@ function Reset-WUCache {
             Rename-Item -LiteralPath $cr -NewName "catroot2.old_$stamp" -Force -ErrorAction Stop
         }
 
-        foreach ($svc in 'cryptsvc', 'bits', 'wuauserv', 'appidsvc') {
+        # [FIX-AUD-2] AppIDSvc not in start list either (see stop list).
+        foreach ($svc in 'cryptsvc', 'bits', 'wuauserv') {
             try { Start-Service -Name $svc -ErrorAction SilentlyContinue -WarningAction SilentlyContinue } catch { }
         }
         Start-Sleep -Seconds 3
@@ -3596,7 +3615,12 @@ function Invoke-Step01 {
 
         if ($svcObj.Status -ne 'Running') {
             Write-Log ("  {0} already stopped." -f $svc) -Level DEBUG
-            $stoppedServices += $svc   # treat as stopped; cache is safe to clear
+            # [FIX-AUD-1] Do NOT add to $stoppedServices. That list is
+            # used later to decide which services to START after cleanup.
+            # A service that was already stopped before WinTune ran must
+            # stay stopped — WinTune did not change its state, so it must
+            # not restore it. The old += here caused WinTune to start
+            # services (e.g. BITS) the user had deliberately left stopped.
             continue
         }
 
@@ -6325,6 +6349,16 @@ function Invoke-Step10 {
         $currentStart = (Get-CimInstance Win32_Service -Filter "Name='$($svc.Name)'" -ErrorAction SilentlyContinue).StartMode
         Write-Log ("  [{0}] Current startup: {1}" -f $svc.Name, $currentStart) -Level DEBUG
 
+        # [FIX-AUD-3] Record rollback entry BEFORE applying the change.
+        # Without this, -Rollback cannot restore DiagTrack/PcaSvc.
+        $__wasRunning = ($service.Status -eq 'Running')
+        Add-RollbackEntry -Step 10 -Type 'Service' -Data @{
+            Name           = $svc.Name
+            OriginalStart  = $currentStart
+            NewStart       = 'Manual'
+            OriginalStatus = $(if ($__wasRunning) { 'Running' } else { 'Stopped' })
+        }
+
         # Reconfigure via sc.exe (matches original behavior)
         try {
             $result = & sc.exe config $svc.Name start= demand 2>&1
@@ -6403,6 +6437,11 @@ function Invoke-Step10 {
             continue
         }
         try {
+            # [FIX-AUD-5] Record rollback entry BEFORE disabling.
+            Add-RollbackEntry -Step 10 -Type 'ScheduledTask' -Data @{
+                Path = $t.Path
+                Name = $t.Name
+            }
             Disable-ScheduledTask -TaskPath $t.Path -TaskName $t.Name -ErrorAction Stop | Out-Null
             Write-Log ("  [OK] Disabled task: {0}{1}" -f $t.Path, $t.Name) -Level OK
             $tasksDisabled++
@@ -6417,6 +6456,16 @@ function Invoke-Step10 {
     $advPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AdvertisingInfo'
     try {
         if (Test-Path -LiteralPath $advPath) {
+            # [FIX-AUD-4] Record original value before overwriting.
+            $__advOrig = (Get-ItemProperty -Path $advPath -Name 'Enabled' -ErrorAction SilentlyContinue).Enabled
+            $__advExisted = ($null -ne $__advOrig)
+            Add-RollbackEntry -Step 10 -Type 'RegistryHKLM' -Data @{
+                Path    = $advPath
+                Name    = 'Enabled'
+                Existed = $__advExisted
+                Value   = if ($__advExisted) { $__advOrig } else { $null }
+                Type    = 'DWord'
+            }
             New-ItemProperty -Path $advPath -Name 'Enabled' -Value 0 -PropertyType DWord -Force -ErrorAction Stop | Out-Null
             Write-Log '  [OK] Advertising ID disabled.' -Level OK
         } else {
@@ -12655,6 +12704,7 @@ function Invoke-Step45 {
 
     $hasHdd = $false
     $checked = 0
+    $allConfirmedSsd = $true
     foreach ($d in $drives) {
         $letter = $d.DeviceID.TrimEnd(':')
         try {
@@ -12666,8 +12716,22 @@ function Invoke-Step45 {
                 Write-Log ("  HDD detected: {0}" -f $d.DeviceID) -Level WARN
                 break
             }
-            $checked++
-        } catch { }
+            # [FIX-AUD-12] Only count drives whose MediaType is POSITIVELY
+            # SSD (4) or SCM (5). The old code incremented $checked for
+            # ANY drive, including those with MediaType=0 (Unspecified)
+            # or with no physical disk at all — letting the "all SSD"
+            # test pass without every drive being actually confirmed SSD.
+            if ($physical -and ($physical.MediaType -eq 4 -or $physical.MediaType -eq 5)) {
+                $checked++
+            } else {
+                $allConfirmedSsd = $false
+                $__mt = if ($physical) { $physical.MediaType } else { 'unknown' }
+                Write-Log ("  [WARN] Drive {0}: MediaType={1} not confirmed SSD" -f $d.DeviceID, $__mt) -Level WARN
+            }
+        } catch {
+            $allConfirmedSsd = $false
+            Write-Log ("  [WARN] Drive {0}: classification failed - {1}" -f $d.DeviceID, $_.Exception.Message) -Level WARN
+        }
     }
 
     if ($hasHdd) {
@@ -12677,20 +12741,33 @@ function Invoke-Step45 {
         return
     }
 
-    if ($checked -eq 0) {
-        Write-Log 'Could not classify any drive - skipping for safety.' -Level WARN
-        Write-Log '[INFO] Step 45 skipped: drive classification failed.' -Level INFO
+    if (-not $allConfirmedSsd) {
+        Write-Log 'Could not positively classify every drive as SSD/NVMe.' -Level WARN
+        Write-Log 'Skipping SysMain tuning for safety (unconfirmed drive may be HDD).' -Level WARN
+        Write-Log '[INFO] Step 45 skipped: drive classification incomplete.' -Level INFO
         return
     }
 
-    Write-Log ("All {0} drive(s) are SSD/NVMe - SysMain tuning is safe." -f $checked) -Level OK
+    Write-Log ("All {0} drive(s) confirmed SSD/NVMe - SysMain tuning is safe." -f $checked) -Level OK
 
     # ---- Detect OS build ----
     $__osBuild = $null
     try {
         $__osBuild = [int](Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).BuildNumber
     } catch {
-        Write-Log ("  [WARN] Could not determine OS build: {0}" -f $_.Exception.Message) -Level WARN
+        Write-Log ("  [ERROR] Could not determine OS build: {0}" -f $_.Exception.Message) -Level ERROR
+    }
+
+    # [FIX-AUD-13] Fail closed if OS build is unknown. Previously the
+    # code fell through to the Windows 10 branch (because
+    # `$null -ge 22000` is $false), which could disable SysMain on an
+    # unknown-OS system — a different behavior than intended. Better
+    # to skip the step entirely.
+    if (-not $__osBuild -or $__osBuild -le 0) {
+        Write-Log 'OS build could not be determined — skipping Step 45 for safety.' -Level WARN
+        Write-Log '[INFO] Step 45 skipped: OS build unknown.' -Level INFO
+        $Script:LastStepDetail = 'Skipped: OS build unknown'
+        return
     }
 
     # [FIX-TIER1-NTFS-ACCESS] Disable NTFS last-access timestamp
@@ -12859,14 +12936,19 @@ function Invoke-Step46 {
         $currentMode = (Get-ItemProperty -Path $doPath -Name 'DODownloadMode' -ErrorAction SilentlyContinue).DODownloadMode
     } catch { }
 
+    # [FIX-AUD-11] Mode descriptions corrected to current Microsoft docs:
+    #   0 = HTTP only (no peer-to-peer at all)
+    #   1 = LAN peers only (Windows 11 client default)
+    #   2 = Group peers only (was previously mislabelled "deprecated")
+    #   3 = Internet + LAN peers (legacy Windows 10 client default)
     $currentText = switch ($currentMode) {
-        0       { 'HTTP only (no P2P)' }
-        1       { 'LAN only' }
-        2       { 'Internet only (deprecated)' }
-        3       { 'Internet + LAN (Windows default)' }
+        0       { 'HTTP only (no peer-to-peer)' }
+        1       { 'LAN peers only (Win 11 default)' }
+        2       { 'Group peers only' }
+        3       { 'Internet + LAN peers (legacy Win 10 default)' }
         99      { 'Simple mode' }
         100     { 'Bypass mode' }
-        default { 'Not configured' }
+        default { 'Not configured (Windows default is mode 1)' }
     }
 
     Write-Log ("Current DODownloadMode = {0} ({1})" -f $currentMode, $currentText) -Level INFO
@@ -12880,7 +12962,12 @@ function Invoke-Step46 {
     # ---- Confirm ----
     Write-Host ''
     Write-Log 'About to set Delivery Optimization to LAN-only (mode 1).' -Level WARN
-    Write-Log 'Effect: Microsoft downloads stay fast, peer uploads stop.' -Level INFO
+    # [FIX-AUD-11] The old text claimed "peer uploads stop" for mode 1,
+    # which is wrong: mode 1 still allows LAN peer sharing. Only mode 0
+    # disables all peer-to-peer.
+    Write-Log 'Effect: Microsoft downloads stay fast; LAN peer sharing allowed.' -Level INFO
+    Write-Log '        Uploads to Internet peers stop; LAN uploads continue.' -Level INFO
+    Write-Log '        For zero peer sharing (including LAN), use mode 0.' -Level INFO
 
     if (-not (Confirm-Action -Query 'Limit Delivery Optimization to LAN-only sharing?')) {
         Write-Log 'Step 46 skipped by user.' -Level WARN
@@ -12896,7 +12983,20 @@ function Invoke-Step46 {
         Write-Log '  [OK] DODownloadMode set to 1 (LAN-only).' -Level OK
         # P3: Step 46 rollback entries
         # [FIX-STEP46-HKLM] HKLM path — RegistryHKLM label for the manifest.
-        Add-RollbackEntry -Step 46 -Type 'RegistryHKLM' -Data @{ Path = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DeliveryOptimization\Config'; Name = 'DODownloadMode'; Existed = $false; Value = $null; Type = 'DWord' }
+        # [FIX-AUD-10] Use the actual current value, not hardcoded
+        # ($false, $null). Rollback must restore $currentMode (any of
+        # 0/1/2/3/99/100) if the value existed, or delete the property
+        # if it did not. The old hardcoded values caused -Rollback to
+        # DELETE the DODownloadMode property even when the user had
+        # explicitly configured it, silently losing their setting.
+        $__doExisted = ($null -ne $currentMode)
+        Add-RollbackEntry -Step 46 -Type 'RegistryHKLM' -Data @{
+            Path    = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DeliveryOptimization\Config'
+            Name    = 'DODownloadMode'
+            Existed = $__doExisted
+            Value   = if ($__doExisted) { $currentMode } else { $null }
+            Type    = 'DWord'
+        }
     } catch {
         Write-Log ("  [WARN] Could not set DODownloadMode: {0}" -f $_.Exception.Message) -Level WARN
         return
@@ -13828,9 +13928,21 @@ function Invoke-RollbackMode {
     $entries = @()
     try {
         $lines = Get-Content -LiteralPath $ManifestPath -ErrorAction Stop
+        # [FIX-AUD-14] Reject corrupt manifest lines instead of silently
+        # skipping them. Previously a 20-entry manifest with 1 corrupt
+        # line would silently restore 19 and drop the 20th — the user
+        # has no way to know partial rollback occurred. Fail closed.
+        $__lineNo = 0
         foreach ($line in $lines) {
+            $__lineNo++
             if ([string]::IsNullOrWhiteSpace($line)) { continue }
-            try { $entries += ($line | ConvertFrom-Json) } catch { }
+            try {
+                $entries += ($line | ConvertFrom-Json)
+            } catch {
+                Write-Host ("  [ERROR] Manifest line {0} is corrupt: {1}" -f $__lineNo, $_.Exception.Message) -ForegroundColor Red
+                Write-Host '  Refusing partial rollback. Restore the manifest, or use -RollbackFrom with a validated file.' -ForegroundColor Red
+                return
+            }
         }
     } catch {
         Write-Host ("Could not read manifest: {0}" -f $_.Exception.Message) -ForegroundColor Red
@@ -13898,19 +14010,7 @@ function Invoke-RollbackMode {
                     }
                     $ok++
                 }
-                'RegistryHKLM' {
-                    # [FIX-REGISTRYHKLM] Same restore/remove semantics as
-                    # RegistryHKCU. The path prefix (HKLM:) is stored in
-                    # Data.Path and used directly.
-                    if ($e.Data.Existed) {
-                        New-ItemProperty -Path $e.Data.Path -Name $e.Data.Name -Value $e.Data.Value -PropertyType $e.Data.Type -Force -ErrorAction Stop | Out-Null
-                        Write-Host ("  OK   {0}: restored {1}\{2}" -f $label, $e.Data.Path, $e.Data.Name) -ForegroundColor Green
-                    } else {
-                        Remove-ItemProperty -Path $e.Data.Path -Name $e.Data.Name -Force -ErrorAction SilentlyContinue
-                        Write-Host ("  OK   {0}: removed {1}\{2}" -f $label, $e.Data.Path, $e.Data.Name) -ForegroundColor Green
-                    }
-                    $ok++
-                }
+
                 default {
                     Write-Host ("  SKIP {0}: unknown type" -f $label) -ForegroundColor DarkGray
                     $skip++
@@ -15307,10 +15407,10 @@ function Invoke-Step56 {
     Write-Log 'STEP 56: Security Posture Audits' -Level STEP
     Write-Log ('-' * 60) -Level STEP
 
-    if ($Script:DryRun) {
-        Write-Log 'Would audit 7 security controls (report-only in DryRun).' -Level PREVIEW
-        return
-    }
+    # [FIX-AUD-8] Audit is read-only — the early return was backwards.
+    # DryRun exists so users see what would be done, not so they see
+    # nothing. All 7 checks now run in every mode; each write block
+    # below checks $Script:DryRun before actually changing state.
 
     # ---- 1. WebClient (WebDAV) ----
     Write-Log 'Audit 1/7: WebClient (WebDAV / NTLM relay)' -Level INFO
@@ -15328,12 +15428,26 @@ function Invoke-Step56 {
             Write-Log '         WebDAV/SharePoint depend on WebClient on managed networks.' -Level WARN
             Write-Log '         To override, disable it manually:  sc config WebClient start= disabled' -Level WARN
         } elseif ($wcStart -ne 'Disabled' -and $Script:DisableWebClient) {
-            try {
-                Set-Service -Name 'WebClient' -StartupType Disabled -ErrorAction Stop
-                if ($wcSvc.Status -eq 'Running') { Stop-Service -Name 'WebClient' -Force -ErrorAction SilentlyContinue }
-                Write-Log '  [OK] WebClient set to Disabled.' -Level OK
-            } catch {
-                Write-Log ("  [WARN] Could not disable WebClient: {0}" -f $_.Exception.Message) -Level WARN
+            # [FIX-AUD-6+AUD-8] DryRun: report what would happen without
+            # actually stopping/disabling the service. Full run: record
+            # rollback BEFORE change so -Rollback can restore it.
+            if ($Script:DryRun) {
+                Write-Log '  [PREVIEW] Would set WebClient to Disabled and stop if running.' -Level PREVIEW
+            } else {
+                $__wcWasRunning = ($wcSvc.Status -eq 'Running')
+                Add-RollbackEntry -Step 56 -Type 'Service' -Data @{
+                    Name           = 'WebClient'
+                    OriginalStart  = $wcStart
+                    NewStart       = 'Disabled'
+                    OriginalStatus = $(if ($__wcWasRunning) { 'Running' } else { 'Stopped' })
+                }
+                try {
+                    Set-Service -Name 'WebClient' -StartupType Disabled -ErrorAction Stop
+                    if ($wcSvc.Status -eq 'Running') { Stop-Service -Name 'WebClient' -Force -ErrorAction SilentlyContinue }
+                    Write-Log '  [OK] WebClient set to Disabled.' -Level OK
+                } catch {
+                    Write-Log ("  [WARN] Could not disable WebClient: {0}" -f $_.Exception.Message) -Level WARN
+                }
             }
         } elseif ($wcStart -ne 'Disabled') {
             Write-Log '  Recommendation: run with -DisableWebClient to harden.' -Level INFO
@@ -15356,12 +15470,24 @@ function Invoke-Step56 {
     if ($wpadPresent) {
         Write-Log '  [OK] WPAD already blocked in hosts file.' -Level OK
     } elseif ($Script:AddWpadHostsEntry) {
-        try {
-            $lines = @('', '# WinTune - WPAD block', '0.0.0.0 wpad', '0.0.0.0 wpad.*')
-            Add-Content -LiteralPath $hostsPath -Value $lines -Encoding ASCII -ErrorAction Stop
-            Write-Log '  [OK] WPAD hosts entry added.' -Level OK
-        } catch {
-            Write-Log ("  [WARN] Could not write hosts file: {0}" -f $_.Exception.Message) -Level WARN
+        if ($Script:DryRun) {
+            Write-Log '  [PREVIEW] Would append 0.0.0.0 wpad to hosts file.' -Level PREVIEW
+        } else {
+            try {
+                # [FIX-AUD-9] Windows hosts file does not support
+                # wildcards. The old '0.0.0.0 wpad.*' line was inert —
+                # it created a literal hostname "wpad.*" that never
+                # matched anything. Hosts-file blocking only covers the
+                # literal 'wpad' hostname. For complete protection use
+                # Group Policy: Computer Configuration > Administrative
+                # Templates > Network > DNS Client > Turn off Multicast
+                # Name Resolution, plus WinHTTP DisableWpad (Step 30).
+                $lines = @('', '# WinTune - WPAD block', '0.0.0.0 wpad')
+                Add-Content -LiteralPath $hostsPath -Value $lines -Encoding ASCII -ErrorAction Stop
+                Write-Log '  [OK] WPAD hosts entry added.' -Level OK
+            } catch {
+                Write-Log ("  [WARN] Could not write hosts file: {0}" -f $_.Exception.Message) -Level WARN
+            }
         }
     } else {
         Write-Log '  Missing. Run with -AddWpadHostsEntry to harden.' -Level INFO
@@ -15397,12 +15523,25 @@ function Invoke-Step56 {
     if ($sblEnabled -eq 1) {
         Write-Log '  [OK] ScriptBlockLogging enabled.' -Level OK
     } elseif ($Script:EnableScriptBlockLogging) {
-        try {
-            if (-not (Test-Path -LiteralPath $sblPath)) { New-Item -Path $sblPath -Force | Out-Null }
-            New-ItemProperty -Path $sblPath -Name 'EnableScriptBlockLogging' -Value 1 -PropertyType DWord -Force -ErrorAction Stop | Out-Null
-            Write-Log '  [OK] ScriptBlockLogging enabled.' -Level OK
-        } catch {
-            Write-Log ("  [WARN] Could not enable ScriptBlockLogging: {0}" -f $_.Exception.Message) -Level WARN
+        if ($Script:DryRun) {
+            Write-Log '  [PREVIEW] Would enable ScriptBlockLogging registry value.' -Level PREVIEW
+        } else {
+            # [FIX-AUD-7] Record original state before writing.
+            $__sblExisted = ($null -ne $sblEnabled)
+            Add-RollbackEntry -Step 56 -Type 'RegistryHKLM' -Data @{
+                Path    = $sblPath
+                Name    = 'EnableScriptBlockLogging'
+                Existed = $__sblExisted
+                Value   = if ($__sblExisted) { $sblEnabled } else { $null }
+                Type    = 'DWord'
+            }
+            try {
+                if (-not (Test-Path -LiteralPath $sblPath)) { New-Item -Path $sblPath -Force | Out-Null }
+                New-ItemProperty -Path $sblPath -Name 'EnableScriptBlockLogging' -Value 1 -PropertyType DWord -Force -ErrorAction Stop | Out-Null
+                Write-Log '  [OK] ScriptBlockLogging enabled.' -Level OK
+            } catch {
+                Write-Log ("  [WARN] Could not enable ScriptBlockLogging: {0}" -f $_.Exception.Message) -Level WARN
+            }
         }
     } else {
         Write-Log '  Not configured. Run with -EnableScriptBlockLogging to harden.' -Level INFO
