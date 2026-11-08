@@ -482,7 +482,6 @@ $Script:StepNames = @{
     57 = 'Advanced System Tweaks'
     58 = 'DNS Resolver Benchmark'
     59 = 'Sandbox / WSL / Dev Drive Audit'
-    60 = 'Aggressive Startup Purge'
     '1b' = 'SSD Fullness Check'
     '8b' = 'Driver Update Audit + Install (Detached)'
 }
@@ -548,7 +547,6 @@ $Script:StepDescriptions = @{
     '57' = 'Applied advanced tweaks (hibernation, HPET, modern standby, registry backup).'
     '58' = 'Benchmarked DNS resolvers and switched to the fastest (home/SMB only).'
     '59' = 'Audited and optionally enabled Windows Sandbox, WSL, and Dev Drive capability.'
-    '60' = 'Aggressively disabled or purged all startup entries (opt-in via -AllowAggressiveStartupPurge).'
 }
 
 
@@ -11274,6 +11272,55 @@ function Invoke-Step38 {
     # PHASE 3: Classify and display
     # ================================================================
     $allEntries     = @($startupEntries) + @($taskEntries)
+
+    # [FIX-MERGE-AGGRESSIVE] Aggressive mode: Run/RunOnce/folder entries become
+    # disable candidates regardless of signature, except the small critical
+    # keep list. Scheduled tasks keep signature classification because they
+    # entangle with system components (Update Orchestrator, Google Update,
+    # Intune Health Eval) and shouldn't be aggressively touched.
+    $__aggressiveMode = $Script:AllowAggressiveStartupPurge
+    $__purgeMode = $__aggressiveMode -and $Script:PurgeStartupEntries
+
+    if ($__aggressiveMode) {
+        $__criticalKeep = @(
+            'RtkAudUService64*'      # Realtek audio - no sound at boot if disabled
+            'SecurityHealth*'        # Defender tray - status invisible if disabled
+            '*Proton VPN NRPT*'      # VPN split-tunnel DNS - VPN silently breaks
+        )
+        if ($Script:IncludeCriticalStartup) {
+            $__criticalKeep = @()
+            Write-Log '  [WARN] -IncludeCriticalStartup supplied: no entries are protected.' -Level WARN
+        }
+        if ($Script:StartupPurgeKeepNames.Count -gt 0) {
+            $__criticalKeep += $Script:StartupPurgeKeepNames
+            Write-Log ("  Custom keep-list: {0}" -f ($Script:StartupPurgeKeepNames -join ', ')) -Level INFO
+        }
+        if ($__criticalKeep.Count -gt 0) {
+            Write-Log ("  Protecting: {0}" -f ($__criticalKeep -join ', ')) -Level INFO
+        }
+
+        foreach ($__e in $allEntries) {
+            # Only affect Run/RunOnce/folder entries; leave tasks classified as-is
+            if ($__e.Location -match '^\\' -or $__e.Location -match '\Startup') {
+                if ($__e.Location -match '\Startup' -and $__e.Location -notmatch 'StartupApproved') {
+                    # Startup folder entry
+                    $__isTask = $false
+                } else {
+                    $__isTask = ($__e.Location -match '^\\')
+                }
+            } else {
+                $__isTask = $false
+            }
+            if ($__isTask) { continue }
+
+            $__matchKeep = $false
+            foreach ($__p in $__criticalKeep) {
+                if ($__e.Name -like $__p) { $__matchKeep = $true; break }
+            }
+            $__e.Kind = if ($__matchKeep) { 'Keep' } else { 'Disable' }
+        }
+    }
+
     $keepEntries    = @($allEntries | Where-Object { $_.Kind -eq 'Keep' })
     $disableEntries = @($allEntries | Where-Object { $_.Kind -eq 'Disable' })
 
@@ -11329,6 +11376,25 @@ function Invoke-Step38 {
             finally { Remove-Item $tempReg -Force -ErrorAction SilentlyContinue }
         }
 
+        # [FIX-MERGE-BACKUP] Also back up StartupApproved keys so that
+        # disabled bits (which aggressive mode writes) can be reverted.
+        # Without this, undoing a Step 38 aggressive run required manual
+        # Task Manager clicks for every entry.
+        $__approvedBackupKeys = @(
+            'HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved'
+            'HKLM\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved'
+        )
+        foreach ($__ak in $__approvedBackupKeys) {
+            $__tempReg = [System.IO.Path]::GetTempFileName() + '.reg'
+            try {
+                $null = & reg.exe export $__ak $__tempReg /y 2>&1
+                if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $__tempReg)) {
+                    [void]$regExports.Add((Get-Content -LiteralPath $__tempReg -Raw))
+                }
+            } catch { }
+            finally { Remove-Item $__tempReg -Force -ErrorAction SilentlyContinue }
+        }
+
         if ($regExports.Count -gt 0) {
             $merged = $regExports[0]
             for ($i = 1; $i -lt $regExports.Count; $i++) {
@@ -11352,9 +11418,19 @@ function Invoke-Step38 {
     # ================================================================
     Write-Host ''
 
-    $autoApprove = $Script:AllowPersistenceAction -and $Script:YesToAll
+    # [FIX-MERGE-NOPROMPT] Aggressive mode = batch operation, no prompts.
+    # Otherwise preserve the existing safe-mode gate.
+    $autoApprove = if ($__aggressiveMode) { $true } else { $Script:AllowPersistenceAction -and $Script:YesToAll }
 
-    if (-not $autoApprove) {
+    if ($__aggressiveMode) {
+        if ($__purgeMode) {
+            Write-Log '  AGGRESSIVE PURGE MODE: deleting all non-critical Run/RunOnce/folder entries.' -Level WARN
+            Write-Log '  Scheduled tasks remain on signature classification (disabled, never deleted).' -Level INFO
+            Write-Log '  .reg backup written above - restore by double-clicking it.' -Level WARN
+        } else {
+            Write-Log '  AGGRESSIVE DISABLE MODE: disabling all non-critical Run/RunOnce/folder entries.' -Level WARN
+        }
+    } elseif (-not $autoApprove) {
         if (-not (Confirm-Action -Query ('Process {0} non-essential entries?' -f $disableEntries.Count))) {
             Write-Log 'Step 38 action declined by user.' -Level WARN
             return
@@ -11396,6 +11472,28 @@ function Invoke-Step38 {
                 Disable-ScheduledTask -TaskPath $e.Location -TaskName $e.Name -ErrorAction Stop | Out-Null
                 Write-Log ("  [DISABLED TASK] {0}{1}" -f $e.Location, $e.Name) -Level OK
                 $tasksDisabled++
+            } catch {
+                Write-Log ("  [FAIL] {0}: {1}" -f $e.Name, $_.Exception.Message) -Level WARN
+                $failed++
+            }
+            continue
+        }
+
+        # [FIX-MERGE-PURGE] Purge mode: delete registry value / startup .lnk
+        if ($__purgeMode) {
+            try {
+                if ($e.Location -like 'HK*') {
+                    Remove-ItemProperty -LiteralPath $e.Location -Name $e.Name -Force -ErrorAction Stop
+                    Write-Log ("  [PURGED REG] {0}" -f $e.Name) -Level OK
+                    $startupDisabled++
+                } elseif (Test-Path -LiteralPath $e.Command -ErrorAction SilentlyContinue) {
+                    Remove-Item -LiteralPath $e.Command -Force -ErrorAction Stop
+                    Write-Log ("  [PURGED LNK] {0}" -f $e.Name) -Level OK
+                    $startupDisabled++
+                } else {
+                    Write-Log ("  [SKIP] {0} - target already gone" -f $e.Name) -Level INFO
+                    $kept++
+                }
             } catch {
                 Write-Log ("  [FAIL] {0}: {1}" -f $e.Name, $_.Exception.Message) -Level WARN
                 $failed++
@@ -11474,8 +11572,33 @@ function Invoke-Step38 {
                 $failed++
             }
         } else {
-            Write-Log ("  [SKIP] {0} - startup folder entries not auto-disabled" -f $e.Name) -Level WARN
-            $kept++
+            # [FIX-MERGE-LNK] Aggressive mode: disable startup-folder .lnk via
+            # StartupApproved\StartupFolder (same mechanism Task Manager uses).
+            if ($__aggressiveMode) {
+                $__sfPath = if ($e.Location -match 'ProgramData') {
+                    'HKLM:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder'
+                } else {
+                    'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder'
+                }
+                try {
+                    if (-not (Test-Path -LiteralPath $__sfPath)) {
+                        New-Item -Path $__sfPath -Force -ErrorAction Stop | Out-Null
+                    }
+                    $__sfBytes = New-Object byte[] 12
+                    $__sfBytes[0] = 0x03
+                    $__sfFt = [BitConverter]::GetBytes([int64][DateTime]::UtcNow.ToFileTimeUtc())
+                    [Array]::Copy($__sfFt, 0, $__sfBytes, 4, 8)
+                    New-ItemProperty -Path $__sfPath -Name $e.Name -Value $__sfBytes -PropertyType Binary -Force -ErrorAction Stop | Out-Null
+                    Write-Log ("  [DISABLED LNK] {0}" -f $e.Name) -Level OK
+                    $startupDisabled++
+                } catch {
+                    Write-Log ("  [FAIL] {0}: {1}" -f $e.Name, $_.Exception.Message) -Level WARN
+                    $failed++
+                }
+            } else {
+                Write-Log ("  [SKIP] {0} - startup folder entries not auto-disabled in safe mode" -f $e.Name) -Level WARN
+                $kept++
+            }
         }
     }
 
@@ -14220,277 +14343,6 @@ function Invoke-Step59 {
     Write-Log 'Step 59 complete.' -Level OK
 }
 
-# ============================================================
-# STEP 60: Aggressive Startup Purge
-# ============================================================
-function Invoke-Step60 {
-    <#
-    .SYNOPSIS
-        Disables or purges ALL startup entries regardless of signature.
-    .DESCRIPTION
-        Aggressive complement to Step 38. Where Step 38 uses signature
-        classification to decide what's safe to disable, Step 60 disables
-        (or purges) everything except a small hardcoded critical list.
-
-        Modes:
-          -AllowAggressiveStartupPurge       Disable all non-critical
-          -AllowAggressiveStartupPurge + -PurgeStartupEntries
-                                             Purge (delete) all non-critical
-
-        Backs up Run + StartupApproved keys to a .reg file before any
-        change. Path logged at step start.
-
-        Domain-join: Purge mode refuses on domain-joined machines.
-        Disable mode is allowed everywhere.
-    #>
-    [CmdletBinding()]
-    param()
-
-    Write-Log 'STEP 60: Aggressive Startup Purge' -Level STEP
-    Write-Log ('-' * 60) -Level STEP
-
-    if (-not $Script:AllowAggressiveStartupPurge) {
-        Write-Log 'Step 60 blocked: -AllowAggressiveStartupPurge not supplied.' -Level INFO
-        Write-Log 'This is the safe default. To enable aggressive startup purge:' -Level INFO
-        Write-Log '  .\WinTune.ps1 -AllowAggressiveStartupPurge' -Level INFO
-        Write-Log '  Add -PurgeStartupEntries to also DELETE entries (irreversible).' -Level INFO
-        return
-    }
-
-    if ($Script:DryRun) {
-        $__mode = if ($Script:PurgeStartupEntries) { 'Purge' } else { 'Disable' }
-        Write-Log ("Would {0} all startup entries (except critical list)." -f $__mode) -Level PREVIEW
-        return
-    }
-
-    # ---- Domain-join guard for Purge mode ----
-    $__isDomain = $false
-    try { $__isDomain = [bool](Get-CimInstance Win32_ComputerSystem -EA SilentlyContinue).PartOfDomain } catch { }
-    if ($Script:PurgeStartupEntries -and $__isDomain) {
-        Write-Log 'Step 60: Purge mode refused on domain-joined machine.' -Level WARN
-        Write-Log '  GPO-managed startup entries will re-add on next policy refresh.' -Level WARN
-        Write-Log '  Purging managed entries wastes effort and may cause transient breakage.' -Level WARN
-        Write-Log '  Use -AllowAggressiveStartupPurge alone to disable instead of purge.' -Level INFO
-        return
-    }
-
-    $__mode = if ($Script:PurgeStartupEntries) { 'Purge' } else { 'Disable' }
-    Write-Log ("Mode: {0}" -f $__mode) -Level INFO
-
-    # ---- Build critical keep list ----
-    $__keep = @()
-    if (-not $Script:IncludeCriticalStartup) {
-        $__keep += @(
-            'RtkAudUService64*'      # Realtek audio - no sound at boot if disabled
-            'SecurityHealth*'        # Defender tray - status invisible if disabled
-            '*Proton VPN NRPT*'      # VPN split-tunnel DNS - VPN silently breaks
-        )
-        Write-Log '  Protecting critical entries: Realtek audio, Defender tray, Proton VPN NRPT' -Level INFO
-        Write-Log '  Use -IncludeCriticalStartup to also disable those (dangerous).' -Level INFO
-    } else {
-        Write-Log '  -IncludeCriticalStartup supplied: NO entries are protected.' -Level WARN
-    }
-    if ($Script:StartupPurgeKeepNames.Count -gt 0) {
-        $__keep += $Script:StartupPurgeKeepNames
-        Write-Log ("  Custom keep-list: {0}" -f ($Script:StartupPurgeKeepNames -join ', ')) -Level INFO
-    }
-
-    function __Test-Keep {
-        param([string]$Name, [string[]]$Patterns)
-        foreach ($p in $Patterns) { if ($Name -like $p) { return $true } }
-        return $false
-    }
-
-    function __Get-TargetPath {
-        param([string]$Command)
-        if ([string]::IsNullOrWhiteSpace($Command)) { return $null }
-        $c = $Command -replace '"', ''
-        $c = $c.Trim()
-        if ($c -match '^(.+?\.(exe|dll|bat|cmd|com|ps1|lnk|url))(\s|$)') { $c = $Matches[1].Trim() }
-        return [Environment]::ExpandEnvironmentVariables($c)
-    }
-
-    # ---- Enumerate all startup entries ----
-    $__runKeys = @(
-        @{ Hive='HKCU'; Path='Software\Microsoft\Windows\CurrentVersion\Run';                 Type='Run'    }
-        @{ Hive='HKCU'; Path='Software\Microsoft\Windows\CurrentVersion\RunOnce';             Type='RunOnce'}
-        @{ Hive='HKLM'; Path='Software\Microsoft\Windows\CurrentVersion\Run';                 Type='Run'    }
-        @{ Hive='HKLM'; Path='Software\Microsoft\Windows\CurrentVersion\RunOnce';             Type='RunOnce'}
-        @{ Hive='HKLM'; Path='Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run';     Type='Run32'  }
-        @{ Hive='HKLM'; Path='Software\WOW6432Node\Microsoft\Windows\CurrentVersion\RunOnce'; Type='Run32'  }
-    )
-
-    $__entries = New-Object System.Collections.ArrayList
-    foreach ($k in $__runKeys) {
-        $__full = "$($k.Hive):\$($k.Path)"
-        if (-not (Test-Path -LiteralPath $__full)) { continue }
-        try {
-            $__props = Get-ItemProperty -LiteralPath $__full -ErrorAction Stop
-            foreach ($p in $__props.PSObject.Properties) {
-                if ($p.Name -like 'PS*') { continue }
-                if ($p.Name -eq '(default)') { continue }
-                if ([string]::IsNullOrWhiteSpace([string]$p.Value)) { continue }
-                [void]$__entries.Add([PSCustomObject]@{
-                    Name=$p.Name; Command=[string]$p.Value; Source='Registry'
-                    Location=$__full; RegType=$k.Type
-                })
-            }
-        } catch { }
-    }
-
-    $__folders = @(
-        @{ Path=(Join-Path $env:APPDATA     'Microsoft\Windows\Start Menu\Programs\Startup'); Label='UserStartup'   }
-        @{ Path=(Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\Startup'); Label='PublicStartup' }
-    )
-    foreach ($f in $__folders) {
-        if (-not (Test-Path -LiteralPath $f.Path)) { continue }
-        try {
-            $__files = Get-ChildItem -LiteralPath $f.Path -File -EA Stop | Where-Object { $_.Extension -in '.lnk','.url' }
-            foreach ($lnk in $__files) {
-                [void]$__entries.Add([PSCustomObject]@{
-                    Name=$lnk.Name; Command=$lnk.FullName; Source='StartupFolder'
-                    Location=$f.Path; RegType=$f.Label
-                })
-            }
-        } catch { }
-    }
-
-    Write-Log ("Enumerated {0} startup entries." -f $__entries.Count) -Level INFO
-
-    if ($__entries.Count -eq 0) {
-        Write-Log '  No startup entries found. Nothing to do.' -Level OK
-        return
-    }
-
-    # ---- Backup to .reg before any change ----
-    $__bak = Join-Path $Script:ScriptDir ("StartupBackup60_{0}.reg" -f $Script:RunStamp)
-    $__regKeys = @(
-        'HKCU\Software\Microsoft\Windows\CurrentVersion\Run'
-        'HKCU\Software\Microsoft\Windows\CurrentVersion\RunOnce'
-        'HKLM\Software\Microsoft\Windows\CurrentVersion\Run'
-        'HKLM\Software\Microsoft\Windows\CurrentVersion\RunOnce'
-        'HKLM\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run'
-        'HKLM\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\RunOnce'
-        'HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved'
-        'HKLM\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved'
-    )
-    $__parts = @('Windows Registry Editor Version 5.00', '')
-    $__exported = 0
-    foreach ($rk in $__regKeys) {
-        $__tmp = Join-Path $env:TEMP ("WTSB60_{0}.reg" -f [Guid]::NewGuid().ToString('N'))
-        try {
-            $null = & reg.exe export $rk $__tmp /y 2>&1
-            if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $__tmp)) {
-                $__body = (Get-Content -LiteralPath $__tmp -Raw) -replace '^Windows Registry Editor Version 5\.00\r?\n\r?\n', ''
-                $__parts += $__body.TrimEnd()
-                $__parts += ''
-                $__exported++
-            }
-        } catch { }
-        finally { Remove-Item -LiteralPath $__tmp -Force -EA SilentlyContinue }
-    }
-    if ($__exported -gt 0) {
-        Set-Content -LiteralPath $__bak -Value $__parts -Encoding Unicode
-        Write-Log ("  [BACKUP] {0}" -f $__bak) -Level OK
-    } else {
-        Write-Log '  [WARN] Could not write .reg backup - refusing to proceed.' -Level WARN
-        Write-Log '  No changes made.' -Level INFO
-        return
-    }
-
-    # ---- Map for StartupApproved lookup ----
-    $__approvedMap = @{
-        'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'                 = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run'
-        'HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce'             = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run32'
-        'HKLM:\Software\Microsoft\Windows\CurrentVersion\Run'                 = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run'
-        'HKLM:\Software\Microsoft\Windows\CurrentVersion\RunOnce'             = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run32'
-        'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run'     = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run32'
-        'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\RunOnce' = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run32'
-    }
-
-    # ---- Process each entry ----
-    $__kept = 0; $__actioned = 0; $__failed = 0
-
-    foreach ($e in $__entries) {
-        if (__Test-Keep -Name $e.Name -Patterns $__keep) {
-            Write-Log ("  [KEPT] {0} (critical list)" -f $e.Name) -Level OK
-            $__kept++
-            continue
-        }
-
-        try {
-            if ($__mode -eq 'Disable') {
-                $__approvedPath = $null
-                if ($__approvedMap.ContainsKey($e.Location)) {
-                    $__approvedPath = $__approvedMap[$e.Location]
-                } elseif ($e.Source -eq 'StartupFolder') {
-                    if ($e.Location -match 'APPDATA') {
-                        $__approvedPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder'
-                    } else {
-                        $__approvedPath = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder'
-                    }
-                }
-
-                if (-not $__approvedPath) {
-                    Write-Log ("  [SKIP] {0} - no StartupApproved mapping for {1}" -f $e.Name, $e.Location) -Level WARN
-                    continue
-                }
-
-                # Preserve existing byte length + timestamp if present
-                $__existing = $null
-                try {
-                    $__ap = Get-ItemProperty -Path $__approvedPath -Name $e.Name -EA SilentlyContinue
-                    if ($__ap -and $__ap.PSObject.Properties[$e.Name]) {
-                        $__existing = $__ap.PSObject.Properties[$e.Name].Value
-                    }
-                } catch { }
-
-                $__bytes = $null
-                if ($__existing -is [byte[]] -and $__existing.Length -in @(8, 12)) {
-                    $__bytes = New-Object byte[] $__existing.Length
-                    [Array]::Copy($__existing, $__bytes, $__existing.Length)
-                    $__bytes[0] = 0x03
-                } else {
-                    $__bytes = New-Object byte[] 12
-                    $__bytes[0] = 0x03
-                    $__ft = [BitConverter]::GetBytes([int64][DateTime]::UtcNow.ToFileTimeUtc())
-                    [Array]::Copy($__ft, 0, $__bytes, 4, 8)
-                }
-
-                if (-not (Test-Path -LiteralPath $__approvedPath)) {
-                    New-Item -Path $__approvedPath -Force -EA Stop | Out-Null
-                }
-                New-ItemProperty -Path $__approvedPath -Name $e.Name -Value $__bytes -PropertyType Binary -Force -EA Stop | Out-Null
-                Write-Log ("  [DISABLED] {0}" -f $e.Name) -Level OK
-                $__actioned++
-            }
-            else {
-                # Purge mode
-                if ($e.Source -eq 'Registry') {
-                    Remove-ItemProperty -LiteralPath $e.Location -Name $e.Name -Force -EA Stop
-                } elseif ($e.Source -eq 'StartupFolder') {
-                    Remove-Item -LiteralPath $e.Command -Force -EA Stop
-                }
-                Write-Log ("  [PURGED] {0}" -f $e.Name) -Level OK
-                $__actioned++
-            }
-        } catch {
-            Write-Log ("  [FAIL] {0}: {1}" -f $e.Name, $_.Exception.Message) -Level WARN
-            $__failed++
-        }
-    }
-
-    # ---- Summary ----
-    Write-Log '' -Level INFO
-    Write-Log ("Step 60 summary ({0} mode): {1} processed, {2} kept, {3} failed" -f $__mode, $__actioned, $__kept, $__failed) -Level INFO
-    Write-Log ("  Backup: {0}" -f $__bak) -Level INFO
-    if ($__mode -eq 'Disable') {
-        Write-Log '  Rollback: Task Manager -> Startup tab -> right-click -> Enable' -Level INFO
-    } else {
-        Write-Log '  Rollback: double-click the .reg backup, then sign out / back in' -Level INFO
-    }
-    Write-Log 'Step 60 complete.' -Level OK
-}
 
 # ============================================================
 # HTML REPORT GENERATOR
@@ -15817,7 +15669,6 @@ function Main {
         'Invoke-Step57'
         'Invoke-Step58'
         'Invoke-Step59'
-        'Invoke-Step60'
             )
 
         for ($i = 0; $i -lt $stepFunctions.Count; $i++) {
