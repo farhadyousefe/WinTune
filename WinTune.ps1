@@ -294,6 +294,12 @@ $Script:AllowPersistenceAction = $AllowPersistenceAction.IsPresent
 if ($Script:RemoveStartups -and -not $Script:AllowPersistenceAction) {
     $Script:AllowPersistenceAction = $true
 }
+# [FIX-REMOVESTARTUPS-ALIAS] -RemoveStartups was documented in v3.1
+# but never read. Step 38's real gate is -AllowPersistenceAction.
+# Alias the deprecated flag so both work.
+if ($Script:RemoveStartups -and -not $Script:AllowPersistenceAction) {
+    $Script:AllowPersistenceAction = $true
+}
 $Script:AllowAutoRunDisable = $AllowAutoRunDisable.IsPresent
 $Script:AllowScheduledTaskAction = $AllowScheduledTaskAction.IsPresent
 $Script:DisableWebClient         = $DisableWebClient.IsPresent
@@ -391,6 +397,11 @@ $SkipSteps = @($__merged | Sort-Object)
 # BEFORE the preset switch ran. Without this line, -Preset Quick /
 # Safe / Weekly silently ran every step (no-op presets).
 $Script:SkipSteps = $SkipSteps
+# [FIX-PRESET-WIRING] Preset merge wrote to local $SkipSteps, but
+# Test-StepEnabled reads $Script:SkipSteps — which was snapshotted
+# BEFORE the preset switch ran. Without this line, -Preset Quick /
+# Safe / Weekly silently ran every step (no-op presets).
+$Script:SkipSteps = $SkipSteps
 
 $Script:FeatureUpdateDelayDays = $FeatureUpdateDelayDays
 
@@ -401,6 +412,9 @@ $Script:LockStream          = $null
 $Script:RebootRequired      = $false
 $Script:RebootReasons       = @()
 $Script:LastStepStatus      = $null   # set by steps that want non-default report status
+# [FIX-STEP38-PURGE] Per-step detail override + Step 38 purge manifest.
+$Script:LastStepDetail      = $null
+$Script:LastStepPurgedStartups = $null
 
 # Detached runner tracking (populated by Fix A / Fix B / Fix C)
 #   Key: PID (int)
@@ -11063,114 +11077,326 @@ function Get-PersistenceClassification {
 }
 
 # ============================================================
-# STEP 38: Startup and Logon Persistence Management
+# STEP 38 HELPERS
 # ============================================================
-function Invoke-Step38 {
-    <#
-    .SYNOPSIS
-        Enumerates startup entries and logon/boot scheduled tasks,
-        classifies each as Keep or Disable via signature checking,
-        and (with user approval) disables the non-essential ones.
+function Resolve-StartupShortcut {
+    param([Parameter(Mandatory)][string]$ShortcutPath)
+    $result = [PSCustomObject]@{
+        TargetExe  = $null
+        Arguments  = $null
+        Resolved   = $false
+        Reason     = ''
+    }
+    if (-not (Test-Path -LiteralPath $ShortcutPath)) {
+        $result.Reason = 'shortcut file not found'
+        return $result
+    }
+    $ext = [System.IO.Path]::GetExtension($ShortcutPath).ToLowerInvariant()
+    if ($ext -ne '.lnk') {
+        $result.Reason = "unsupported extension '$ext'"
+        return $result
+    }
+    try {
+        $wsh = New-Object -ComObject WScript.Shell
+        $sc  = $wsh.CreateShortcut($ShortcutPath)
+        if ($sc.TargetPath) {
+            $result.TargetExe = $sc.TargetPath
+            $result.Arguments = $sc.Arguments
+            $result.Resolved  = $true
+            $result.Reason    = 'resolved'
+        } else {
+            $result.Reason = 'shortcut has no TargetPath'
+        }
+        [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($wsh)
+    } catch {
+        $result.Reason = ('COM error: ' + $_.Exception.Message)
+    }
+    return $result
+}
 
-    .DESCRIPTION
-        Sources:
-          * HKCU/HKLM Run + RunOnce keys (6 locations)
-          * User + All-Users Startup folders
-          * Scheduled tasks with LogonTrigger or BootTrigger
-            (excluding Microsoft-owned tasks under \Microsoft\)
+function Get-CommandPayload {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$CommandLine)
+    $result = [PSCustomObject]@{
+        Executable = ''
+        Hosted     = $false
+        Confidence = 'Unknown'
+    }
+    if ([string]::IsNullOrWhiteSpace($CommandLine)) { return $result }
 
-        Classification: Get-PersistenceClassification (signature-based)
-          * Keep: signed by Microsoft, hardware vendor, security vendor,
-            sync client, or input device vendor
-          * Disable: unsigned, unknown publisher, or stale (file missing)
+    $raw = $CommandLine.Trim()
+    $exe = $null
+    # [FIX-V7-2] Handle redundant wrapping quotes. Some vendors
+    # (notably Realtek) register scheduled tasks with the command
+    # already quoted, then the arguments concatenation adds another
+    # layer, producing ""C:\path\foo.exe"" -arg. Try the multi-quote
+    # forms BEFORE the single-quote forms. Trailing (\s|$) ensures
+    # we don't match inside a path that happens to contain a quote.
+    if     ($raw -match '^"{3}([^"]+?)"{3}(\s|$)') { $exe = $Matches[1] }
+    elseif ($raw -match '^"{2}([^"]+?)"{2}(\s|$)') { $exe = $Matches[1] }
+    elseif ($raw -match "^'{3}([^']+?)'{3}(\s|$)") { $exe = $Matches[1] }
+    elseif ($raw -match "^'{2}([^']+?)'{2}(\s|$)") { $exe = $Matches[1] }
+    elseif ($raw -match '^"([^"]+)"(\s|$)')        { $exe = $Matches[1] }
+    elseif ($raw -match "^'([^']+)'(\s|$)")        { $exe = $Matches[1] }
+    elseif ($raw -match '^([^\s"]+)')              { $exe = $Matches[1] }
+    if (-not $exe) { return $result }
 
-        Action:
-          * Startup entries: write StartupApproved disabled bit
-            (same mechanism as Task Manager's toggle - reversible)
-          * Scheduled tasks: Disable-ScheduledTask (reversible)
+    $exe = [System.Environment]::ExpandEnvironmentVariables($exe)
+    $leaf = Split-Path $exe -Leaf
+    if (-not $leaf) { $leaf = $exe }
+    $leafLower = $leaf.ToLowerInvariant()
 
-        Safety:
-          * Always runs the audit (read-only) unless -AllowPersistenceAction
-          * Backup .reg file written before any change
-          * Interactive Y/N per entry (or batch confirm with the flag)
-          * Never deletes files or registry values
-          * Full rollback documented in log
-    #>
+    $hostExes = @(
+        'powershell.exe', 'pwsh.exe', 'cmd.exe',
+        'wscript.exe', 'cscript.exe', 'mshta.exe',
+        'rundll32.exe', 'regsvr32.exe'
+    )
+    if ($hostExes -contains $leafLower) {
+        $payload = $null
+        switch ($leafLower) {
+            'powershell.exe' {
+                if ($raw -match '-File\s+["'']?([^"''\s]+)') { $payload = $Matches[1] }
+            }
+            'pwsh.exe' {
+                if ($raw -match '-File\s+["'']?([^"''\s]+)') { $payload = $Matches[1] }
+            }
+            'cmd.exe' {
+                if ($raw -match '/[cC]\s+["'']?([^"''\s]+)') { $payload = $Matches[1] }
+            }
+            'wscript.exe' {
+                if ($raw -match '["'']?([^"''\s]+\.(vbs|js|wsf))["'']?') { $payload = $Matches[1] }
+            }
+            'cscript.exe' {
+                if ($raw -match '["'']?([^"''\s]+\.(vbs|js|wsf))["'']?') { $payload = $Matches[1] }
+            }
+            'mshta.exe' {
+                if ($raw -match '["'']?([^"''\s]+\.(hta|vbs|js))["'']?') { $payload = $Matches[1] }
+            }
+            'rundll32.exe' {
+                if ($raw -match '["'']?([^"''\s,]+\.dll)') { $payload = $Matches[1] }
+            }
+        }
+        if ($payload) {
+            $payload = [System.Environment]::ExpandEnvironmentVariables(($payload -replace '"', '').Trim())
+            return [PSCustomObject]@{
+                Executable = $payload
+                Hosted     = $true
+                Confidence = 'High'
+            }
+        }
+        return [PSCustomObject]@{
+            Executable = $exe
+            Hosted     = $true
+            Confidence = 'Unknown'
+        }
+    }
+
+    return [PSCustomObject]@{
+        Executable = $exe
+        Hosted     = $false
+        Confidence = 'High'
+    }
+}
+
+function Classify-StartupEntry {
+    param(
+        [string]$RawCommand,
+        [string]$SourceType
+    )
+
+    if ($SourceType -eq 'ApprovedOnly') { return 'Purge' }
+    if ([string]::IsNullOrWhiteSpace($RawCommand)) { return 'Unknown' }
+
+    $payload = Get-CommandPayload -CommandLine $RawCommand
+    if ($payload.Confidence -eq 'Unknown') { return 'Unknown' }
+
+    $clean = [System.Environment]::ExpandEnvironmentVariables(
+        ($payload.Executable -replace '"', '').Trim()
+    )
+    if (-not $clean) { return 'Unknown' }
+
+    $winInternal = @(
+        '\Windows\System32\'
+        '\Windows\SysWOW64\'
+        '\Windows\SystemApps\'
+        '\Windows\SystemTemp\'
+        '\Windows\WinSxS\'
+        # [FIX-V7-3] Hardware driver packages live here. Explicit entry
+        # documents intent; \Windows\System32\ already covers it via
+        # prefix match, but making it explicit prevents future churn.
+        '\Windows\System32\DriverStore\'
+        '\Program Files\Windows Defender\'
+        '\Program Files\Windows Security\'
+        '\Program Files\WindowsApps\Microsoft.'
+        '\Program Files\WindowsApps\MicrosoftCorporationII.'
+        '\Program Files\Common Files\Microsoft Shared\'
+        '\Program Files\Microsoft OneDrive\'
+        '\AppData\Local\Microsoft\OneDrive\'
+    )
+    foreach ($p in $winInternal) {
+        if ($clean -match [regex]::Escape($p)) { return 'Keep' }
+    }
+
+    if (-not (Test-Path -LiteralPath $clean -ErrorAction SilentlyContinue)) {
+        return 'Purge'
+    }
+
+    try {
+        $sig = Get-AuthenticodeSignature -LiteralPath $clean -ErrorAction Stop
+        if ($sig.Status -ne 'Valid') { return 'Unknown' }
+        $subject = $sig.SignerCertificate.Subject
+        $hwPublishers = @(
+            'NVIDIA', 'Advanced Micro Devices', 'AMD', 'Intel Corporation'
+            'Realtek', 'Dolby', 'Waves Audio', 'Nahimic', 'DTS', 'Cirrus Logic', 'Creative Technology'
+            'Intel', 'Qualcomm', 'Broadcom', 'Marvell', 'MediaTek', 'ASMedia', 'Renesas'
+            'Logitech', 'Razer', 'Corsair', 'SteelSeries', 'HyperX', 'Wacom', 'Elan', 'Synaptics', 'Alps Electric'
+            'ASUSTeK', 'MSI', 'Micro-Star', 'Gigabyte', 'GIGA-BYTE', 'Dell', 'Hewlett-Packard', 'HP Inc', 'Lenovo', 'Acer', 'Samsung'
+        )
+        foreach ($p in $hwPublishers) {
+            if ($subject -match [regex]::Escape($p)) { return 'Keep' }
+        }
+        return 'Purge'
+    } catch {
+        return 'Unknown'
+    }
+}
+
+function Get-StartupEntries {
     [CmdletBinding()]
     param()
 
-    Write-Log 'STEP 38: Startup and Logon Persistence Management' -Level STEP
-    Write-Log ('-' * 60) -Level STEP
+    $entries = New-Object System.Collections.ArrayList
+    $enumErrors = New-Object System.Collections.ArrayList
 
-    # ================================================================
-    # PHASE 1: Startup entries
-    # ================================================================
-    Write-Log 'PHASE 1: Enumerating startup entries...' -Level INFO
-
-    $startupLocations = @(
-        'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
-        'HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce'
-        'HKLM:\Software\Microsoft\Windows\CurrentVersion\Run'
-        'HKLM:\Software\Microsoft\Windows\CurrentVersion\RunOnce'
-        'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run'
-        'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\RunOnce'
+    $runLocations = @(
+        @{ Hive = 'HKCU'; Path = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'; Bucket = 'Run' }
+        @{ Hive = 'HKCU'; Path = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce'; Bucket = 'Run' }
+        @{ Hive = 'HKLM'; Path = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Run'; Bucket = 'Run' }
+        @{ Hive = 'HKLM'; Path = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\RunOnce'; Bucket = 'Run' }
+        @{ Hive = 'HKLM'; Path = 'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run'; Bucket = 'Run32' }
+        @{ Hive = 'HKLM'; Path = 'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\RunOnce'; Bucket = 'Run32' }
     )
-
-    $startupEntries = @()
-    foreach ($loc in $startupLocations) {
-        if (-not (Test-Path -LiteralPath $loc)) { continue }
+    foreach ($loc in $runLocations) {
+        if (-not (Test-Path -LiteralPath $loc.Path)) { continue }
         try {
-            $props = Get-ItemProperty -LiteralPath $loc -ErrorAction Stop
+            $props = Get-ItemProperty -LiteralPath $loc.Path -ErrorAction Stop
             foreach ($prop in $props.PSObject.Properties) {
                 if ($prop.Name -like 'PS*') { continue }
                 if ($prop.Name -eq '(default)') { continue }
                 if ([string]::IsNullOrWhiteSpace([string]$prop.Value)) { continue }
-
-                $class = Get-PersistenceClassification -FilePath ([string]$prop.Value)
-
-                $startupEntries += [PSCustomObject]@{
-                    Name     = $prop.Name
-                    Command  = [string]$prop.Value
-                    Location = $loc
-                    Kind     = $class
-                }
+                [void]$entries.Add([PSCustomObject]@{
+                    Name = $prop.Name
+                    Command = [string]$prop.Value
+                    SourceType = 'Registry'
+                    SourcePath = $loc.Path
+                    SourceHive = $loc.Hive
+                    SourceBucket = $loc.Bucket
+                    ApprovedPath = $null
+                    IsEnabled = $true
+                    Kind = 'Unknown'
+                })
             }
-        } catch { }
+        } catch {
+            [void]$enumErrors.Add(('Registry read failed: {0} — {1}' -f $loc.Path, $_.Exception.Message))
+        }
     }
 
-    # Startup folders
     $startupFolders = @(
-        (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Startup')
-        (Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\Startup')
+        @{ Hive = 'HKCU'; Path = (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Startup'); Bucket = 'StartupFolder' }
+        @{ Hive = 'HKLM'; Path = (Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\Startup'); Bucket = 'StartupFolder' }
     )
     foreach ($folder in $startupFolders) {
-        if (-not (Test-Path -LiteralPath $folder)) { continue }
+        if (-not (Test-Path -LiteralPath $folder.Path)) { continue }
         try {
-            $files = Get-ChildItem -LiteralPath $folder -File -ErrorAction SilentlyContinue
+            $files = Get-ChildItem -LiteralPath $folder.Path -File -Force -ErrorAction SilentlyContinue
             foreach ($f in $files) {
-                if ($f.Extension -notin '.lnk','.url') { continue }
-                $class = Get-PersistenceClassification -FilePath $f.FullName
-                $startupEntries += [PSCustomObject]@{
-                    Name     = $f.BaseName
-                    Command  = $f.FullName
-                    Location = $folder
-                    Kind     = $class
+                if ($f.Extension -notin '.lnk', '.url') { continue }
+
+                $rawCmd = $f.FullName
+                if ($f.Extension -eq '.lnk') {
+                    $resolved = Resolve-StartupShortcut -ShortcutPath $f.FullName
+                    if ($resolved.Resolved) {
+                        $rawCmd = if ($resolved.Arguments) {
+                            ('"{0}" {1}' -f $resolved.TargetExe, $resolved.Arguments)
+                        } else {
+                            ('"{0}"' -f $resolved.TargetExe)
+                        }
+                    } else {
+                        [void]$enumErrors.Add(('Shortcut resolve failed: {0} — {1}' -f $f.FullName, $resolved.Reason))
+                    }
                 }
+
+                [void]$entries.Add([PSCustomObject]@{
+                    Name = $f.BaseName
+                    Command = $rawCmd
+                    SourceType = 'StartupFolder'
+                    SourcePath = $folder.Path
+                    SourceHive = $folder.Hive
+                    SourceBucket = $folder.Bucket
+                    ApprovedPath = $null
+                    IsEnabled = $true
+                    Kind = 'Unknown'
+                    ShortcutPath = $f.FullName
+                })
             }
-        } catch { }
+        } catch {
+            [void]$enumErrors.Add(('Folder enumerate failed: {0} — {1}' -f $folder.Path, $_.Exception.Message))
+        }
     }
 
-    # ================================================================
-    # PHASE 2: Logon/boot scheduled tasks
-    # ================================================================
-    Write-Host ''
-    Write-Log 'PHASE 2: Enumerating logon/boot scheduled tasks...' -Level INFO
+    $approvedLocations = @(
+        @{ Hive = 'HKCU'; Path = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run'; Bucket = 'Run' }
+        @{ Hive = 'HKCU'; Path = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run32'; Bucket = 'Run32' }
+        @{ Hive = 'HKCU'; Path = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder'; Bucket = 'StartupFolder' }
+        @{ Hive = 'HKLM'; Path = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run'; Bucket = 'Run' }
+        @{ Hive = 'HKLM'; Path = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run32'; Bucket = 'Run32' }
+        @{ Hive = 'HKLM'; Path = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder'; Bucket = 'StartupFolder' }
+    )
+    foreach ($loc in $approvedLocations) {
+        if (-not (Test-Path -LiteralPath $loc.Path)) { continue }
+        try {
+            $props = Get-ItemProperty -LiteralPath $loc.Path -ErrorAction Stop
+            foreach ($prop in $props.PSObject.Properties) {
+                if ($prop.Name -like 'PS*') { continue }
+                if ($prop.Name -eq '(default)') { continue }
+                if ($null -eq $prop.Value) { continue }
+                $bytes = $prop.Value
+                $isEnabled = $true
+                if ($bytes -is [byte[]] -and $bytes.Length -ge 1) {
+                    $isEnabled = ($bytes[0] -ne 0x03)
+                }
+                $matching = $entries | Where-Object {
+                    $_.Name -eq $prop.Name -and
+                    $_.SourceHive -eq $loc.Hive -and
+                    $_.SourceBucket -eq $loc.Bucket
+                } | Select-Object -First 1
+                if ($matching) {
+                    $matching.ApprovedPath = $loc.Path
+                    $matching.IsEnabled = $isEnabled
+                } else {
+                    [void]$entries.Add([PSCustomObject]@{
+                        Name = $prop.Name
+                        Command = ''
+                        SourceType = 'ApprovedOnly'
+                        SourcePath = $null
+                        SourceHive = $loc.Hive
+                        SourceBucket = $loc.Bucket
+                        ApprovedPath = $loc.Path
+                        IsEnabled = $isEnabled
+                        Kind = 'Purge'
+                    })
+                }
+            }
+        } catch {
+            [void]$enumErrors.Add(('StartupApproved read failed: {0} — {1}' -f $loc.Path, $_.Exception.Message))
+        }
+    }
 
-    $taskEntries = @()
     try {
         $allTasks = Get-ScheduledTask -ErrorAction Stop
         foreach ($task in $allTasks) {
-            # Only logon/boot triggers
+            if ($task.TaskPath -like '\Microsoft\*') { continue }
+            if ($task.State -eq 'Disabled') { continue }
+
             $hasTrigger = $false
             if ($task.Triggers) {
                 foreach ($t in $task.Triggers) {
@@ -11181,252 +11407,439 @@ function Invoke-Step38 {
             }
             if (-not $hasTrigger) { continue }
 
-            # Skip disabled and Microsoft-owned
-            if ($task.State -eq 'Disabled') { continue }
-            if ($task.TaskPath -like '\Microsoft\*') { continue }
-
-            # Extract executable
             $exe = ''
             if ($task.Actions) {
                 foreach ($a in $task.Actions) {
                     if ($a.PSObject.Properties['Execute'] -and $a.Execute) {
                         $exe = [string]$a.Execute
+                        if ($a.PSObject.Properties['Arguments'] -and $a.Arguments) {
+                            $exe += ' ' + [string]$a.Arguments
+                        }
                         break
                     }
                 }
             }
 
-            $class = Get-PersistenceClassification -FilePath $exe
-
-            $taskEntries += [PSCustomObject]@{
-                Name     = $task.TaskName
-                Command  = $exe
-                Location = $task.TaskPath
-                Kind     = $class
-            }
+            [void]$entries.Add([PSCustomObject]@{
+                Name = $task.TaskName
+                Command = $exe
+                SourceType = 'ScheduledTask'
+                SourcePath = $task.TaskPath
+                SourceHive = 'SYSTEM'
+                SourceBucket = 'Task'
+                ApprovedPath = $null
+                IsEnabled = $true
+                Kind = 'Unknown'
+                TaskPath = $task.TaskPath
+                TaskName = $task.TaskName
+            })
         }
     } catch {
-        Write-Log ('Could not enumerate scheduled tasks: {0}' -f $_.Exception.Message) -Level WARN
+        [void]$enumErrors.Add(('ScheduledTask enumerate failed: ' + $_.Exception.Message))
     }
 
-    # ================================================================
-    # PHASE 3: Classify and display
-    # ================================================================
-    $allEntries     = @($startupEntries) + @($taskEntries)
-    $keepEntries    = @($allEntries | Where-Object { $_.Kind -eq 'Keep' })
-    $disableEntries = @($allEntries | Where-Object { $_.Kind -eq 'Disable' })
+    return [PSCustomObject]@{
+        Entries = $entries
+        Errors  = $enumErrors
+    }
+}
 
-    Write-Host ''
-    Write-Log ("Total: {0} entries ({1} Keep, {2} Disable)" -f $allEntries.Count, $keepEntries.Count, $disableEntries.Count) -Level INFO
+function Remove-StartupEntry {
+    param([Parameter(Mandatory)]$Entry)
+    $removed = New-Object System.Collections.ArrayList
 
-    if ($keepEntries.Count -gt 0) {
-        Write-Host ''
-        Write-Log 'PROTECTED (signed by trusted publisher):' -Level OK
-        foreach ($e in $keepEntries) {
-            Write-Log ("  [KEEP] {0}" -f $e.Name) -Level OK
-            Write-Log ("         {0}" -f $e.Command) -Level DEBUG
+    if ($Entry.SourceType -eq 'Registry' -and $Entry.SourcePath) {
+        try {
+            Remove-ItemProperty -Path $Entry.SourcePath -Name $Entry.Name -Force -ErrorAction Stop
+            [void]$removed.Add('Registry:' + $Entry.SourcePath + '::' + $Entry.Name)
+        } catch {
+            return [PSCustomObject]@{
+                Ok = $false
+                Reason = ('Run key delete failed: ' + $_.Exception.Message)
+                Removed = @($removed)
+            }
+        }
+    }
+    if ($Entry.SourceType -eq 'StartupFolder' -and $Entry.ShortcutPath) {
+        try {
+            Remove-Item -LiteralPath $Entry.ShortcutPath -Force -ErrorAction Stop
+            [void]$removed.Add('File:' + $Entry.ShortcutPath)
+        } catch {
+            return [PSCustomObject]@{
+                Ok = $false
+                Reason = ('Shortcut delete failed: ' + $_.Exception.Message)
+                Removed = @($removed)
+            }
+        }
+    }
+    if ($Entry.SourceType -eq 'ScheduledTask' -and $Entry.TaskPath -and $Entry.TaskName) {
+        try {
+            $null = Unregister-ScheduledTask -TaskPath $Entry.TaskPath -TaskName $Entry.TaskName -Confirm:$false -ErrorAction Stop
+            [void]$removed.Add('Task:' + $Entry.TaskPath + '::' + $Entry.TaskName)
+        } catch {
+            return [PSCustomObject]@{
+                Ok = $false
+                Reason = ('Scheduled task unregister failed: ' + $_.Exception.Message)
+                Removed = @($removed)
+            }
+        }
+    }
+    if ($Entry.ApprovedPath) {
+        try {
+            Remove-ItemProperty -Path $Entry.ApprovedPath -Name $Entry.Name -Force -ErrorAction Stop
+            [void]$removed.Add('Approved:' + $Entry.ApprovedPath + '::' + $Entry.Name)
+        } catch {
+            if ($_.Exception.Message -notmatch 'not found|Cannot find|cannot find') {
+                return [PSCustomObject]@{
+                    Ok = $false
+                    Reason = ('StartupApproved delete failed: ' + $_.Exception.Message)
+                    Removed = @($removed)
+                }
+            }
         }
     }
 
-    if ($disableEntries.Count -gt 0) {
-        Write-Host ''
-        Write-Log 'CANDIDATES FOR DISABLE:' -Level WARN
-        foreach ($e in $disableEntries) {
-            Write-Log ("  [DISABLE] {0}" -f $e.Name) -Level WARN
-            Write-Log ("            {0}" -f $e.Command) -Level WARN
+    return [PSCustomObject]@{ Ok = $true; Reason = 'purged'; Removed = @($removed) }
+}
+
+# ============================================================
+# STEP 38: Startup and Logon Persistence Purge
+# ============================================================
+function Invoke-Step38 {
+    [CmdletBinding()]
+    param()
+
+    Write-Log 'STEP 38: Startup and Logon Persistence Purge' -Level STEP
+    Write-Log ('-' * 60) -Level STEP
+    Write-Log 'Policy: keep only Windows system components and hardware drivers.'
+    Write-Log 'Purge everything else. Unclassifiable entries are kept and reported.'
+
+    # ============================================================
+    # PHASE 1: ENUMERATE
+    # ============================================================
+    Write-Log 'PHASE 1: Enumerating every startup location...' -Level INFO
+    $enum = Get-StartupEntries
+    $entries = @($enum.Entries)
+    $enumErrors = @($enum.Errors)
+
+    Write-Log ('  Total startup entries: {0}' -f $entries.Count) -Level INFO
+    if ($enumErrors.Count -gt 0) {
+        Write-Log ('  Enumeration warnings: {0}' -f $enumErrors.Count) -Level WARN
+        foreach ($msg in $enumErrors) {
+            Write-Log ('    [ENUM] ' + $msg) -Level WARN
         }
     }
 
-    if ($disableEntries.Count -eq 0) {
-        Write-Host ''
-        Write-Log 'No non-essential entries detected.' -Level OK
+    if ($entries.Count -eq 0) {
+        Write-Log 'No startup entries detected.' -Level OK
+        $Script:LastStepDetail = 'No startup entries found.'
         Write-Log 'Step 38 complete.' -Level OK
         return
     }
 
-    # ================================================================
-    # PHASE 4: Backup
-    # ================================================================
-    if (-not $Script:DryRun) {
+    # ============================================================
+    # PHASE 2: CLASSIFY
+    # ============================================================
+    Write-Log 'PHASE 2: Classifying entries (system + hardware only)...' -Level INFO
+    foreach ($e in $entries) {
+        $e.Kind = Classify-StartupEntry -RawCommand $e.Command -SourceType $e.SourceType
+    }
+    $keepEntries    = @($entries | Where-Object { $_.Kind -eq 'Keep' })
+    $purgeEntries   = @($entries | Where-Object { $_.Kind -eq 'Purge' })
+    $unknownEntries = @($entries | Where-Object { $_.Kind -eq 'Unknown' })
+
+    Write-Host ''
+    Write-Log ('Classified: {0} KEEP, {1} PURGE, {2} UNKNOWN (kept)' -f `
+        $keepEntries.Count, $purgeEntries.Count, $unknownEntries.Count) -Level INFO
+
+    if ($keepEntries.Count -gt 0) {
         Write-Host ''
-        Write-Log 'Backing up startup entries to .reg file...' -Level INFO
-        $backupFile = Join-Path $Script:ScriptDir ("StartupBackup_{0}.reg" -f $Script:RunStamp)
-
-        $regExports = New-Object System.Collections.ArrayList
-        $byLocation = $startupEntries | Where-Object { $_.Location -like 'HK*' } | Group-Object -Property Location
-        foreach ($group in $byLocation) {
-            $loc = $group.Name
-            $regKey = $loc -replace '^HKCU:\\', 'HKCU\' -replace '^HKLM:\\', 'HKLM\'
-            $regKey = $regKey.TrimEnd('\')
-            $tempReg = [System.IO.Path]::GetTempFileName() + '.reg'
-            try {
-                $null = & reg.exe export $regKey $tempReg /y 2>&1
-                if (Test-Path $tempReg) {
-                    [void]$regExports.Add((Get-Content -LiteralPath $tempReg -Raw))
-                }
-            } catch { }
-            finally { Remove-Item $tempReg -Force -ErrorAction SilentlyContinue }
+        Write-Log 'PROTECTED (system / hardware drivers):' -Level OK
+        foreach ($e in $keepEntries) {
+            $state = if ($e.IsEnabled) { 'enabled' } else { 'disabled' }
+            Write-Log ('  [KEEP/{0}] {1} ({2}/{3})' -f $state, $e.Name, $e.SourceHive, $e.SourceBucket) -Level OK
+            # [FIX-V7-4] Show the command so users can verify what is
+            # protected. Audit trail matters more than compactness.
+            if ($e.Command) { Write-Log ('          {0}' -f $e.Command) -Level OK }
         }
-
-        if ($regExports.Count -gt 0) {
-            $merged = $regExports[0]
-            for ($i = 1; $i -lt $regExports.Count; $i++) {
-                $body = $regExports[$i] -replace '^Windows Registry Editor Version 5\.00\s*', ''
-                $merged += "`r`n" + $body
-            }
-            Set-Content -LiteralPath $backupFile -Value $merged -Encoding Unicode
-            Write-Log ("  Backup: {0}" -f $backupFile) -Level OK
+    }
+    if ($unknownEntries.Count -gt 0) {
+        Write-Host ''
+        Write-Log 'UNCLASSIFIABLE (kept - manual review):' -Level WARN
+        foreach ($e in $unknownEntries) {
+            Write-Log ('  [UNKNOWN/{0}] {1} ({2}/{3})' -f $e.SourceType, $e.Name, $e.SourceHive, $e.SourceBucket) -Level WARN
+            if ($e.Command) { Write-Log ('          {0}' -f $e.Command) -Level WARN }
         }
-
-        Write-Log 'Scheduled tasks: rollback via Enable-ScheduledTask if needed.' -Level INFO
+    }
+    if ($purgeEntries.Count -gt 0) {
+        Write-Host ''
+        Write-Log 'TO BE PURGED (non-system, non-hardware):' -Level WARN
+        foreach ($e in $purgeEntries) {
+            Write-Log ('  [PURGE/{0}] {1} ({2}/{3})' -f $e.SourceType, $e.Name, $e.SourceHive, $e.SourceBucket) -Level WARN
+            if ($e.Command) { Write-Log ('          {0}' -f $e.Command) -Level WARN }
+        }
     }
 
-    if ($Script:DryRun) {
-        Write-Log ("[PREVIEW] Would prompt to disable {0} entries." -f $disableEntries.Count) -Level PREVIEW
+    if ($purgeEntries.Count -eq 0) {
+        Write-Host ''
+        Write-Log 'No purge candidates detected.' -Level OK
+        $Script:LastStepDetail = ('Audited {0} entries; {1} kept, {2} unknown, 0 purged' -f `
+            $entries.Count, $keepEntries.Count, $unknownEntries.Count)
+        Write-Log 'Step 38 complete.' -Level OK
         return
     }
 
-    # ================================================================
-    # PHASE 5: Action
-    # ================================================================
+    # ============================================================
+    # PHASE 3: DRYRUN + AUTHORIZATION
+    # ============================================================
+    if ($Script:DryRun) {
+        Write-Log ('[PREVIEW] Would purge {0} entries.' -f $purgeEntries.Count) -Level PREVIEW
+        $Script:LastStepDetail = ('Dry run: would purge {0}, keep {1}, unknown {2}' -f `
+            $purgeEntries.Count, $keepEntries.Count, $unknownEntries.Count)
+        return
+    }
+    if (-not $Script:AllowPersistenceAction) {
+        Write-Host ''
+        Write-Log 'Purge NOT authorized. Add -AllowPersistenceAction to enable.' -Level INFO
+        Write-Log 'Audit complete. No changes made.' -Level INFO
+        $Script:LastStepDetail = ('Audit only: {0} purge candidates; add -AllowPersistenceAction to purge' -f $purgeEntries.Count)
+        Write-Log 'Step 38 complete (audit only).' -Level OK
+        return
+    }
+
+    # ============================================================
+    # PHASE 4: BACKUP (verified per location)
+    # ============================================================
     Write-Host ''
+    Write-Log 'Backing up every affected location before purge...' -Level INFO
 
-    $autoApprove = $Script:AllowPersistenceAction -and $Script:YesToAll
+    $backupFile = Join-Path $Script:ScriptDir ('StartupBackup_{0}.reg' -f $Script:RunStamp)
+    $regPathsToBackup = @(
+        'HKCU\Software\Microsoft\Windows\CurrentVersion\Run'
+        'HKCU\Software\Microsoft\Windows\CurrentVersion\RunOnce'
+        'HKLM\Software\Microsoft\Windows\CurrentVersion\Run'
+        'HKLM\Software\Microsoft\Windows\CurrentVersion\RunOnce'
+        'HKLM\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run'
+        'HKLM\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\RunOnce'
+        'HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run'
+        'HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run32'
+        'HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder'
+        'HKLM\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run'
+        'HKLM\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run32'
+        'HKLM\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder'
+    )
 
+    $backupManifest = New-Object System.Collections.ArrayList
+    $regExports = New-Object System.Collections.ArrayList
+
+    foreach ($regPath in $regPathsToBackup) {
+        $tempReg = Join-Path $env:TEMP (([Guid]::NewGuid().ToString('N')) + '.reg')
+        $rec = [PSCustomObject]@{ Path = $regPath; Ok = $false; ExitCode = -1; Size = 0; Header = '' }
+        try {
+            $null = & reg.exe export $regPath $tempReg /y 2>&1
+            $rec.ExitCode = $LASTEXITCODE
+            if (Test-Path $tempReg) {
+                $rec.Size = (Get-Item -LiteralPath $tempReg).Length
+                if ($rec.Size -gt 50) {
+                    $firstLine = Get-Content -LiteralPath $tempReg -TotalCount 1 -ErrorAction SilentlyContinue
+                    $rec.Header = [string]$firstLine
+                }
+                if ($rec.ExitCode -eq 0 -and $rec.Size -gt 50 -and
+                    $rec.Header -match 'Windows Registry Editor Version 5\.00') {
+                    [void]$regExports.Add((Get-Content -LiteralPath $tempReg -Raw))
+                    $rec.Ok = $true
+                }
+            }
+        } catch {
+            $rec.Header = $_.Exception.Message
+        } finally {
+            Remove-Item -LiteralPath $tempReg -Force -ErrorAction SilentlyContinue
+        }
+        [void]$backupManifest.Add($rec)
+    }
+
+    $failedBackups = @($backupManifest | Where-Object { -not $_.Ok })
+    if ($failedBackups.Count -gt 0) {
+        Write-Host ''
+        Write-Log ('  [ABORT] {0} registry backup(s) failed.' -f $failedBackups.Count) -Level ERROR
+        foreach ($f in $failedBackups) {
+            Write-Log ('    {0} (exit={1}, size={2}, header={3})' -f $f.Path, $f.ExitCode, $f.Size, $f.Header) -Level ERROR
+        }
+        Write-Log '  Purge aborted: refusing to modify registry without full backup.' -Level ERROR
+        $Script:LastStepDetail = ('Purge aborted: {0} registry backup(s) failed' -f $failedBackups.Count)
+        $Script:LastStepStatus = 'Failed'
+        return
+    }
+
+    try {
+        $merged = $regExports[0]
+        for ($i = 1; $i -lt $regExports.Count; $i++) {
+            $body = $regExports[$i] -replace '^Windows Registry Editor Version 5\.00\s*', ''
+            $merged += "`r`n" + $body
+        }
+        Set-Content -LiteralPath $backupFile -Value $merged -Encoding Unicode -ErrorAction Stop
+        Write-Log ('  Registry backup: {0}' -f $backupFile) -Level OK
+        Write-Log ('  Registry backup verified: {0} location(s)' -f $regExports.Count) -Level OK
+    } catch {
+        Write-Log ('  [ABORT] Could not write merged backup: ' + $_.Exception.Message) -Level ERROR
+        $Script:LastStepDetail = 'Purge aborted: merged backup write failed'
+        $Script:LastStepStatus = 'Failed'
+        return
+    }
+
+    $folderBackup = Join-Path $Script:ScriptDir ('StartupFolders_{0}' -f $Script:RunStamp)
+    if (-not (Test-Path -LiteralPath $folderBackup)) {
+        New-Item -ItemType Directory -Path $folderBackup -Force | Out-Null
+    }
+    $userBackupDir   = Join-Path $folderBackup 'User'
+    $machineBackupDir = Join-Path $folderBackup 'AllUsers'
+    New-Item -ItemType Directory -Path $userBackupDir   -Force | Out-Null
+    New-Item -ItemType Directory -Path $machineBackupDir -Force | Out-Null
+
+    $folderBackupFailed = $false
+    $sf1 = Join-Path $env:APPDATA     'Microsoft\Windows\Start Menu\Programs\Startup'
+    $sf2 = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\Startup'
+    foreach ($pair in @(@{ Src = $sf1; Dst = $userBackupDir }, @{ Src = $sf2; Dst = $machineBackupDir })) {
+        if (-not (Test-Path -LiteralPath $pair.Src)) { continue }
+        try {
+            $files = Get-ChildItem -LiteralPath $pair.Src -File -Force -ErrorAction SilentlyContinue |
+                     Where-Object { $_.Extension -in '.lnk', '.url' }
+            foreach ($f in $files) {
+                $dest = Join-Path $pair.Dst $f.Name
+                Copy-Item -LiteralPath $f.FullName -Destination $dest -Force -ErrorAction Stop
+                if (-not (Test-Path -LiteralPath $dest)) {
+                    Write-Log ('  [ABORT] Copy verification failed: ' + $dest) -Level ERROR
+                    $folderBackupFailed = $true
+                }
+            }
+        } catch {
+            Write-Log ('  [ABORT] Folder backup failed: ' + $_.Exception.Message) -Level ERROR
+            $folderBackupFailed = $true
+        }
+    }
+    if ($folderBackupFailed) {
+        Write-Log '  Purge aborted: startup-folder backup incomplete.' -Level ERROR
+        $Script:LastStepDetail = 'Purge aborted: folder backup incomplete'
+        $Script:LastStepStatus = 'Failed'
+        return
+    }
+    Write-Log ('  Folder backup:  {0}' -f $folderBackup) -Level OK
+
+    $taskXmlDir = Join-Path $Script:ScriptDir ('StartupTasks_{0}' -f $Script:RunStamp)
+    $purgeTasks = @($purgeEntries | Where-Object { $_.SourceType -eq 'ScheduledTask' })
+    if ($purgeTasks.Count -gt 0) {
+        New-Item -ItemType Directory -Path $taskXmlDir -Force | Out-Null
+        foreach ($t in $purgeTasks) {
+            try {
+                $safeName = ($t.TaskPath + $t.TaskName) -replace '[\\/:*?"<>|]', '_'
+                $xmlPath  = Join-Path $taskXmlDir ($safeName + '.xml')
+                $null = Export-ScheduledTask -TaskPath $t.TaskPath -TaskName $t.TaskName |
+                        Set-Content -LiteralPath $xmlPath -Encoding UTF8 -ErrorAction Stop
+            } catch {
+                Write-Log ('  [WARN] Could not export task XML for backup: ' + $t.Name) -Level WARN
+            }
+        }
+        Write-Log ('  Task XML backup: {0}' -f $taskXmlDir) -Level OK
+    }
+
+    # ============================================================
+    # PHASE 5: CONFIRM + PURGE
+    # ============================================================
+    Write-Host ''
+    $autoApprove = $Script:YesToAll
     if (-not $autoApprove) {
-        if (-not (Confirm-Action -Query ('Process {0} non-essential entries?' -f $disableEntries.Count))) {
-            Write-Log 'Step 38 action declined by user.' -Level WARN
+        if (-not (Confirm-Action -Query ('Purge {0} startup entries permanently?' -f $purgeEntries.Count))) {
+            Write-Log 'Step 38 purge declined by user.' -Level WARN
+            $Script:LastStepDetail = 'Purge declined by user'
             return
         }
     } else {
-        Write-Log 'Auto-processing all candidates (-AllowPersistenceAction + -YesToAll).' -Level WARN
+        Write-Log 'Auto-approving all purge candidates (-YesToAll).' -Level WARN
     }
 
-    $startupDisabled = 0
-    $tasksDisabled   = 0
-    $failed          = 0
-    $kept            = 0
+    Write-Host ''
+    Write-Log 'PHASE 6: Purging startup entries...' -Level INFO
+    $purged = 0; $partial = 0; $failed = 0; $declined = 0
+    $purgeRecords = New-Object System.Collections.ArrayList
 
-    # StartupApproved mapping
-    # [FIX-STEP38-RUNONCE-MAP] Microsoft's StartupApproved subkeys are
-    # Run, Run32, StartupFolder, StartupFolder32. RunOnce entries share
-    # the same bucket as their Run counterpart — there is no separate
-    # RunOnce bucket. The old mapping sent HKCU/HKLM RunOnce to Run32,
-    # which caused Task Manager to misparse the entry and had no effect
-    # on the actual RunOnce entry. WOW6432Node Run/RunOnce correctly map
-    # to Run32 as the 32-bit view of the 64-bit Run bucket.
-    $approvedMap = @{
-        'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'         = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run'
-        'HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce'     = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run'
-        'HKLM:\Software\Microsoft\Windows\CurrentVersion\Run'         = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run'
-        'HKLM:\Software\Microsoft\Windows\CurrentVersion\RunOnce'     = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run'
-        'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run'     = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run32'
-        'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\RunOnce' = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run32'
-    }
-
-    foreach ($e in $disableEntries) {
+    foreach ($e in $purgeEntries) {
         $approved = $autoApprove
         if (-not $autoApprove) {
-            $approved = Confirm-Action -Query ('Disable {0}?' -f $e.Name)
+            $approved = Confirm-Action -Query ('Purge {0} ({1}/{2})?' -f $e.Name, $e.SourceHive, $e.SourceBucket)
         }
-
         if (-not $approved) {
-            Write-Log ("  [KEPT] {0}" -f $e.Name) -Level INFO
-            $kept++
+            Write-Log ('  [DECLINED] {0}' -f $e.Name) -Level INFO
+            $declined++
+            [void]$purgeRecords.Add([PSCustomObject]@{
+                Name = $e.Name
+                Source = $e.SourceType
+                Hive = $e.SourceHive
+                Bucket = $e.SourceBucket
+                Command = $e.Command
+                Result = 'Declined'
+                Reason = 'declined by user'
+            })
             continue
         }
-
-        # Scheduled task
-        if ($e.Location -notlike 'HK*' -and $e.Location -notlike '*\Startup*' -and $e.Location -match '^\\') {
-            try {
-                Disable-ScheduledTask -TaskPath $e.Location -TaskName $e.Name -ErrorAction Stop | Out-Null
-                Write-Log ("  [DISABLED TASK] {0}{1}" -f $e.Location, $e.Name) -Level OK
-                $tasksDisabled++
-            } catch {
-                Write-Log ("  [FAIL] {0}: {1}" -f $e.Name, $_.Exception.Message) -Level WARN
-                $failed++
-            }
-            continue
-        }
-
-        # Registry startup entry
-        $approvedPath = $approvedMap[$e.Location]
-        if ($approvedPath) {
-            try {
-                # Suppression: if we disabled this entry on a previous run AND
-                # the user has re-enabled it since, honor their choice.
-                # Marker key is a sibling of the StartupApproved value.
-                $markerPath = 'HKCU:\Software\WinTune\DisabledStartups'
-                if (-not (Test-Path -LiteralPath $markerPath)) {
-                    New-Item -Path $markerPath -Force -ErrorAction SilentlyContinue | Out-Null
-                }
-                $markerName = '{0}_{1}' -f ($e.Location -replace '[\\/:*?"<>|]', '_'), $e.Name
-                $markerVal  = (Get-ItemProperty -Path $markerPath -Name $markerName -ErrorAction SilentlyContinue).$markerName
-
-                if ($markerVal -eq 'user-reenabled') {
-                    Write-Log ("  [SKIP-REENABLED] {0} (user re-enabled since last run)" -f $e.Name) -Level INFO
-                    $kept++
-                    continue
-                }
-
-                # Check if the entry is currently ENABLED (first byte != 0x03)
-                $currentBytes = (Get-ItemProperty -Path $approvedPath -Name $e.Name -ErrorAction SilentlyContinue).($e.Name)
-                if ($currentBytes -and $currentBytes.Length -ge 1 -and $currentBytes[0] -ne 0x03 -and $markerVal) {
-                    # We disabled it before, user re-enabled it. Record that and skip.
-                    New-ItemProperty -Path $markerPath -Name $markerName -Value 'user-reenabled' -PropertyType String -Force -ErrorAction SilentlyContinue | Out-Null
-                    Write-Log ("  [SKIP-REENABLED] {0} (user re-enabled since last run - not disabling again)" -f $e.Name) -Level INFO
-                    $kept++
-                    continue
-                }
-
-                if (-not (Test-Path -LiteralPath $approvedPath)) {
-                    New-Item -Path $approvedPath -Force -ErrorAction Stop | Out-Null
-                }
-                # [FIX-STEP38-STARTUPBYTES] Preserve existing byte length.
-                # Modern Windows uses 12-byte StartupApproved entries
-                # (1-byte status + 11-byte FILETIME), but legacy-migrated
-                # entries (from pre-Win8 systems) are 8 bytes. Writing
-                # 12 bytes to an 8-byte slot causes Task Manager to
-                # misparse and may silently re-enable the entry. If a
-                # value already exists, keep its length and only flip
-                # byte[0] to 0x03 (disabled). If no value exists, write
-                # the modern 12-byte default.
-                $__existing = (Get-ItemProperty -Path $approvedPath -Name $e.Name -ErrorAction SilentlyContinue).($e.Name)
-                if ($__existing -is [byte[]] -and $__existing.Length -in @(8, 12)) {
-                    $disabledBytes = New-Object byte[] $__existing.Length
-                    [Array]::Copy($__existing, $disabledBytes, $__existing.Length)
-                    $disabledBytes[0] = 0x03
-                } else {
-                    $disabledBytes = [byte[]](0x03,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00)
-                }
-                New-ItemProperty -Path $approvedPath -Name $e.Name -Value $disabledBytes -PropertyType Binary -Force -ErrorAction Stop | Out-Null
-
-                # Record that WE disabled it, so a future run can detect user re-enable.
-                New-ItemProperty -Path $markerPath -Name $markerName -Value 'wintune-disabled' -PropertyType String -Force -ErrorAction SilentlyContinue | Out-Null
-                Write-Log ("  [DISABLED STARTUP] {0}" -f $e.Name) -Level OK
-                $startupDisabled++
-            } catch {
-                Write-Log ("  [FAIL] {0}: {1}" -f $e.Name, $_.Exception.Message) -Level WARN
-                $failed++
-            }
+        $purgeResult = Remove-StartupEntry -Entry $e
+        if ($purgeResult.Ok) {
+            Write-Log ('  [PURGED] {0} ({1}/{2})' -f $e.Name, $e.SourceHive, $e.SourceBucket) -Level OK
+            $purged++; $resultLabel = 'Purged'
+        } elseif ($purgeResult.Removed.Count -gt 0) {
+            Write-Log ('  [PARTIAL] {0}: {1}' -f $e.Name, $purgeResult.Reason) -Level WARN
+            $partial++; $resultLabel = 'Partial'
         } else {
-            Write-Log ("  [SKIP] {0} - startup folder entries not auto-disabled" -f $e.Name) -Level WARN
-            $kept++
+            Write-Log ('  [FAIL] {0}: {1}' -f $e.Name, $purgeResult.Reason) -Level WARN
+            $failed++; $resultLabel = 'Failed'
+        }
+        [void]$purgeRecords.Add([PSCustomObject]@{
+            Name = $e.Name
+            Source = $e.SourceType
+            Hive = $e.SourceHive
+            Bucket = $e.SourceBucket
+            Command = $e.Command
+            Result = $resultLabel
+            Reason = $purgeResult.Reason
+        })
+    }
+
+    # ============================================================
+    # PHASE 7: SUMMARY
+    # ============================================================
+    Write-Host ''
+    Write-Log ('Step 38 summary: {0} purged, {1} partial, {2} declined, {3} failed' -f `
+        $purged, $partial, $declined, $failed) -Level INFO
+
+    if ($purged -gt 0) {
+        Write-Host ''
+        Write-Log 'PURGED STARTUPS:' -Level OK
+        foreach ($r in ($purgeRecords | Where-Object { $_.Result -eq 'Purged' })) {
+            Write-Log ('  [PURGED] {0} ({1}/{2})' -f $r.Name, $r.Hive, $r.Bucket) -Level OK
+        }
+    }
+    if ($partial -gt 0 -or $failed -gt 0) {
+        Write-Host ''
+        Write-Log 'ENTRIES REQUIRING ATTENTION:' -Level WARN
+        foreach ($r in ($purgeRecords | Where-Object { $_.Result -in 'Partial', 'Failed' })) {
+            Write-Log ('  [{0}] {1}: {2}' -f $r.Result.ToUpper(), $r.Name, $r.Reason) -Level WARN
         }
     }
 
-    # ================================================================
-    # Summary
-    # ================================================================
     Write-Host ''
-    Write-Log ("Step 38 summary: {0} startup disabled, {1} tasks disabled, {2} protected/skipped, {3} failed" -f $startupDisabled, $tasksDisabled, $kept, $failed) -Level INFO
-    Write-Log '' -Level INFO
-    Write-Log 'Rollback:' -Level INFO
-    Write-Log '  Startup entries: Task Manager -> Startup tab -> re-enable' -Level INFO
-    Write-Log '  Scheduled tasks: Enable-ScheduledTask -TaskPath <path> -TaskName <name>' -Level INFO
-    Write-Log '' -Level INFO
+    Write-Log 'Restore procedure:' -Level INFO
+    Write-Log ('  1. Registry: double-click {0}' -f $backupFile) -Level INFO
+    Write-Log ('  2. Shortcuts: copy from {0}' -f $folderBackup) -Level INFO
+    if ($purgeTasks.Count -gt 0) {
+        Write-Log ('  3. Scheduled tasks: Register-ScheduledTask -Xml (Get-Content <path>) from {0}' -f $taskXmlDir) -Level INFO
+    }
+
+    $Script:LastStepPurgedStartups = $purgeRecords
+    $Script:LastStepDetail = ('Purged {0}, partial {1}, declined {2}, failed {3} (backup: {4})' -f `
+        $purged, $partial, $declined, $failed, (Split-Path -Leaf $backupFile))
+    if ($failed -gt 0) { $Script:LastStepStatus = 'Warning' } else { $Script:LastStepStatus = 'OK' }
+
     Write-Log 'Step 38 complete.' -Level OK
-    Write-Log '[SUCCESS] Non-essential persistence processed.' -Level OK
+    Write-Log '[SUCCESS] Non-essential persistence purged.' -Level OK
 }
 
 function Invoke-Step39 {
@@ -13485,6 +13898,19 @@ function Invoke-RollbackMode {
                     }
                     $ok++
                 }
+                'RegistryHKLM' {
+                    # [FIX-REGISTRYHKLM] Same restore/remove semantics as
+                    # RegistryHKCU. The path prefix (HKLM:) is stored in
+                    # Data.Path and used directly.
+                    if ($e.Data.Existed) {
+                        New-ItemProperty -Path $e.Data.Path -Name $e.Data.Name -Value $e.Data.Value -PropertyType $e.Data.Type -Force -ErrorAction Stop | Out-Null
+                        Write-Host ("  OK   {0}: restored {1}\{2}" -f $label, $e.Data.Path, $e.Data.Name) -ForegroundColor Green
+                    } else {
+                        Remove-ItemProperty -Path $e.Data.Path -Name $e.Data.Name -Force -ErrorAction SilentlyContinue
+                        Write-Host ("  OK   {0}: removed {1}\{2}" -f $label, $e.Data.Path, $e.Data.Name) -ForegroundColor Green
+                    }
+                    $ok++
+                }
                 default {
                     Write-Host ("  SKIP {0}: unknown type" -f $label) -ForegroundColor DarkGray
                     $skip++
@@ -14120,6 +14546,67 @@ function Invoke-Step59 {
 # ============================================================
 # HTML REPORT GENERATOR
 # ============================================================
+# ============================================================
+# [FIX-STEP38-PURGE] HTML section builder for the Step 38 purge manifest
+# ============================================================
+function New-PurgedStartupSectionHtml {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Records,
+        [Parameter(Mandatory)][scriptblock]$Escape
+    )
+
+    if (-not $Records -or $Records.Count -eq 0) { return '' }
+
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.AppendLine('  <section>')
+    [void]$sb.AppendLine('    <h2>Step 38: Startup Purge Manifest</h2>')
+    [void]$sb.AppendLine('    <p style="color:#6b7280;font-size:13px;margin:0 0 12px 0;">')
+    [void]$sb.AppendLine('      Every entry considered by Step 38 is listed below.')
+    [void]$sb.AppendLine('      A .reg backup, folder copy, and (for scheduled tasks) XML')
+    [void]$sb.AppendLine('      export were written to the script directory before any change.')
+    [void]$sb.AppendLine('      See the log for exact paths.')
+    [void]$sb.AppendLine('    </p>')
+    [void]$sb.AppendLine('    <table>')
+    [void]$sb.AppendLine('      <thead>')
+    [void]$sb.AppendLine('        <tr><th>Name</th><th>Source</th><th>Hive</th><th>Bucket</th><th>Command</th><th>Result</th><th>Reason</th></tr>')
+    [void]$sb.AppendLine('      </thead>')
+    [void]$sb.AppendLine('      <tbody>')
+
+    foreach ($r in $Records) {
+        $cls = switch ($r.Result) {
+            'Purged'   { 'st-ok' }
+            'Partial'  { 'st-warn' }
+            'Failed'   { 'st-fail' }
+            'Declined' { 'st-noop' }
+            default    { 'st-other' }
+        }
+        $nameEsc   = & $Escape ([string]$r.Name)
+        $sourceEsc = & $Escape ([string]$r.Source)
+        $hiveEsc   = & $Escape ([string]$r.Hive)
+        $bucketEsc = & $Escape ([string]$r.Bucket)
+        $cmdEsc    = if ($r.Command) { & $Escape ([string]$r.Command) } else { '' }
+        $resultEsc = & $Escape ([string]$r.Result)
+        $reasonEsc = & $Escape ([string]$r.Reason)
+
+        [void]$sb.AppendLine('        <tr>')
+        [void]$sb.AppendLine('          <td>' + $nameEsc + '</td>')
+        [void]$sb.AppendLine('          <td>' + $sourceEsc + '</td>')
+        [void]$sb.AppendLine('          <td>' + $hiveEsc + '</td>')
+        [void]$sb.AppendLine('          <td>' + $bucketEsc + '</td>')
+        [void]$sb.AppendLine('          <td style="font-family:ui-monospace,Consolas,monospace;font-size:11px;max-width:400px;word-break:break-all;">' + $cmdEsc + '</td>')
+        [void]$sb.AppendLine('          <td class="status ' + $cls + '">' + $resultEsc + '</td>')
+        [void]$sb.AppendLine('          <td>' + $reasonEsc + '</td>')
+        [void]$sb.AppendLine('        </tr>')
+    }
+
+    [void]$sb.AppendLine('      </tbody>')
+    [void]$sb.AppendLine('    </table>')
+    [void]$sb.AppendLine('  </section>')
+    return $sb.ToString()
+}
+
 function Write-HtmlReport {
     <#
     .SYNOPSIS
@@ -14310,6 +14797,15 @@ function Write-HtmlReport {
             ('<div class="detached-banner">{0} detached runner(s) still executing - see their window(s) and child log(s) below.</div>' -f $__stillRunning)
         } else { '' }
 
+        # [FIX-STEP38-PURGE] Build the Step 38 purged-startups section
+        # by calling the helper. Guard the call against $null so the
+        # audit-only path (nothing purged) doesn't throw on the
+        # [object[]] + Mandatory + AllowEmptyCollection binding.
+        $__purgedStartupSection = ''
+        if ($Script:LastStepPurgedStartups -and @($Script:LastStepPurgedStartups).Count -gt 0) {
+            $__purgedStartupSection = New-PurgedStartupSectionHtml -Records @($Script:LastStepPurgedStartups) -Escape $enc
+        }
+
         # ---- Assemble HTML ----
         $html = @"
 <!DOCTYPE html>
@@ -14466,6 +14962,8 @@ $($stepRows.ToString())
       '<table><thead><tr><th>Kind</th><th>PID</th><th>Note</th><th>Launched</th><th>Exit</th></tr></thead><tbody>' + $runnerRows.ToString() + '</tbody></table>'
     })
   </section>
+
+$__purgedStartupSection
 
   <section>
     <h2>Log</h2>
@@ -15473,6 +15971,7 @@ function Main {
                 $stepStatus = 'OK'
                 $stepDetail = ''
                 $Script:LastStepStatus = $null
+                $Script:LastStepDetail = $null   # [FIX-STEP38-PURGE]
                 try {
                     & $stepName
                     if ($Script:LastStepStatus) {
@@ -15492,12 +15991,14 @@ function Main {
                 $stepSw.Stop()
 
                 $rptName = if ($Script:StepNames.ContainsKey($stepNumStr)) { $Script:StepNames[$stepNumStr] } else { $stepName }
-                # [FIX-REPORT-ERRORDETAIL] On failure, prefer the live
-                # exception message ($stepDetail) over the static
-                # StepDescriptions blurb. Otherwise every failed step
-                # looked identical in the HTML report regardless of the
-                # actual error.
-                if ($stepStatus -eq 'Failed' -and -not [string]::IsNullOrWhiteSpace($stepDetail)) {
+                # [FIX-STEP38-PURGE] Priority for the report's Detail column:
+                #   1. Explicit per-step override ($Script:LastStepDetail)
+                #   2. Live exception message on failure
+                #   3. Static StepDescriptions blurb
+                #   4. Empty
+                if (-not [string]::IsNullOrWhiteSpace($Script:LastStepDetail)) {
+                    $rptDetail = $Script:LastStepDetail
+                } elseif ($stepStatus -eq 'Failed' -and -not [string]::IsNullOrWhiteSpace($stepDetail)) {
                     $rptDetail = $stepDetail
                 } elseif ($Script:StepDescriptions.ContainsKey($stepNumStr)) {
                     $rptDetail = $Script:StepDescriptions[$stepNumStr]
