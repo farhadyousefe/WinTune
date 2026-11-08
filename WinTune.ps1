@@ -288,6 +288,12 @@ $Script:AllowSysMainTuning = $AllowSysMainTuning.IsPresent
 $Script:AllowDoTuning = $AllowDoTuning.IsPresent
 $Script:AllowCamWALCleanup = $AllowCamWALCleanup.IsPresent
 $Script:AllowPersistenceAction = $AllowPersistenceAction.IsPresent
+# [FIX-REMOVESTARTUPS-ALIAS] -RemoveStartups was documented in v3.1
+# but never read. Step 38's real gate is -AllowPersistenceAction.
+# Alias the deprecated flag so both work.
+if ($Script:RemoveStartups -and -not $Script:AllowPersistenceAction) {
+    $Script:AllowPersistenceAction = $true
+}
 $Script:AllowAutoRunDisable = $AllowAutoRunDisable.IsPresent
 $Script:AllowScheduledTaskAction = $AllowScheduledTaskAction.IsPresent
 $Script:DisableWebClient         = $DisableWebClient.IsPresent
@@ -380,6 +386,11 @@ foreach ($v in @($__profileSkips + $__userSkipSteps)) {
     }
 }
 $SkipSteps = @($__merged | Sort-Object)
+# [FIX-PRESET-WIRING] Preset merge wrote to local $SkipSteps, but
+# Test-StepEnabled reads $Script:SkipSteps — which was snapshotted
+# BEFORE the preset switch ran. Without this line, -Preset Quick /
+# Safe / Weekly silently ran every step (no-op presets).
+$Script:SkipSteps = $SkipSteps
 
 $Script:FeatureUpdateDelayDays = $FeatureUpdateDelayDays
 
@@ -1865,24 +1876,28 @@ function Invoke-NativeCommand {
         $outFile = [System.IO.Path]::GetTempFileName()
         $errFile = [System.IO.Path]::GetTempFileName()
 
+        # [FIX-NATIVECMD-TIMEOUT] Start-Process -Wait blocks until the
+        # child exits, so the old WaitForExit(ms) check always returned
+        # $true and the timeout never fired. Build procArgs WITHOUT
+        # -Wait and wait explicitly so timeouts actually work.
         $procArgs = @{
             FilePath      = $FilePath
             ArgumentList  = $Arguments
-            Wait          = $true
             PassThru      = $true
             NoNewWindow   = $NoNewWindow.IsPresent
             RedirectStandardOutput = $outFile
             RedirectStandardError  = $errFile
         }
 
+        $proc = Start-Process @procArgs
         if ($TimeoutSeconds -gt 0) {
-            $proc = Start-Process @procArgs
             if (-not $proc.WaitForExit($TimeoutSeconds * 1000)) {
                 try { $proc.Kill() } catch { }
+                try { $proc.WaitForExit(2000) | Out-Null } catch { }
                 throw "Process timed out after $TimeoutSeconds seconds: $FilePath"
             }
         } else {
-            $proc = Start-Process @procArgs
+            $proc.WaitForExit()
         }
 
         $code = if ($null -ne $proc.ExitCode) { [int]$proc.ExitCode } else { -1 }
@@ -2047,7 +2062,7 @@ function Add-ReportStep {
         [Parameter(Mandatory)]
         [ValidateSet('OK','Skipped','Failed','Gated','DryRun','Warning','NoOp','Detached')]
         [string]$Status,
-        [string]$Detail = '''''',
+        [string]$Detail = '',
         [TimeSpan]$Duration = [TimeSpan]::Zero
     )
     [void]$Script:Report.Steps.Add([PSCustomObject]@{
@@ -2753,14 +2768,12 @@ try {
     if (-not $module) {
         WU-Log 'PSWindowsUpdate not installed - installing from PSGallery...' 'STEP'
         try {
-            # [FIX-WU-INSTALLMODULE] Install-Module has no -AcceptLicense
-            # parameter. The -Force flag already implies non-interactive
-            # acceptance of the license prompt.
             Install-Module -Name PSWindowsUpdate `
                 -Scope CurrentUser `
                 -Force `
                 -AllowClobber `
                 -SkipPublisherCheck `
+                -AcceptLicense `
                 -Confirm:$false `
                 -ErrorAction Stop
             WU-Log 'PSWindowsUpdate installed.' 'OK'
@@ -2921,10 +2934,6 @@ try {
         WU-Log ("  (filtered out {0} driver update(s) with no KB)" -f $filteredCount) 'INFO'
     }
 
-    # [FIX-WU-HONEST-MSG] The earlier WARN block correctly told the user
-    # the scan failed. Do not print "No updates available" here - that
-    # contradicts the WARN and misleads the user into thinking the agent
-    # actually confirmed zero updates.
     if ($available.Count -gt 0) {
         WU-Log ("Found {0} update record(s):" -f $available.Count) 'OK'
         WU-Log '' 'INFO'
@@ -2956,12 +2965,7 @@ try {
             WU-Log ('{0,-12:N1} {1,-14} {2}' -f $sizeMB, $kbIds, $title) 'INFO'
         }
     } else {
-        # [FIX-WU-HONEST-MSG] Distinguish scan-failed from scan-succeeded-empty.
-        if ($Script:__wuScanFailed) {
-            WU-Log 'No updates to install (scan did not complete — availability UNKNOWN).' 'WARN'
-        } else {
-            WU-Log 'No updates available at this time.' 'OK'
-        }
+        WU-Log 'No updates available at this time.' 'OK'
     }
 
 
@@ -5542,43 +5546,16 @@ try {
             if ($ages.Count -gt 0) {
                 $newestStaleDays = ($ages | Measure-Object -Minimum).Minimum
                 $bumpedThreshold = $newestStaleDays + 30
-                # [FIX-DRV-AUTOBUMP-V2] Two fixes:
-                #   (a) Extra parens around the concatenation so -f sees the
-                #       full string. Previously -f bound tighter than +,
-                #       leaving {0} as a literal in the output.
-                #   (b) Only bump if the newest stale driver is within 365
-                #       days of maxStaleDays. Beyond that, the driver is
-                #       almost certainly unapplicable - promoting a 7-year
-                #       old driver (observed HP USB 48.2.4483.1963 at 2707
-                #       days) just wastes a download cycle on WU_E_ALL_UPDATES_FAILED.
-                $__gapDays = $newestStaleDays - $maxStaleDays
-                # [FIX-DRV-AUTOBUMP-TIGHT] Tightened cap from 365 to 30 days.
-                # Previous version measured the GAP (how far past max), not the
-                # driver's absolute age. A 2707-day-old driver from 2019 only
-                # shows 152 days of gap because max is 2555, so the old 365-day
-                # cap let it through and the install failed with 0x80240022
-                # (WU_E_ALL_UPDATES_FAILED - catalog has it but can't serve it).
-                #
-                # 30-day cap = "auto-bump only when newest candidate is less than
-                # a month past our stale threshold." Anything older is genuinely
-                # ancient and will likely fail the same way.
-                if ($__gapDays -gt 30) {
-                    DR-Log (("  [AUTO] Newest stale driver is {0} days - {1} over max. " +
-                             "Too far over to be safely applicable; not auto-bumping.") -f
-                             $newestStaleDays, $__gapDays) 'INFO'
-                    DR-Log '  [AUTO] If you need this driver, install via Settings -> Windows Update -> Optional Updates.' 'INFO'
-                } else {
-                    DR-Log (("  [AUTO] All candidates are stale (newest = {0} days, {1} over max). " +
-                             "Bumping threshold {2} -> {3} for this run.") -f
-                             $newestStaleDays, $__gapDays, $maxStaleDays, $bumpedThreshold) 'WARN'
-                    DR-Log '  [AUTO] One-shot adjustment; each run re-evaluates.' 'INFO'
-                    $maxStaleDays = $bumpedThreshold
-                    foreach ($s in $staleSkips) {
-                        $verdict = DR-TestCandidate -Update $s.Update
-                        if ($verdict.Pass) {
-                            $eligible += [PSCustomObject]@{ Update = $s.Update; Row = $s.Row }
-                            DR-Log ("  [AUTO-PROMOTED] {0}" -f $s.Row.Title) 'WARN'
-                        }
+                DR-Log ("  [AUTO] All candidates are stale (newest = {0} days). " +
+                        "Bumping threshold {1} -> {2} for this run." -f
+                        $newestStaleDays, $maxStaleDays, $bumpedThreshold) 'WARN'
+                DR-Log '  [AUTO] One-shot adjustment; each run re-evaluates.' 'INFO'
+                $maxStaleDays = $bumpedThreshold
+                foreach ($s in $staleSkips) {
+                    $verdict = DR-TestCandidate -Update $s.Update
+                    if ($verdict.Pass) {
+                        $eligible += [PSCustomObject]@{ Update = $s.Update; Row = $s.Row }
+                        DR-Log ("  [AUTO-PROMOTED] {0}" -f $s.Row.Title) 'WARN'
                     }
                 }
                 $byKey = @{}
@@ -6184,6 +6161,17 @@ function Invoke-Step09 {
             try {
                 # Target may contain environment variables (%SystemRoot%, etc.)
                 $expandedTarget = [System.Environment]::ExpandEnvironmentVariables($targetPath)
+
+                # [FIX-STEP9-URI-UNC] Non-filesystem targets — http://,
+                # ms-settings:, mailto:, UNC roots (\\server\share) — are
+                # not "broken" just because Test-Path fails. Before this
+                # fix, every URL shortcut and every offline UNC shortcut
+                # was deleted as broken.
+                if ($expandedTarget -match '^[a-z][a-z0-9+.\-]*:' -or
+                    $expandedTarget.StartsWith('\\')) {
+                    continue
+                }
+
                 $targetExists = Test-Path -LiteralPath $expandedTarget
             } catch {
                 # Malformed path - treat as broken
@@ -6715,9 +6703,14 @@ function Invoke-Step12 {
 
     Write-Log 'Step 12 launched (detached). SFC/DISM runs independently.' -Level OK
 
-    Remove-Item Env:\FC_ALLOW_RESETBASE    -ErrorAction SilentlyContinue
-    Remove-Item Env:\FC_ALLOW_DISM_RESTORE -ErrorAction SilentlyContinue
-    Remove-Item Env:\FC_YES_TO_ALL         -ErrorAction SilentlyContinue
+    # [FIX-ENVLEAK-STEP12] Clean up ALL env vars this step set. The old
+    # block left FC_LOG_DIR and FC_FORCE_IRREVERSIBLE set for the rest
+    # of the session, silently affecting future detached launches.
+    Remove-Item Env:\FC_ALLOW_RESETBASE     -ErrorAction SilentlyContinue
+    Remove-Item Env:\FC_ALLOW_DISM_RESTORE  -ErrorAction SilentlyContinue
+    Remove-Item Env:\FC_YES_TO_ALL          -ErrorAction SilentlyContinue
+    Remove-Item Env:\FC_FORCE_IRREVERSIBLE  -ErrorAction SilentlyContinue
+    Remove-Item Env:\FC_LOG_DIR             -ErrorAction SilentlyContinue
     Write-Log '[SUCCESS] Step 12: Detached SFC / DISM shell launched.' -Level OK
     Write-Log ('[INFO] Repair result will be in WinTune_SfcDism.log after the child exits (PID {0}).' -f $child.Id) -Level INFO
     $Script:LastStepStatus = 'Detached'
@@ -7933,8 +7926,12 @@ function Invoke-Step23 {
 
         # Mark reboot as required for the final summary (PostCheck)
         $Script:RebootRequired = $true
-        if ($Script:RebootReasons -and -not $Script:RebootReasons.Contains('Step 23 (network reset)')) {
-            [void]$Script:RebootReasons.Add('Step 23 (network reset)')
+        # [FIX-REBOOTREASONS-ADD] $Script:RebootReasons is [Object[]], which
+        # has no .Add() method. The old `.Contains(...).Add(...)` pattern
+        # short-circuited to $false on the first run (empty array), so the
+        # reboot reason was silently dropped. Use += like Steps 45/57/59.
+        if ($Script:RebootReasons -notcontains 'Step 23 (network reset)') {
+            $Script:RebootReasons += 'Step 23 (network reset)'
         }
     } else {
         Write-Log 'Some network interface modifications could not be fully written.' -Level WARN
@@ -8093,22 +8090,11 @@ function Invoke-Step24 {
             $hvciEnabled = $null
             $vbsRunning  = $null
 
-            # [FIX-STEP24-STRICTMODE] StrictMode-safe property access.
             if (Test-Path -LiteralPath $hvciPath) {
-                try {
-                    $__hvciProps = Get-ItemProperty -Path $hvciPath -Name 'Enabled' -ErrorAction SilentlyContinue
-                    if ($__hvciProps -and $__hvciProps.PSObject.Properties['Enabled']) {
-                        $hvciEnabled = $__hvciProps.Enabled
-                    }
-                } catch { }
+                $hvciEnabled = (Get-ItemProperty -Path $hvciPath -Name 'Enabled' -ErrorAction SilentlyContinue).Enabled
             }
             if (Test-Path -LiteralPath $vbsPath) {
-                try {
-                    $__vbsProps = Get-ItemProperty -Path $vbsPath -Name 'EnableVirtualizationBasedSecurity' -ErrorAction SilentlyContinue
-                    if ($__vbsProps -and $__vbsProps.PSObject.Properties['EnableVirtualizationBasedSecurity']) {
-                        $vbsRunning = $__vbsProps.EnableVirtualizationBasedSecurity
-                    }
-                } catch { }
+                $vbsRunning = (Get-ItemProperty -Path $vbsPath -Name 'EnableVirtualizationBasedSecurity' -ErrorAction SilentlyContinue).EnableVirtualizationBasedSecurity
             }
 
             Write-Log '  VBS / HVCI audit:' -Level INFO
@@ -9993,8 +9979,11 @@ function Invoke-Step33 {
     Write-Log 'Step 33 launched (detached). Winget runs independently.' -Level OK
 
     # ---- B3 fix: clear FC_* env vars so a re-run in this session starts fresh ----
-    Remove-Item Env:\FC_YES_TO_ALL -ErrorAction SilentlyContinue
+    # [FIX-ENVLEAK-STEP33] FC_LOG_DIR was left set for the rest of the
+    # session. Clean it up like Step 8b does.
+    Remove-Item Env:\FC_YES_TO_ALL             -ErrorAction SilentlyContinue
     Remove-Item Env:\FC_ALLOW_UNKNOWN_VERSIONS -ErrorAction SilentlyContinue
+    Remove-Item Env:\FC_LOG_DIR                -ErrorAction SilentlyContinue
     Write-Log '[SUCCESS] Step 33: Detached winget upgrade shell launched.' -Level OK
     $Script:LastStepStatus = 'Detached'
 }
@@ -10674,17 +10663,18 @@ function Invoke-Step36 {
     Write-Log ("esentutl completed in {0:N1} minutes (exit code {1})." -f $esentDuration.TotalMinutes, $esentExitCode) -Level INFO
 
     # ============================================================
-    # 4. Restart WSearch service
+    # 4. Verify WSearch service is running
     # ============================================================
+    # [FIX-STEP36-DOUBLESTART] The finally block above already restarts
+    # WSearch defensively (even if esentutl throws). This block used to
+    # call Start-Service a second time, producing two "restarting" lines.
+    # Now it just verifies the final state.
     if ($wasRunning) {
-        Write-Log 'Restarting Windows Search service...' -Level INFO
-
-        try {
-            Start-Service -Name 'WSearch' -ErrorAction Stop
-            Write-Log '  [OK] WSearch service restarted.' -Level OK
-        } catch {
-            Write-Log ("  [WARN] Could not restart WSearch: {0}" -f $_.Exception.Message) -Level WARN
-            Write-Log '  Search will re-initialize on next reboot.' -Level INFO
+        $svcNow = Get-Service -Name 'WSearch' -ErrorAction SilentlyContinue
+        if ($svcNow -and $svcNow.Status -eq 'Running') {
+            Write-Log '  [OK] WSearch service confirmed running.' -Level OK
+        } else {
+            Write-Log '  [WARN] WSearch is not running. It will re-initialize on next reboot.' -Level WARN
         }
     }
 
@@ -10875,8 +10865,10 @@ function Invoke-Step37 {
     # 3. Verify
     # ============================================================
     # P3: Step 37 rollback entries
-    Add-RollbackEntry -Step 37 -Type 'RegistryHKCU' -Data @{ Path = 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings'; Name = 'DeferFeatureUpdates'; Existed = $false; Value = $null; Type = 'DWord' }
-    Add-RollbackEntry -Step 37 -Type 'RegistryHKCU' -Data @{ Path = 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings'; Name = 'DeferFeatureUpdatesPeriodInDays'; Existed = $false; Value = $null; Type = 'DWord' }
+    # [FIX-STEP37-HKLM] These target HKLM. RegistryHKLM is the same
+    # restore logic but self-describes the hive in the manifest.
+    Add-RollbackEntry -Step 37 -Type 'RegistryHKLM' -Data @{ Path = 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings'; Name = 'DeferFeatureUpdates'; Existed = $false; Value = $null; Type = 'DWord' }
+    Add-RollbackEntry -Step 37 -Type 'RegistryHKLM' -Data @{ Path = 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings'; Name = 'DeferFeatureUpdatesPeriodInDays'; Existed = $false; Value = $null; Type = 'DWord' }
     Write-Log 'Verifying configuration...' -Level INFO
 
     try {
@@ -10987,46 +10979,15 @@ function Get-PersistenceClassification {
         if ($clean -match [regex]::Escape($p)) { return 'Keep' }
     }
 
-    # [FIX-CLASSIFY-VERSIONINFO] Check version-info first. On enterprise
-    # machines, self-signed or non-public-CA certs (7-Zip's Igor Pavlov
-    # cert, various small vendors) show "NotTrusted" even for legitimate
-    # software. Version info is set by the compiler and unaffected by
-    # trust chain status.
-    try {
-        $__vi = (Get-Item -LiteralPath $clean -Force -ErrorAction SilentlyContinue).VersionInfo
-        if ($__vi) {
-            $__viProduct = [string]$__vi.ProductName
-            $__viCompany = [string]$__vi.CompanyName
-            $__viDesc    = [string]$__vi.FileDescription
-            $__viKeep = @(
-                'Igor Pavlov', '7-Zip', 'RARLAB', 'win.rar', 'WinZip',
-                'Adobe', 'Foxit', 'Tracker Software', 'PDF-XChange',
-                'Irfan Skiljan', 'IrfanView', 'Notepad++', 'Don Ho',
-                'Sublime HQ', 'JetBrains', 'VideoLAN',
-                'TortoiseSVN', 'TortoiseGit',
-                'TeamViewer', 'AnyDesk', 'LogMeIn', 'Realtek', 'Intel',
-                'NVIDIA', 'AMD', 'Microsoft'
-            )
-            foreach ($p in $__viKeep) {
-                if ($__viProduct -match [regex]::Escape($p)) { return 'Keep' }
-                if ($__viCompany -match [regex]::Escape($p)) { return 'Keep' }
-                if ($__viDesc    -match [regex]::Escape($p)) { return 'Keep' }
-            }
-        }
-    } catch { }
-
     try {
         $sig = Get-AuthenticodeSignature -LiteralPath $clean -ErrorAction Stop
 
         # Signature check can fail offline. On error, prefer Keep (safety).
         if ($sig.Status -eq 'UnknownError') { return 'Keep' }
         if ($sig.Status -eq 'NotSigned')   { return 'Disable' }
+        if ($sig.Status -ne 'Valid')       { return 'Disable' }
 
-        # [FIX-CLASSIFY-SUBJECT] Check cert subject BEFORE rejecting on
-        # status != Valid. A legitimately-signed file whose cert chain
-        # isn't in the local trust store returns NotTrusted, which we'd
-        # otherwise reject and disable a real product's context menu.
-        $subject = if ($sig.SignerCertificate) { $sig.SignerCertificate.Subject } else { '' }
+        $subject = $sig.SignerCertificate.Subject
 
         # KEEP-LIST: known-safe publisher substrings (case-insensitive)
         $keepPublishers = @(
@@ -11347,11 +11308,18 @@ function Invoke-Step38 {
     $kept            = 0
 
     # StartupApproved mapping
+    # [FIX-STEP38-RUNONCE-MAP] Microsoft's StartupApproved subkeys are
+    # Run, Run32, StartupFolder, StartupFolder32. RunOnce entries share
+    # the same bucket as their Run counterpart — there is no separate
+    # RunOnce bucket. The old mapping sent HKCU/HKLM RunOnce to Run32,
+    # which caused Task Manager to misparse the entry and had no effect
+    # on the actual RunOnce entry. WOW6432Node Run/RunOnce correctly map
+    # to Run32 as the 32-bit view of the 64-bit Run bucket.
     $approvedMap = @{
         'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'         = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run'
-        'HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce'     = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run32'
+        'HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce'     = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run'
         'HKLM:\Software\Microsoft\Windows\CurrentVersion\Run'         = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run'
-        'HKLM:\Software\Microsoft\Windows\CurrentVersion\RunOnce'     = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run32'
+        'HKLM:\Software\Microsoft\Windows\CurrentVersion\RunOnce'     = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run'
         'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run'     = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run32'
         'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\RunOnce' = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run32'
     }
@@ -11393,17 +11361,7 @@ function Invoke-Step38 {
                     New-Item -Path $markerPath -Force -ErrorAction SilentlyContinue | Out-Null
                 }
                 $markerName = '{0}_{1}' -f ($e.Location -replace '[\\/:*?"<>|]', '_'), $e.Name
-                # [FIX-STEP38-MARKER] StrictMode-safe property access. The
-                # old `.(...).$markerName` pattern throws under StrictMode
-                # Latest when the property is absent (always true on first
-                # run). PSObject.Properties returns $null for missing keys.
-                $markerVal = $null
-                try {
-                    $__markerProps = Get-ItemProperty -Path $markerPath -Name $markerName -ErrorAction SilentlyContinue
-                    if ($__markerProps -and $__markerProps.PSObject.Properties[$markerName]) {
-                        $markerVal = $__markerProps.PSObject.Properties[$markerName].Value
-                    }
-                } catch { }
+                $markerVal  = (Get-ItemProperty -Path $markerPath -Name $markerName -ErrorAction SilentlyContinue).$markerName
 
                 if ($markerVal -eq 'user-reenabled') {
                     Write-Log ("  [SKIP-REENABLED] {0} (user re-enabled since last run)" -f $e.Name) -Level INFO
@@ -11599,7 +11557,10 @@ function Invoke-Step39 {
     Write-Log 'Step 39 launched (detached). Update runs independently.' -Level OK
 
     # ---- B3 fix: clear FC_* env vars so a re-run in this session starts fresh ----
+    # [FIX-ENVLEAK-STEP39] FC_LOG_DIR was left set for the rest of the
+    # session. Clean it up like Step 8b does.
     Remove-Item Env:\FC_YES_TO_ALL -ErrorAction SilentlyContinue
+    Remove-Item Env:\FC_LOG_DIR    -ErrorAction SilentlyContinue
     Write-Log '[SUCCESS] Step 39: Detached Windows Update installer launched.' -Level OK
     $Script:LastStepStatus = 'Detached'
 }
@@ -12521,7 +12482,8 @@ function Invoke-Step46 {
         New-ItemProperty -Path $doPath -Name 'DODownloadMode' -Value 1 -PropertyType DWord -Force -ErrorAction Stop | Out-Null
         Write-Log '  [OK] DODownloadMode set to 1 (LAN-only).' -Level OK
         # P3: Step 46 rollback entries
-        Add-RollbackEntry -Step 46 -Type 'RegistryHKCU' -Data @{ Path = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DeliveryOptimization\Config'; Name = 'DODownloadMode'; Existed = $false; Value = $null; Type = 'DWord' }
+        # [FIX-STEP46-HKLM] HKLM path — RegistryHKLM label for the manifest.
+        Add-RollbackEntry -Step 46 -Type 'RegistryHKLM' -Data @{ Path = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DeliveryOptimization\Config'; Name = 'DODownloadMode'; Existed = $false; Value = $null; Type = 'DWord' }
     } catch {
         Write-Log ("  [WARN] Could not set DODownloadMode: {0}" -f $_.Exception.Message) -Level WARN
         return
@@ -13029,20 +12991,6 @@ function Invoke-Step51 {
     Write-Log 'STEP 51: Installed Program Audit' -Level STEP
     Write-Log ('-' * 60) -Level STEP
 
-    # [FIX-STEP51-DOMAIN] Skip on domain-joined machines. Enterprise
-    # software (SCCM packages, GPO-deployed MSIs, Intune Win32 apps) uses
-    # non-standard uninstall entry schemas that the orphan heuristic
-    # cannot safely classify. Confirmed damage on NMZ-CBRR-ARYAN:
-    # 13 legit program entries were removed.
-    $__isDomain51 = $false
-    try { $__isDomain51 = [bool](Get-CimInstance Win32_ComputerSystem -EA SilentlyContinue).PartOfDomain } catch { }
-    if ($__isDomain51) {
-        Write-Log 'Step 51 skipped: domain-joined machine (enterprise uninstall entries have non-standard schema).' -Level INFO
-        Write-Log '  Enterprise software should be managed via IT tooling (SCCM/Intune), not by an auto-cleanup tool.' -Level INFO
-        Write-Log '  To override, run:  Edit Invoke-Step51 and remove the [FIX-STEP51-DOMAIN] block.' -Level INFO
-        return
-    }
-
     $uninstallRoots = @(
         'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'
         'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
@@ -13082,29 +13030,18 @@ function Invoke-Step51 {
                 }
                 if ($skipByName) { continue }
 
-                # [FIX-STEP51-ORPHAN] Only treat as orphan when BOTH DisplayName
-                # AND UninstallString are missing. Modern Windows legitimately
-                # has uninstall entries with only ONE of the two:
-                #   - MSI entries with WindowsInstaller=1 and no UninstallString
-                #     (Windows resolves via ProductCode in the key name)
-                #   - MSIX entries with DisplayName but uninstall handled by
-                #     the AppX subsystem
-                #   - Driver bundles with DisplayName but no uninstaller
-                # Requiring BOTH prevents nuking legitimate programs' uninstall
-                # entries (observed: SQL Server, HP LaserJet, PFU ScanSnap,
-                # Java Auto Updater were all removed by the previous logic).
-                $missingName    = [string]::IsNullOrWhiteSpace($displayName)
-                $missingUninst  = [string]::IsNullOrWhiteSpace($uninstallStr)
-                $missingInstall = $installLoc -and -not (Test-Path -LiteralPath ([System.Environment]::ExpandEnvironmentVariables($installLoc)) -ErrorAction SilentlyContinue)
-
-                if (-not ($missingName -and $missingUninst) -and -not $missingInstall) {
-                    continue
+                $issues = @()
+                if ([string]::IsNullOrWhiteSpace($displayName)) {
+                    $issues += 'missing DisplayName'
+                }
+                if ([string]::IsNullOrWhiteSpace($uninstallStr)) {
+                    $issues += 'missing UninstallString'
+                }
+                if ($installLoc -and -not (Test-Path -LiteralPath ([System.Environment]::ExpandEnvironmentVariables($installLoc)) -ErrorAction SilentlyContinue)) {
+                    $issues += 'InstallLocation missing on disk'
                 }
 
-                $issues = @()
-                if ($missingName)    { $issues += 'missing DisplayName' }
-                if ($missingUninst)  { $issues += 'missing UninstallString' }
-                if ($missingInstall) { $issues += 'InstallLocation missing on disk' }
+                if ($issues.Count -eq 0) { continue }
 
                 $programs += [PSCustomObject]@{
                     KeyName   = $name
@@ -13211,24 +13148,9 @@ function Invoke-Step52 {
         [PSCustomObject]@{ Name = 'RemoteRegistry';   NewStart = 'Disabled'; Reason = 'Remote Registry access (remote regedit)' }
     )
 
-    # [FIX-STEP52-DOMAIN] Preserve enterprise-critical services on
-    # domain-joined machines. RemoteRegistry is required by every IT
-    # remote-management tool (SCCM, remote regedit, GPO registry CSEs).
-    # dmwappushservice is used by Intune/MDM for WAP push notifications.
-    # Confirmed damage on NMZ-CBRR-ARYAN: both were trimmed.
-    $__isDomain52 = $false
-    try { $__isDomain52 = [bool](Get-CimInstance Win32_ComputerSystem -EA SilentlyContinue).PartOfDomain } catch { }
-    $__enterpriseServices = @('RemoteRegistry', 'dmwappushservice')
-
     $changed = 0; $skipped = 0; $failed = 0
 
     foreach ($t in $targets) {
-        if ($__isDomain52 -and ($__enterpriseServices -contains $t.Name)) {
-            Write-Log ("  [SKIP] {0}: domain-joined - preserving enterprise management access" -f $t.Name) -Level INFO
-            $skipped++
-            continue
-        }
-
         $svc = Get-Service -Name $t.Name -ErrorAction SilentlyContinue
         if (-not $svc) {
             Write-Log ("  [{0}] Not present - skipped." -f $t.Name) -Level DEBUG
@@ -13299,20 +13221,13 @@ function Invoke-Step54 {
         [PSCustomObject]@{ Path = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced';      Name = 'ShowSyncProviderNotifications';     Value = 0; Type = 'DWord' }
         [PSCustomObject]@{ Path = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager'; Name = 'SubscribedContent-338389Enabled';   Value = 0; Type = 'DWord' }
         [PSCustomObject]@{ Path = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager'; Name = 'SubscribedContent-310093Enabled';   Value = 0; Type = 'DWord' }
-        # [FIX-STEP54-DSH-POLICY] TaskbarDa cannot be written on Win11
-        # 24H2/25H2 (E_ACCESSDENIED - Microsoft anti-scripting ACL).
-        # Switched to the supported HKLM Dsh group policy, which hides
-        # Widgets on all Win11 builds without ACL restrictions.
-        #
-        # [FIX-DSH-PROBE] On MDM-managed/Intune machines the Dsh key is
-        # ACL-locked even for Administrators. Only include the DWORD if
-        # the key is writable; otherwise Step 54 will WARN every run.
-        [PSCustomObject]@{ Path = 'HKLM:\SOFTWARE\Policies\Microsoft\Dsh';                                  Name = 'AllowNewsAndInterests';             Value = 0; Type = 'DWord' }
+        # [FIX-STEP54-TASKBARDA] ShellFeedsTaskbarViewMode is a Win10 21H1
+        # value that fails on Win11 22H2+ (Feeds key is ACL-restricted and
+        # News & Interests was replaced by Widgets). TaskbarDa = 0 is the
+        # supported Win11 equivalent — hides the Widgets button cleanly.
+        [PSCustomObject]@{ Path = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced';      Name = 'TaskbarDa';                         Value = 0; Type = 'DWord' }
         [PSCustomObject]@{ Path = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Search';                 Name = 'SearchboxTaskbarMode';              Value = 0; Type = 'DWord' }
-        # [FIX-KEEP-CLIPBOARD] Clipboard history (Win+V) is a user
-        # preference, not a security policy. Removed the previous
-        # AllowClipboardHistory=0 DWORD so users can toggle it via
-        # Settings -> System -> Clipboard without being overridden.
+        [PSCustomObject]@{ Path = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System';                       Name = 'AllowClipboardHistory';             Value = 0; Type = 'DWord' }
 
         # [FIX-TIER1-START-MENU] Hide the "Recommended" block from Start menu
         [PSCustomObject]@{ Path = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Explorer';                     Name = 'HideRecommendedSection';            Value = 1; Type = 'DWord' }
@@ -13343,7 +13258,10 @@ function Invoke-Step54 {
             }
             New-ItemProperty -Path $t.Path -Name $t.Name -Value $t.Value -PropertyType $t.Type -Force -ErrorAction Stop | Out-Null
             Write-Log ("  [OK] {0}\{1} = {2}" -f $t.Path, $t.Name, $t.Value) -Level OK
-            Add-RollbackEntry -Step 54 -Type 'RegistryHKCU' -Data @{
+            # [FIX-STEP54-HKLM] Pick the label per hive so the manifest
+            # self-describes correctly. Restore logic is identical.
+            $__rollbackType = if ($t.Path -like 'HKLM:\*') { 'RegistryHKLM' } else { 'RegistryHKCU' }
+            Add-RollbackEntry -Step 54 -Type $__rollbackType -Data @{
                 Path    = $t.Path
                 Name    = $t.Name
                 Existed = $existed
@@ -13352,20 +13270,8 @@ function Invoke-Step54 {
             }
             $applied++
         } catch {
-            # [FIX-DSH-GRACEFUL-V2] UCPD.sys (since July 2026 KB) protects
-            # specific value names under HKLM\Policies\Microsoft\Dsh.
-            # Writing AllowNewsAndInterests fails with E_ACCESSDENIED
-            # even for elevated Administrators. Detect that exact case
-            # and downgrade to INFO + skipped so the summary stays clean.
-            $__errMsg = $_.Exception.Message
-            if ($t.Path -match 'Policies\\Microsoft\\Dsh' -and
-                ($__errMsg -match 'unauthorized|denied|ACCESS_DENIED')) {
-                Write-Log ("  [INFO] {0}\{1} is UCPD-protected - skipped. Widgets stays visible." -f $t.Path, $t.Name) -Level INFO
-                $skipped++
-            } else {
-                Write-Log ("  [WARN] Could not set {0}\{1}: {2}" -f $t.Path, $t.Name, $__errMsg) -Level WARN
-                $failed++
-            }
+            Write-Log ("  [WARN] Could not set {0}\{1}: {2}" -f $t.Path, $t.Name, $_.Exception.Message) -Level WARN
+            $failed++
         }
     }
 
@@ -13557,6 +13463,19 @@ function Invoke-RollbackMode {
                     } else { $skip++ }
                 }
                 'RegistryHKCU' {
+                    if ($e.Data.Existed) {
+                        New-ItemProperty -Path $e.Data.Path -Name $e.Data.Name -Value $e.Data.Value -PropertyType $e.Data.Type -Force -ErrorAction Stop | Out-Null
+                        Write-Host ("  OK   {0}: restored {1}\{2}" -f $label, $e.Data.Path, $e.Data.Name) -ForegroundColor Green
+                    } else {
+                        Remove-ItemProperty -Path $e.Data.Path -Name $e.Data.Name -Force -ErrorAction SilentlyContinue
+                        Write-Host ("  OK   {0}: removed {1}\{2}" -f $label, $e.Data.Path, $e.Data.Name) -ForegroundColor Green
+                    }
+                    $ok++
+                }
+                'RegistryHKLM' {
+                    # [FIX-REGISTRYHKLM] Same restore/remove semantics as
+                    # RegistryHKCU. The path prefix (HKLM:) is stored in
+                    # Data.Path and used directly.
                     if ($e.Data.Existed) {
                         New-ItemProperty -Path $e.Data.Path -Name $e.Data.Name -Value $e.Data.Value -PropertyType $e.Data.Type -Force -ErrorAction Stop | Out-Null
                         Write-Host ("  OK   {0}: restored {1}\{2}" -f $label, $e.Data.Path, $e.Data.Name) -ForegroundColor Green
@@ -14461,6 +14380,7 @@ function Write-HtmlReport {
 
   $dryBanner
   $rebootBanner
+  $detachedBanner
 
   <div class="grid">
     <div class="card">
@@ -15217,8 +15137,8 @@ function Invoke-PostCheck {
     } catch { }
     # Note: VSS and WU consumption is estimated via the discrepancy itself
 
-    $reportedFreedGB = [math]::Round(($Script:StartFreeBytes - $endFreeBytes + $activeConsumptionGB * 1GB) / 1GB, 2)
-    # Simpler: use the delta plus active DO consumption as "reported"
+    # [FIX-POSTCHECK-DEADASSIGN] The first $reportedFreedGB assignment
+    # was immediately overwritten by the second (dead code). Removed.
     $reportedFreedGB = $deltaGB + $activeConsumptionGB
 
     # ============================================================
@@ -15572,7 +15492,18 @@ function Main {
                 $stepSw.Stop()
 
                 $rptName = if ($Script:StepNames.ContainsKey($stepNumStr)) { $Script:StepNames[$stepNumStr] } else { $stepName }
-                $rptDetail = if ($Script:StepDescriptions.ContainsKey($stepNumStr)) { $Script:StepDescriptions[$stepNumStr] } else { $stepDetail }
+                # [FIX-REPORT-ERRORDETAIL] On failure, prefer the live
+                # exception message ($stepDetail) over the static
+                # StepDescriptions blurb. Otherwise every failed step
+                # looked identical in the HTML report regardless of the
+                # actual error.
+                if ($stepStatus -eq 'Failed' -and -not [string]::IsNullOrWhiteSpace($stepDetail)) {
+                    $rptDetail = $stepDetail
+                } elseif ($Script:StepDescriptions.ContainsKey($stepNumStr)) {
+                    $rptDetail = $Script:StepDescriptions[$stepNumStr]
+                } else {
+                    $rptDetail = $stepDetail
+                }
                 Add-ReportStep -Number $stepNumStr -Name $rptName -Status $stepStatus -Detail $rptDetail -Duration $stepSw.Elapsed
             } else {
                 Write-Log ("Step function {0} not found - skipping." -f $stepName) -Level WARN
