@@ -2707,12 +2707,27 @@ function Pause-Exit {
 }
 # ---- Embedded WUA cache reset helper (needed because this is a separate process) ----
 function Reset-WUCache {
+    # [FIX-V62-4a] Capture original service states BEFORE stopping.
+    # The finally block added by V62-4c uses these to restore only the
+    # services that were running before the reset.
+    $__svcStates = @{}
+    foreach ($__svcName in 'cryptsvc', 'bits', 'wuauserv') {
+        $__s = Get-Service -Name $__svcName -ErrorAction SilentlyContinue
+        $__svcStates[$__svcName] = @{
+            Existed    = [bool]$__s
+            WasRunning = ($__s -and $__s.Status -eq 'Running')
+        }
+    }
     try {
         # [FIX-AUD-2] AppIDSvc removed from the stop list. AppIDSvc
         # enforces AppLocker policy; stopping it can disable application
         # control on managed machines. It is not required for WU cache
         # reset — the actual WU stack is wuauserv + bits + cryptsvc.
+        # [FIX-V62-4b] Only stop services that were running. A service
+        # the user had already stopped before WinTune runs is left
+        # alone — WinTune never restores it because it never changed it.
         foreach ($svc in 'wuauserv', 'bits', 'cryptsvc') {
+            if (-not $__svcStates[$svc].WasRunning) { continue }
             try { Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue -WarningAction SilentlyContinue } catch { }
         }
         Start-Sleep -Seconds 3
@@ -2729,17 +2744,12 @@ function Reset-WUCache {
         }
 
         # [FIX-AUD-2] AppIDSvc not in start list either (see stop list).
-        foreach ($svc in 'cryptsvc', 'bits', 'wuauserv') {
-            try { Start-Service -Name $svc -ErrorAction SilentlyContinue -WarningAction SilentlyContinue } catch { }
-        }
         Start-Sleep -Seconds 3
 
         $deadline = (Get-Date).AddSeconds(30)
         while ((Get-Date) -lt $deadline) {
             $wu = Get-Service -Name wuauserv -ErrorAction SilentlyContinue
             if ($wu -and $wu.Status -eq 'Running') {
-                # [FIX-RESETWU-HASHTABLE] Return hashtable so caller can
-                # log WHY the reset failed, not just "didn't work."
                 return @{ Ok = $true; Reason = 'reset complete; wuauserv running' }
             }
             Start-Sleep -Seconds 2
@@ -2747,6 +2757,16 @@ function Reset-WUCache {
         return @{ Ok = $false; Reason = 'wuauserv did not reach Running within 30s after reset' }
     } catch {
         return @{ Ok = $false; Reason = $_.Exception.Message }
+    } finally {
+        # [FIX-V62-4c] Restore only services that were running before.
+        # finally guarantees restoration even if cache ops threw.
+        foreach ($svc in 'cryptsvc', 'bits', 'wuauserv') {
+            if (-not $__svcStates[$svc].WasRunning) { continue }
+            $__cur = Get-Service -Name $svc -ErrorAction SilentlyContinue
+            if ($__cur -and $__cur.Status -ne 'Running') {
+                try { Start-Service -Name $svc -ErrorAction SilentlyContinue -WarningAction SilentlyContinue } catch { }
+            }
+        }
     }
 }
 
@@ -11186,6 +11206,17 @@ function Get-CommandPayload {
     elseif ($raw -match "^'{2}([^']+?)'{2}(\s|$)") { $exe = $Matches[1] }
     elseif ($raw -match '^"([^"]+)"(\s|$)')        { $exe = $Matches[1] }
     elseif ($raw -match "^'([^']+)'(\s|$)")        { $exe = $Matches[1] }
+    # [FIX-V65-1] Unquoted path with spaces. Some apps register
+    # 'C:\Program Files\Vendor\App\foo.exe /arg' WITHOUT wrapping the
+    # path in quotes. The old '^([^\s"]+)' branch stopped at the first
+    # space and returned 'C:\Program'. New branch matches greedily to
+    # the first executable extension followed by whitespace or EOL.
+    # Non-greedy `.+?` ensures we stop at the FIRST .exe boundary, so
+    # 'C:\Program Files\foo.exe bar.exe' extracts 'C:\Program Files\foo.exe'
+    # (not 'C:\Program Files\foo.exe bar.exe').
+    elseif ($raw -match '^(.+?\.(exe|com|bat|cmd|ps1|msc|cpl|scr))(\s|$)') {
+        $exe = $Matches[1]
+    }
     elseif ($raw -match '^([^\s"]+)')              { $exe = $Matches[1] }
     if (-not $exe) { return $result }
 
@@ -11200,28 +11231,51 @@ function Get-CommandPayload {
         'rundll32.exe', 'regsvr32.exe'
     )
     if ($hostExes -contains $leafLower) {
+        # [FIX-V62-1] Quote-aware extraction. Old regexes used
+        # [^"''\s]+ which stopped at the first space even when the path
+        # was quoted — "C:\Program Files\X.ps1" became "C:\Program".
+        # That path fails Test-Path and the entry got mis-classified as
+        # Purge. New logic: try quoted form first, then unquoted.
         $payload = $null
+
+        $__extractArg = {
+            param([string]$Text, [string]$FlagPattern)
+            if ($Text -match ($FlagPattern + '\s+"([^"]+)"')) { return $Matches[1] }
+            if ($Text -match ($FlagPattern + "\s+'([^']+)'")) { return $Matches[1] }
+            if ($Text -match ($FlagPattern + '\s+([^\s"''][^\s"'']*\.[A-Za-z0-9]{2,4})')) { return $Matches[1] }
+            return $null
+        }
+
         switch ($leafLower) {
-            'powershell.exe' {
-                if ($raw -match '-File\s+["'']?([^"''\s]+)') { $payload = $Matches[1] }
-            }
-            'pwsh.exe' {
-                if ($raw -match '-File\s+["'']?([^"''\s]+)') { $payload = $Matches[1] }
-            }
-            'cmd.exe' {
-                if ($raw -match '/[cC]\s+["'']?([^"''\s]+)') { $payload = $Matches[1] }
-            }
+            'powershell.exe' { $payload = & $__extractArg $raw '-File' }
+            'pwsh.exe'       { $payload = & $__extractArg $raw '-File' }
+            'cmd.exe'        { $payload = & $__extractArg $raw '/[cC]' }
             'wscript.exe' {
-                if ($raw -match '["'']?([^"''\s]+\.(vbs|js|wsf))["'']?') { $payload = $Matches[1] }
+                $payload = & $__extractArg $raw ''
+                if (-not $payload) {
+                    if ($raw -match '["'']([^"'']+\.(vbs|js|wsf))["'']') { $payload = $Matches[1] }
+                }
             }
             'cscript.exe' {
-                if ($raw -match '["'']?([^"''\s]+\.(vbs|js|wsf))["'']?') { $payload = $Matches[1] }
+                $payload = & $__extractArg $raw ''
+                if (-not $payload) {
+                    if ($raw -match '["'']([^"'']+\.(vbs|js|wsf))["'']') { $payload = $Matches[1] }
+                }
             }
             'mshta.exe' {
-                if ($raw -match '["'']?([^"''\s]+\.(hta|vbs|js))["'']?') { $payload = $Matches[1] }
+                $payload = & $__extractArg $raw ''
+                if (-not $payload) {
+                    if ($raw -match '["'']([^"'']+\.(hta|vbs|js))["'']') { $payload = $Matches[1] }
+                }
             }
             'rundll32.exe' {
-                if ($raw -match '["'']?([^"''\s,]+\.dll)') { $payload = $Matches[1] }
+                if ($raw -match '["'']([^"'',\s]+\.dll)') { $payload = $Matches[1] }
+                elseif ($raw -match '([^\s"'']+\.dll)') { $payload = $Matches[1] }
+            }
+            'regsvr32.exe' {
+                # [FIX-V62-1] regsvr32 payload extraction (was unhandled).
+                if ($raw -match '["'']([^"'']+\.(dll|ocx))["'']') { $payload = $Matches[1] }
+                elseif ($raw -match '([^\s"'']+\.(dll|ocx))') { $payload = $Matches[1] }
             }
         }
         if ($payload) {
@@ -11252,47 +11306,135 @@ function Classify-StartupEntry {
         [string]$SourceType
     )
 
-    if ($SourceType -eq 'ApprovedOnly') { return 'Purge' }
-    if ([string]::IsNullOrWhiteSpace($RawCommand)) { return 'Unknown' }
+    # [FIX-V64] Full DEBUG logging at every branch. This lets the
+    # next audit-only Step 38 run reveal EXACTLY which condition is
+    # producing UNKNOWN for entries that should be PURGE.
+    Write-Log ("[CLASSIFY] IN: SourceType='{0}' CommandLength={1}" -f $SourceType, $RawCommand.Length) -Level DEBUG
+    Write-Log ("[CLASSIFY] RawCommand: '{0}'" -f $RawCommand) -Level DEBUG
 
-    $payload = Get-CommandPayload -CommandLine $RawCommand
-    if ($payload.Confidence -eq 'Unknown') { return 'Unknown' }
-
-    $clean = [System.Environment]::ExpandEnvironmentVariables(
-        ($payload.Executable -replace '"', '').Trim()
-    )
-    if (-not $clean) { return 'Unknown' }
-
-    $winInternal = @(
-        '\Windows\System32\'
-        '\Windows\SysWOW64\'
-        '\Windows\SystemApps\'
-        '\Windows\SystemTemp\'
-        '\Windows\WinSxS\'
-        # [FIX-V7-3] Hardware driver packages live here. Explicit entry
-        # documents intent; \Windows\System32\ already covers it via
-        # prefix match, but making it explicit prevents future churn.
-        '\Windows\System32\DriverStore\'
-        '\Program Files\Windows Defender\'
-        '\Program Files\Windows Security\'
-        '\Program Files\WindowsApps\Microsoft.'
-        '\Program Files\WindowsApps\MicrosoftCorporationII.'
-        '\Program Files\Common Files\Microsoft Shared\'
-        '\Program Files\Microsoft OneDrive\'
-        '\AppData\Local\Microsoft\OneDrive\'
-    )
-    foreach ($p in $winInternal) {
-        if ($clean -match [regex]::Escape($p)) { return 'Keep' }
+    if ($SourceType -eq 'ApprovedOnly') {
+        Write-Log "[CLASSIFY] -> Purge (ApprovedOnly - no source to verify)" -Level DEBUG
+        return 'Purge'
+    }
+    if ([string]::IsNullOrWhiteSpace($RawCommand)) {
+        Write-Log "[CLASSIFY] -> Unknown (empty command)" -Level DEBUG
+        return 'Unknown'
     }
 
-    if (-not (Test-Path -LiteralPath $clean -ErrorAction SilentlyContinue)) {
+    $payload = $null
+    try {
+        $payload = Get-CommandPayload -CommandLine $RawCommand
+    } catch {
+        Write-Log ("[CLASSIFY] Get-CommandPayload THREW: {0}" -f $_.Exception.Message) -Level DEBUG
+        return 'Unknown'
+    }
+
+    Write-Log ("[CLASSIFY] Payload.Executable: '{0}'" -f $payload.Executable) -Level DEBUG
+    Write-Log ("[CLASSIFY] Payload.Hosted: {0}" -f $payload.Hosted) -Level DEBUG
+    Write-Log ("[CLASSIFY] Payload.Confidence: '{0}'" -f $payload.Confidence) -Level DEBUG
+
+    if ($payload.Confidence -eq 'Unknown') {
+        Write-Log "[CLASSIFY] -> Unknown (payload returned Confidence=Unknown)" -Level DEBUG
+        return 'Unknown'
+    }
+
+    $clean = ''
+    try {
+        $clean = [System.Environment]::ExpandEnvironmentVariables(
+            ($payload.Executable -replace '"', '').Trim()
+        )
+    } catch {
+        Write-Log ("[CLASSIFY] ExpandEnvironmentVariables THREW: {0}" -f $_.Exception.Message) -Level DEBUG
+        return 'Unknown'
+    }
+    Write-Log ("[CLASSIFY] Clean path: '{0}' (length={1})" -f $clean, $clean.Length) -Level DEBUG
+
+    if (-not $clean) {
+        Write-Log "[CLASSIFY] -> Unknown (clean path empty after processing)" -Level DEBUG
+        return 'Unknown'
+    }
+
+    $__cleanFull = $clean
+    try {
+        $__cleanFull = [System.IO.Path]::GetFullPath($clean)
+    } catch {
+        Write-Log ("[CLASSIFY] GetFullPath THREW: {0}" -f $_.Exception.Message) -Level DEBUG
+    }
+    Write-Log ("[CLASSIFY] FullPath: '{0}'" -f $__cleanFull) -Level DEBUG
+
+    $__winRoots = @(
+        ($env:SystemRoot + '\System32\')
+        ($env:SystemRoot + '\SysWOW64\')
+        ($env:SystemRoot + '\SystemApps\')
+        ($env:SystemRoot + '\SystemTemp\')
+        ($env:SystemRoot + '\WinSxS\')
+        ($env:SystemRoot + '\System32\DriverStore\')
+        ($env:ProgramFiles + '\Windows Defender\')
+        ($env:ProgramFiles + '\Windows Security\')
+        ($env:ProgramFiles + '\WindowsApps\Microsoft.')
+        ($env:ProgramFiles + '\WindowsApps\MicrosoftCorporationII.')
+        ($env:ProgramFiles + '\Common Files\Microsoft Shared\')
+        ($env:ProgramFiles + '\Microsoft OneDrive\')
+        ($env:LOCALAPPDATA + '\Microsoft\OneDrive\')
+    )
+    foreach ($__root in $__winRoots) {
+        if ([string]::IsNullOrEmpty($__root)) { continue }
+        $__rootNorm = $__root.TrimEnd('\')
+        if ($__cleanFull.StartsWith($__rootNorm + '\', [StringComparison]::OrdinalIgnoreCase) -or
+            $__cleanFull -ieq $__rootNorm) {
+            Write-Log ("[CLASSIFY] -> Keep (matches winRoot: {0})" -f $__rootNorm) -Level DEBUG
+            return 'Keep'
+        }
+    }
+
+    $__exists = $false
+    try {
+        $__exists = Test-Path -LiteralPath $clean -ErrorAction SilentlyContinue
+    } catch {
+        Write-Log ("[CLASSIFY] Test-Path THREW: {0}" -f $_.Exception.Message) -Level DEBUG
+    }
+    Write-Log ("[CLASSIFY] Test-Path('{0}') = {1}" -f $clean, $__exists) -Level DEBUG
+
+    if (-not $__exists) {
+        # [FIX-V65-2] Defense-in-depth. If extraction produced a path
+        # that looks suspiciously broken — short, no extension, raw
+        # command much longer — this is likely a parsing failure, not a
+        # missing file. Return Unknown (which keeps the entry and logs
+        # it for manual review) instead of Purge (which would delete it).
+        $__cleanLen = if ($clean) { $clean.Length } else { 0 }
+        $__rawLen = if ($RawCommand) { $RawCommand.Length } else { 0 }
+        $__looksBroken = (
+            $__cleanLen -le 15 -and
+            $clean -notmatch '\.\w{2,4}$' -and
+            $__rawLen -gt ($__cleanLen + 10)
+        )
+        if ($__looksBroken) {
+            Write-Log ("[CLASSIFY] -> Unknown (suspected broken extraction: '{0}')" -f $clean) -Level DEBUG
+            return 'Unknown'
+        }
+        Write-Log "[CLASSIFY] -> Purge (file missing)" -Level DEBUG
         return 'Purge'
     }
 
     try {
         $sig = Get-AuthenticodeSignature -LiteralPath $clean -ErrorAction Stop
-        if ($sig.Status -ne 'Valid') { return 'Unknown' }
-        $subject = $sig.SignerCertificate.Subject
+        Write-Log ("[CLASSIFY] Signature Status: '{0}'" -f $sig.Status) -Level DEBUG
+        if ($sig.SignerCertificate) {
+            Write-Log ("[CLASSIFY] Signature Subject: '{0}'" -f $sig.SignerCertificate.Subject) -Level DEBUG
+        } else {
+            Write-Log "[CLASSIFY] SignerCertificate is NULL (file may be unsigned)" -Level DEBUG
+        }
+
+        if ($sig.Status -ne 'Valid') {
+            Write-Log ("[CLASSIFY] -> Unknown (signature status: {0})" -f $sig.Status) -Level DEBUG
+            return 'Unknown'
+        }
+
+        $subject = ''
+        if ($sig.SignerCertificate) {
+            $subject = [string]$sig.SignerCertificate.Subject
+        }
+
         $hwPublishers = @(
             'NVIDIA', 'Advanced Micro Devices', 'AMD', 'Intel Corporation'
             'Realtek', 'Dolby', 'Waves Audio', 'Nahimic', 'DTS', 'Cirrus Logic', 'Creative Technology'
@@ -11301,10 +11443,20 @@ function Classify-StartupEntry {
             'ASUSTeK', 'MSI', 'Micro-Star', 'Gigabyte', 'GIGA-BYTE', 'Dell', 'Hewlett-Packard', 'HP Inc', 'Lenovo', 'Acer', 'Samsung'
         )
         foreach ($p in $hwPublishers) {
-            if ($subject -match [regex]::Escape($p)) { return 'Keep' }
+            if ($subject -match [regex]::Escape($p)) {
+                Write-Log ("[CLASSIFY] -> Keep (hw publisher match: '{0}')" -f $p) -Level DEBUG
+                return 'Keep'
+            }
         }
+
+        Write-Log "[CLASSIFY] -> Purge (signed, publisher not in hw allowlist)" -Level DEBUG
         return 'Purge'
     } catch {
+        Write-Log ("[CLASSIFY] Signature check THREW: {0}" -f $_.Exception.Message) -Level DEBUG
+        Write-Log ("[CLASSIFY] Exception type: {0}" -f $_.Exception.GetType().FullName) -Level DEBUG
+        if ($_.Exception.InnerException) {
+            Write-Log ("[CLASSIFY] Inner exception: {0}" -f $_.Exception.InnerException.Message) -Level DEBUG
+        }
         return 'Unknown'
     }
 }
@@ -11682,6 +11834,20 @@ function Invoke-Step38 {
     $regExports = New-Object System.Collections.ArrayList
 
     foreach ($regPath in $regPathsToBackup) {
+        # [FIX-V63-2] Skip keys that don't exist. Some StartupApproved
+        # subkeys (Run32) are legitimately absent on systems with no
+        # 32-bit startup entries. reg.exe export fails on missing keys,
+        # which was aborting the whole purge. Skip them cleanly.
+        $__psPath = $regPath -replace '^HKCU\\', 'HKCU:\' -replace '^HKLM\\', 'HKLM:\'
+        if (-not (Test-Path -LiteralPath $__psPath -ErrorAction SilentlyContinue)) {
+            $rec = [PSCustomObject]@{
+                Path = $regPath; Ok = $true; ExitCode = 0; Size = 0
+                Header = '(not present - skipped)'
+            }
+            [void]$backupManifest.Add($rec)
+            Write-Log ("  [BACKUP] {0} - not present (skipped)" -f $regPath) -Level DEBUG
+            continue
+        }
         $tempReg = Join-Path $env:TEMP (([Guid]::NewGuid().ToString('N')) + '.reg')
         $rec = [PSCustomObject]@{ Path = $regPath; Ok = $false; ExitCode = -1; Size = 0; Header = '' }
         try {
@@ -11778,17 +11944,30 @@ function Invoke-Step38 {
     $purgeTasks = @($purgeEntries | Where-Object { $_.SourceType -eq 'ScheduledTask' })
     if ($purgeTasks.Count -gt 0) {
         New-Item -ItemType Directory -Path $taskXmlDir -Force | Out-Null
+        $__taskBackupFailures = 0
         foreach ($t in $purgeTasks) {
             try {
                 $safeName = ($t.TaskPath + $t.TaskName) -replace '[\\/:*?"<>|]', '_'
                 $xmlPath  = Join-Path $taskXmlDir ($safeName + '.xml')
                 $null = Export-ScheduledTask -TaskPath $t.TaskPath -TaskName $t.TaskName |
                         Set-Content -LiteralPath $xmlPath -Encoding UTF8 -ErrorAction Stop
+                # [FIX-V62-3] Verify XML non-empty and parseable.
+                if (-not (Test-Path -LiteralPath $xmlPath) -or (Get-Item -LiteralPath $xmlPath).Length -lt 50) {
+                    throw 'XML backup file missing or too small'
+                }
+                $null = [xml](Get-Content -LiteralPath $xmlPath -Raw)
             } catch {
-                Write-Log ('  [WARN] Could not export task XML for backup: ' + $t.Name) -Level WARN
+                Write-Log ('  [ERROR] Task XML backup failed: {0} — {1}' -f $t.Name, $_.Exception.Message) -Level ERROR
+                $__taskBackupFailures++
             }
         }
-        Write-Log ('  Task XML backup: {0}' -f $taskXmlDir) -Level OK
+        if ($__taskBackupFailures -gt 0) {
+            Write-Log ('  [ABORT] {0} task XML backup(s) failed. Refusing to unregister without recovery.' -f $__taskBackupFailures) -Level ERROR
+            $Script:LastStepDetail = ('Purge aborted: {0} task backup(s) failed' -f $__taskBackupFailures)
+            $Script:LastStepStatus = 'Failed'
+            return
+        }
+        Write-Log ('  Task XML backup: {0} (verified)' -f $taskXmlDir) -Level OK
     }
 
     # ============================================================
@@ -11885,7 +12064,14 @@ function Invoke-Step38 {
     $Script:LastStepPurgedStartups = $purgeRecords
     $Script:LastStepDetail = ('Purged {0}, partial {1}, declined {2}, failed {3} (backup: {4})' -f `
         $purged, $partial, $declined, $failed, (Split-Path -Leaf $backupFile))
-    if ($failed -gt 0) { $Script:LastStepStatus = 'Warning' } else { $Script:LastStepStatus = 'OK' }
+    # [FIX-V62-9] Partial (source deleted but StartupApproved remained,
+    # or vice versa) is not clean success. Old code only checked
+    # $failed > 0; $partial > 0 could be misreported as OK.
+    if ($failed -gt 0 -or $partial -gt 0) {
+        $Script:LastStepStatus = 'Warning'
+    } else {
+        $Script:LastStepStatus = 'OK'
+    }
 
     Write-Log 'Step 38 complete.' -Level OK
     Write-Log '[SUCCESS] Non-essential persistence purged.' -Level OK
@@ -12702,6 +12888,14 @@ function Invoke-Step45 {
         return
     }
 
+    # [FIX-V62-7] Fail closed on empty drive list. Old code initialized
+    # $allConfirmedSsd = $true and never reset on empty iteration.
+    if (@($drives).Count -eq 0) {
+        Write-Log 'No fixed drives detected — skipping SysMain tuning for safety.' -Level WARN
+        $Script:LastStepDetail = 'Skipped: zero fixed drives detected'
+        return
+    }
+
     $hasHdd = $false
     $checked = 0
     $allConfirmedSsd = $true
@@ -12721,12 +12915,21 @@ function Invoke-Step45 {
             # ANY drive, including those with MediaType=0 (Unspecified)
             # or with no physical disk at all — letting the "all SSD"
             # test pass without every drive being actually confirmed SSD.
-            if ($physical -and ($physical.MediaType -eq 4 -or $physical.MediaType -eq 5)) {
+            # [FIX-V63-1] MediaType is returned by CIM as STRING ("SSD")
+            # not integer enum (4). Match both forms plus NVMe bus type.
+            $__mtRaw = if ($physical) { $physical.MediaType } else { '' }
+            $__mtStr = [string]$__mtRaw
+            $__isSsd = $false
+            if ($physical) {
+                if ($__mtRaw -eq 4 -or $__mtRaw -eq 5) { $__isSsd = $true }
+                elseif ($__mtStr -match '^(?i)(SSD|SCM)$') { $__isSsd = $true }
+                elseif ($physical.BusType -eq 'NVMe') { $__isSsd = $true }
+            }
+            if ($__isSsd) {
                 $checked++
             } else {
                 $allConfirmedSsd = $false
-                $__mt = if ($physical) { $physical.MediaType } else { 'unknown' }
-                Write-Log ("  [WARN] Drive {0}: MediaType={1} not confirmed SSD" -f $d.DeviceID, $__mt) -Level WARN
+                Write-Log ("  [WARN] Drive {0}: MediaType='{1}' not confirmed SSD" -f $d.DeviceID, $__mtStr) -Level WARN
             }
         } catch {
             $allConfirmedSsd = $false
@@ -12979,8 +13182,6 @@ function Invoke-Step46 {
         if (-not (Test-Path -LiteralPath $doPath)) {
             New-Item -Path $doPath -Force -ErrorAction Stop | Out-Null
         }
-        New-ItemProperty -Path $doPath -Name 'DODownloadMode' -Value 1 -PropertyType DWord -Force -ErrorAction Stop | Out-Null
-        Write-Log '  [OK] DODownloadMode set to 1 (LAN-only).' -Level OK
         # P3: Step 46 rollback entries
         # [FIX-STEP46-HKLM] HKLM path — RegistryHKLM label for the manifest.
         # [FIX-AUD-10] Use the actual current value, not hardcoded
@@ -12989,6 +13190,9 @@ function Invoke-Step46 {
         # if it did not. The old hardcoded values caused -Rollback to
         # DELETE the DODownloadMode property even when the user had
         # explicitly configured it, silently losing their setting.
+        # [FIX-V62-6] Rollback journal BEFORE mutation. If
+        # Add-RollbackEntry throws (once AUD-3.1 makes it fail-closed),
+        # the outer try/catch aborts before the registry is touched.
         $__doExisted = ($null -ne $currentMode)
         Add-RollbackEntry -Step 46 -Type 'RegistryHKLM' -Data @{
             Path    = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DeliveryOptimization\Config'
@@ -12997,6 +13201,8 @@ function Invoke-Step46 {
             Value   = if ($__doExisted) { $currentMode } else { $null }
             Type    = 'DWord'
         }
+        New-ItemProperty -Path $doPath -Name 'DODownloadMode' -Value 1 -PropertyType DWord -Force -ErrorAction Stop | Out-Null
+        Write-Log '  [OK] DODownloadMode set to 1 (LAN-only).' -Level OK
     } catch {
         Write-Log ("  [WARN] Could not set DODownloadMode: {0}" -f $_.Exception.Message) -Level WARN
         return
@@ -13968,8 +14174,40 @@ function Invoke-RollbackMode {
                 'Service' {
                     $svc = Get-Service -Name $e.Data.Name -ErrorAction SilentlyContinue
                     if (-not $svc) { Write-Host ("  SKIP {0}: {1} not present" -f $label, $e.Data.Name) -ForegroundColor DarkGray; $skip++; continue }
+                    # [FIX-V62-5] Restore startup type AND running state.
+                    # Old code only set StartType, leaving a service the
+                    # user had running (e.g. DiagTrack) stopped after
+                    # -Rollback. That's a silent partial rollback.
                     Set-Service -Name $e.Data.Name -StartupType (ConvertTo-ServiceStartType -Mode $e.Data.OriginalStart) -ErrorAction Stop
-                    Write-Host ("  OK   {0}: {1} -> {2}" -f $label, $e.Data.NewStart, $e.Data.OriginalStart) -ForegroundColor Green
+                    Write-Host ("  OK   {0}: start type {1} -> {2}" -f $label, $e.Data.NewStart, $e.Data.OriginalStart) -ForegroundColor Green
+
+                    $__origStatus = ''
+                    try {
+                        if ($e.Data.PSObject.Properties['OriginalStatus'] -and $e.Data.OriginalStatus) {
+                            $__origStatus = [string]$e.Data.OriginalStatus
+                        }
+                    } catch { }
+
+                    if ($__origStatus -eq 'Running' -or $__origStatus -eq 'Stopped') {
+                        $__now = Get-Service -Name $e.Data.Name -ErrorAction SilentlyContinue
+                        $__target = $__origStatus
+                        $__actual = if ($__now) { [string]$__now.Status } else { 'Unknown' }
+                        if ($__target -eq 'Running' -and $__actual -ne 'Running') {
+                            try {
+                                Start-Service -Name $e.Data.Name -ErrorAction Stop
+                                Write-Host ("  OK   {0}: service started (was {1})" -f $label, $__actual) -ForegroundColor Green
+                            } catch {
+                                Write-Host ("  WARN {0}: could not start service: {1}" -f $label, $_.Exception.Message) -ForegroundColor Yellow
+                            }
+                        } elseif ($__target -eq 'Stopped' -and $__actual -ne 'Stopped') {
+                            try {
+                                Stop-Service -Name $e.Data.Name -Force -ErrorAction Stop
+                                Write-Host ("  OK   {0}: service stopped (was {1})" -f $label, $__actual) -ForegroundColor Green
+                            } catch {
+                                Write-Host ("  WARN {0}: could not stop service: {1}" -f $label, $_.Exception.Message) -ForegroundColor Yellow
+                            }
+                        }
+                    }
                     $ok++
                 }
                 'ScheduledTask' {
@@ -15464,7 +15702,10 @@ function Invoke-Step56 {
     $wpadPresent = $false
     if (Test-Path -LiteralPath $hostsPath) {
         try {
-            $wpadPresent = (Get-Content -LiteralPath $hostsPath -ErrorAction Stop) -match '^\s*0\.0\.0\.0\s+wpad\b'
+            # [FIX-V62-8] `\b` matched before any non-word char, so
+            # `0.0.0.0 wpad.example.com` was treated as blocked.
+            # Require exact hostname: whitespace or EOL after "wpad".
+            $wpadPresent = (Get-Content -LiteralPath $hostsPath -ErrorAction Stop) -match '^\s*0\.0\.0\.0\s+wpad\s*$'
         } catch { }
     }
     if ($wpadPresent) {
@@ -15495,22 +15736,40 @@ function Invoke-Step56 {
 
     # ---- 3. LAPS ----
     Write-Log 'Audit 3/7: Windows LAPS' -Level INFO
-    $lapsPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\LAPS'
-    $lapsLegacy = 'HKLM:\SOFTWARE\Policies\Microsoft Services\AdmPwd'
-    if (Test-Path -LiteralPath $lapsPath) {
-        Write-Log '  [OK] Windows LAPS registry path present.' -Level OK
+    # [FIX-V62-10] Check all documented Windows LAPS policy roots plus
+    # legacy AdmPwd. Old code used a single (often non-existent) path,
+    # so LAPS could report "not configured" even when active.
+    $__lapsRoots = @(
+        @{ Path = 'HKLM:\SOFTWARE\Microsoft\Policies\LAPS';                              Source = 'CSP' }
+        @{ Path = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\LAPS';       Source = 'Group Policy' }
+        @{ Path = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\LAPS\Config';         Source = 'Local' }
+    )
+    $__lapsLegacy = 'HKLM:\SOFTWARE\Policies\Microsoft Services\AdmPwd'
+    $__lapsFound = $false
+    foreach ($__root in $__lapsRoots) {
+        if (-not (Test-Path -LiteralPath $__root.Path)) { continue }
+        $__lapsFound = $true
+        Write-Log ("  [OK] LAPS policy root present: {0} ({1})" -f $__root.Path, $__root.Source) -Level OK
         try {
-            $lapsBackup = (Get-ItemProperty -Path $lapsPath -Name 'BackupDirectory' -ErrorAction SilentlyContinue).BackupDirectory
-            if ($null -ne $lapsBackup) {
-                Write-Log ("    BackupDirectory = {0}" -f $lapsBackup) -Level INFO
+            $__bd = (Get-ItemProperty -Path $__root.Path -Name 'BackupDirectory' -ErrorAction SilentlyContinue).BackupDirectory
+            if ($null -ne $__bd) {
+                $__bdText = switch ([int]$__bd) {
+                    0 { 'BackupDirectory = 0 (DISABLED - passwords NOT backed up)' }
+                    1 { 'BackupDirectory = 1 (Azure AD)' }
+                    2 { 'BackupDirectory = 2 (Active Directory)' }
+                    default { "BackupDirectory = $__bd" }
+                }
+                $__bdLevel = if ([int]$__bd -eq 0) { 'WARN' } else { 'INFO' }
+                Write-Log ("    {0}" -f $__bdText) -Level $__bdLevel
             } else {
-                Write-Log '    Not configured (no BackupDirectory value).' -Level INFO
+                Write-Log '    BackupDirectory not set at this root.' -Level INFO
             }
         } catch { }
-    } elseif (Test-Path -LiteralPath $lapsLegacy) {
+    }
+    if (-not $__lapsFound -and (Test-Path -LiteralPath $__lapsLegacy)) {
         Write-Log '  [OK] Legacy LAPS (AdmPwd) policy present.' -Level OK
-    } else {
-        Write-Log '  Not configured. (Report only - no action taken.)' -Level INFO
+    } elseif (-not $__lapsFound) {
+        Write-Log '  Not configured on any known policy root. (Report only.)' -Level INFO
     }
 
     # ---- 4. PowerShell ScriptBlockLogging ----
@@ -15574,10 +15833,17 @@ function Invoke-Step56 {
         $cli = Get-SmbClientConfiguration -ErrorAction SilentlyContinue
         if ($srv) { Write-Log ("    Server RequireSecuritySignature = {0}" -f $srv.RequireSecuritySignature) -Level INFO }
         if ($cli) { Write-Log ("    Client RequireSecuritySignature = {0}" -f $cli.RequireSecuritySignature) -Level INFO }
+        # [FIX-V62-11] Server and client independent. Old code only
+        # warned about server. Client signing protects outbound SMB.
         if ($srv -and -not $srv.RequireSecuritySignature) {
             Write-Log '  [WARN] SMB server signing not enforced. Report only.' -Level WARN
         } elseif ($srv) {
             Write-Log '  [OK] SMB server signing enforced.' -Level OK
+        }
+        if ($cli -and -not $cli.RequireSecuritySignature) {
+            Write-Log '  [WARN] SMB client signing not enforced (outbound SMB unprotected). Report only.' -Level WARN
+        } elseif ($cli) {
+            Write-Log '  [OK] SMB client signing enforced.' -Level OK
         }
     } catch {
         Write-Log ("  [WARN] Could not read SMB config: {0}" -f $_.Exception.Message) -Level WARN
@@ -15597,11 +15863,24 @@ function Invoke-Step56 {
                 }
             }
         } else {
-            # manage-bde fallback
+            # [FIX-V62-12] manage-bde fallback. Old code only dumped the
+            # output. Now we parse for the protection state and emit a
+            # structured verdict.
             $bde = & manage-bde.exe -status $env:SystemDrive 2>&1
-            if ($bde) {
-                $bde | ForEach-Object { Write-Log ("    {0}" -f $_) -Level DEBUG }
-                $bde | ForEach-Object { Add-Content -LiteralPath $Script:LogFile -Value $_ -Encoding UTF8 -ErrorAction SilentlyContinue }
+            $bdeText = ($bde -join "`r`n")
+            foreach ($__ln in $bde) {
+                Add-Content -LiteralPath $Script:LogFile -Value $__ln -Encoding UTF8 -ErrorAction SilentlyContinue
+            }
+            if ($bdeText -match 'Protection\s+On') {
+                Write-Log '  [OK] BitLocker protection ON (via manage-bde).' -Level OK
+            } elseif ($bdeText -match 'Protection\s+Off') {
+                Write-Log '  [WARN] BitLocker protection OFF (via manage-bde). Report only.' -Level WARN
+            } elseif ($bdeText -match 'Protection\s+Suspended') {
+                Write-Log '  [WARN] BitLocker protection SUSPENDED. Report only.' -Level WARN
+            } elseif ([string]::IsNullOrWhiteSpace($bdeText)) {
+                Write-Log '  [WARN] BitLocker status query returned no output.' -Level WARN
+            } else {
+                Write-Log '  [WARN] Could not parse BitLocker status from manage-bde output.' -Level WARN
             }
         }
     } catch {
