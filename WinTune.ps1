@@ -121,6 +121,7 @@ param(
     [switch]$AllowModernStandbyOff,                             # Step 57 - disable modern standby (requires reboot)
     [switch]$AllowHpetOff,                                      # Step 57 - disable HPET (for low-latency gaming)
     [switch]$AllowRegistryBackup,                               # Step 57 - enable periodic registry backups
+    [switch]$AllowExplorerRestart,                              # Step 27 - restart Explorer after visual tweaks
 
     # ---- New in v3.9 (DNS benchmark) ----
     # [FIX-DNSBENCH-PARAM] Benchmark well-known DNS resolvers and
@@ -323,6 +324,7 @@ $Script:AllowHibernationOff = $AllowHibernationOff.IsPresent
 $Script:AllowModernStandbyOff = $AllowModernStandbyOff.IsPresent
 $Script:AllowHpetOff = $AllowHpetOff.IsPresent
 $Script:AllowRegistryBackup = $AllowRegistryBackup.IsPresent
+$Script:AllowExplorerRestart = $AllowExplorerRestart.IsPresent
 $Script:AllowDnsBenchmark = $AllowDnsBenchmark.IsPresent
 $Script:AllowFastStartupOff = $AllowFastStartupOff.IsPresent
 $Script:AllowGamingTweaks = $AllowGamingTweaks.IsPresent
@@ -6373,7 +6375,7 @@ function Invoke-Step10 {
         # [FIX-AUD-3] Record rollback entry BEFORE applying the change.
         # Without this, -Rollback cannot restore DiagTrack/PcaSvc.
         $__wasRunning = ($service.Status -eq 'Running')
-        Add-RollbackEntry -Step 10 -Type 'Service' -Data @{
+        $null = Add-RollbackEntry -Step 10 -Type 'Service' -Data @{
             Name           = $svc.Name
             OriginalStart  = $currentStart
             NewStart       = 'Manual'
@@ -6459,7 +6461,7 @@ function Invoke-Step10 {
         }
         try {
             # [FIX-AUD-5] Record rollback entry BEFORE disabling.
-            Add-RollbackEntry -Step 10 -Type 'ScheduledTask' -Data @{
+            $null = Add-RollbackEntry -Step 10 -Type 'ScheduledTask' -Data @{
                 Path = $t.Path
                 Name = $t.Name
             }
@@ -6480,7 +6482,7 @@ function Invoke-Step10 {
             # [FIX-AUD-4] Record original value before overwriting.
             $__advOrig = (Get-ItemProperty -Path $advPath -Name 'Enabled' -ErrorAction SilentlyContinue).Enabled
             $__advExisted = ($null -ne $__advOrig)
-            Add-RollbackEntry -Step 10 -Type 'RegistryHKLM' -Data @{
+            $null = Add-RollbackEntry -Step 10 -Type 'RegistryHKLM' -Data @{
                 Path    = $advPath
                 Name    = 'Enabled'
                 Existed = $__advExisted
@@ -6579,9 +6581,26 @@ function Invoke-Step11 {
     # ---- 1. Enable Taskbar End-Task ----
     Backup-RegistryKey -Step 11 -RegPath 'HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced'
     Backup-RegistryKey -Step 11 -RegPath 'HKCU\Software\Microsoft\Windows\CurrentVersion\GameDVR'
+    # [FIX-BATCH-C-7a] Capture Existed/Value BEFORE mutation so rollback
+    # can restore user-customized values. Old code hardcoded ($false, $null)
+    # which destroys custom values on -Rollback.
+    $__captureReg = {
+        param([string]$Path, [string]$Name)
+        $existed = $false; $value = $null
+        try {
+            if (Test-Path -LiteralPath $Path) {
+                $v = (Get-ItemProperty -Path $Path -Name $Name -ErrorAction SilentlyContinue).$Name
+                if ($null -ne $v) { $existed = $true; $value = $v }
+            }
+        } catch { }
+        return [PSCustomObject]@{ Existed = $existed; Value = $value }
+    }
+
     Write-Log 'Injecting power-user taskbar adjustments into the registry...' -Level INFO
 
     $endTaskPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced'
+    $__etOrig = & $__captureReg $endTaskPath 'TaskbarEndTask'
+    $null = Add-RollbackEntry -Step 11 -Type 'RegistryHKCU' -Data @{ Path = $endTaskPath; Name = 'TaskbarEndTask'; Existed = $__etOrig.Existed; Value = $__etOrig.Value; Type = 'DWord' }
     if (& $setRegDword $endTaskPath 'TaskbarEndTask' 1) {
         Write-Log '  [OK] Taskbar End-Task enabled.' -Level OK
         $stats.Applied++
@@ -6593,6 +6612,8 @@ function Invoke-Step11 {
     Write-Log 'Disabling Game DVR background recording pipelines...' -Level INFO
 
     $gameDvrPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR'
+    $__acOrig = & $__captureReg $gameDvrPath 'AppCaptureEnabled'
+    $null = Add-RollbackEntry -Step 11 -Type 'RegistryHKCU' -Data @{ Path = $gameDvrPath; Name = 'AppCaptureEnabled'; Existed = $__acOrig.Existed; Value = $__acOrig.Value; Type = 'DWord' }
     if (& $setRegDword $gameDvrPath 'AppCaptureEnabled' 0) {
         Write-Log '  [OK] AppCaptureEnabled disabled.' -Level OK
         $stats.Applied++
@@ -6600,6 +6621,8 @@ function Invoke-Step11 {
         $stats.Failed++
     }
 
+    $__hcOrig = & $__captureReg $gameDvrPath 'HistoricalCaptureEnabled'
+    $null = Add-RollbackEntry -Step 11 -Type 'RegistryHKCU' -Data @{ Path = $gameDvrPath; Name = 'HistoricalCaptureEnabled'; Existed = $__hcOrig.Existed; Value = $__hcOrig.Value; Type = 'DWord' }
     if (& $setRegDword $gameDvrPath 'HistoricalCaptureEnabled' 0) {
         Write-Log '  [OK] HistoricalCaptureEnabled disabled.' -Level OK
         $stats.Applied++
@@ -6609,10 +6632,6 @@ function Invoke-Step11 {
 
     # ---- 3. Broadcast WM_SETTINGCHANGE ----
     Write-Log 'Broadcasting environment refresh signal to active shell threads...' -Level INFO
-    # P3: Step 11 rollback entries
-    Add-RollbackEntry -Step 11 -Type 'RegistryHKCU' -Data @{ Path = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced'; Name = 'TaskbarEndTask'; Existed = $false; Value = $null; Type = 'DWord' }
-    Add-RollbackEntry -Step 11 -Type 'RegistryHKCU' -Data @{ Path = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR'; Name = 'AppCaptureEnabled'; Existed = $false; Value = $null; Type = 'DWord' }
-    Add-RollbackEntry -Step 11 -Type 'RegistryHKCU' -Data @{ Path = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR'; Name = 'HistoricalCaptureEnabled'; Existed = $false; Value = $null; Type = 'DWord' }
 
     try {
         # Add-Type compiles the P/Invoke once per session; subsequent calls reuse it
@@ -7024,6 +7043,17 @@ function Invoke-Step17 {
         }
     } catch {
         Write-Log ("  Could not determine drive size: {0}" -f $_.Exception.Message) -Level DEBUG
+    }
+
+    # [FIX-BATCH-C-8] Fail closed on drive-size detection failure. The
+    # old code fell back to 3 GB when detection failed ($driveSizeGB
+    # stayed 0). On a large drive with heavy VSS usage, that silently
+    # purges all historical restore points to fit 3 GB. Abort instead
+    # so the user can re-run with -ForceIrreversible to override.
+    if ($driveSizeGB -le 0 -and -not $Script:ForceIrreversible) {
+        Write-Log '  [SKIP] Could not determine system drive size — aborting VSS resize.' -Level WARN
+        Write-Log '  Re-run with -ForceIrreversible to force a 3 GB cap.' -Level INFO
+        return
     }
 
     # Tiered policy:
@@ -7573,7 +7603,7 @@ function Invoke-Step20 {
                     try {
                         Disable-ScheduledTask -TaskPath $c.TaskPath -TaskName $c.TaskName -ErrorAction Stop | Out-Null
                         Write-Log ("  [DISABLED] {0}{1}" -f $c.TaskPath, $c.TaskName) -Level OK
-                        Add-RollbackEntry -Step 20 -Type 'ScheduledTask' -Data @{
+                        $null = Add-RollbackEntry -Step 20 -Type 'ScheduledTask' -Data @{
                             Path = $c.TaskPath
                             Name = $c.TaskName
                         }
@@ -7947,6 +7977,25 @@ function Invoke-Step23 {
     # ============================================================
     # 2. Clear static routes
     # ============================================================
+    # [FIX-BATCH-C-16] Export route table before route /f. route /f
+    # clears ALL routes including persistent routes added with
+    # 'route add -p' and VPN-specific routes. The previous comment
+    # claimed "network config preserved" which is false for routes.
+    # Manual recovery is possible by re-adding from the exported table.
+    Write-Log 'Exporting current route table before clearing...' -Level INFO
+    $__routeBackupPath = Join-Path $Script:ScriptDir ('RouteTable_{0}.txt' -f $Script:RunStamp)
+    try {
+        $__routeDump = & route.exe print 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            Set-Content -LiteralPath $__routeBackupPath -Value $__routeDump -Encoding UTF8 -ErrorAction Stop
+            Write-Log ("  [OK] Route table saved: {0}" -f $__routeBackupPath) -Level OK
+        } else {
+            Write-Log ("  [WARN] route print returned {0} - backup not written" -f $LASTEXITCODE) -Level WARN
+        }
+    } catch {
+        Write-Log ("  [WARN] Could not save route table: {0}" -f $_.Exception.Message) -Level WARN
+    }
+
     Write-Log 'Clearing stale network gateway routing logs...' -Level INFO
 
     $routeResult = Invoke-NativeCommand -FilePath 'route.exe' -Arguments @('/f') -NoNewWindow
@@ -8120,14 +8169,16 @@ function Invoke-Step24 {
                 $mediaType = $physical.MediaType
             }
         } catch {
-            # Fall back to MSFT_PhysicalDisk WMI directly
-            try {
-                $wmi = Get-CimInstance -Namespace 'root\Microsoft\Windows\Storage' -ClassName 'MSFT_PhysicalDisk' -ErrorAction SilentlyContinue |
-                       Select-Object -First 1
-                if ($wmi) {
-                    $mediaType = $wmi.MediaType
-                }
-            } catch { }
+            # [FIX-BATCH-C-2] Fail closed. The previous fallback grabbed
+            # the FIRST physical disk on the system — which could be a
+            # completely different disk from the one hosting this volume.
+            # On a multi-disk SSD+HDD system, C: on the HDD could be
+            # classified as SSD if disk 0 happens to be the SSD. This
+            # then skips defrag on the HDD and (worse) allows Step 45
+            # to disable SysMain on a system that has an HDD.
+            # Leaving mediaType/busType null causes the classifier to
+            # take the 'Unknown media type' branch — no action, safe.
+            Write-Log ("  [WARN] Drive {0}: partition lookup failed - {1}" -f $d.DeviceID, $_.Exception.Message) -Level WARN
         }
 
         # Classify
@@ -8786,9 +8837,34 @@ function Invoke-Step27 {
     Backup-RegistryKey -Step 27 -RegPath 'HKCU\Control Panel\Mouse'
     Backup-RegistryKey -Step 27 -RegPath 'HKCU\Software\Microsoft\Windows\CurrentVersion\Accessibility'
     Backup-RegistryKey -Step 27 -RegPath 'HKCU\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}'
-    Write-Log 'Disabling visual transparency...' -Level INFO
+
+    # [FIX-BATCH-C-7b] Capture original values before mutation.
+    $__captureReg27 = {
+        param([string]$Path, [string]$Name)
+        $existed = $false; $value = $null
+        try {
+            if (Test-Path -LiteralPath $Path) {
+                $v = (Get-ItemProperty -Path $Path -Name $Name -ErrorAction SilentlyContinue).$Name
+                if ($null -ne $v) { $existed = $true; $value = $v }
+            }
+        } catch { }
+        return [PSCustomObject]@{ Existed = $existed; Value = $value }
+    }
 
     $transparencyPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize'
+    $windowMetricsPath = 'HKCU:\Control Panel\Desktop\WindowMetrics'
+    $a11yPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Accessibility'
+
+    $__trOrig  = & $__captureReg27 $transparencyPath 'EnableTransparency'
+    $__minOrig = & $__captureReg27 $windowMetricsPath 'MinAnimate'
+    $__aeOrig  = & $__captureReg27 $a11yPath 'AnimationEffect'
+
+    $null = Add-RollbackEntry -Step 27 -Type 'RegistryHKCU' -Data @{ Path = $transparencyPath; Name = 'EnableTransparency'; Existed = $__trOrig.Existed; Value = $__trOrig.Value; Type = 'DWord' }
+    $null = Add-RollbackEntry -Step 27 -Type 'RegistryHKCU' -Data @{ Path = $windowMetricsPath; Name = 'MinAnimate'; Existed = $__minOrig.Existed; Value = $__minOrig.Value; Type = 'String' }
+    $null = Add-RollbackEntry -Step 27 -Type 'RegistryHKCU' -Data @{ Path = $a11yPath; Name = 'AnimationEffect'; Existed = $__aeOrig.Existed; Value = $__aeOrig.Value; Type = 'DWord' }
+
+    Write-Log 'Disabling visual transparency...' -Level INFO
+
     if (& $setRegValue $transparencyPath 'EnableTransparency' 0 'DWord') {
         Write-Log '  [OK] Transparency disabled.' -Level OK
     } else {
@@ -8871,11 +8947,9 @@ function Invoke-Step27 {
         Write-Log ("  [WARN] Could not enable classic context menu: {0}" -f $_.Exception.Message) -Level WARN
     }
 
+    # [FIX-BATCH-C-7b2] Rollback entries now written before mutation in
+    # the "1. Disable transparency" block above.
     Write-Log 'Broadcasting user-environment refresh...' -Level INFO
-    # P3: Step 27 rollback entries
-    Add-RollbackEntry -Step 27 -Type 'RegistryHKCU' -Data @{ Path = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize'; Name = 'EnableTransparency'; Existed = $false; Value = $null; Type = 'DWord' }
-    Add-RollbackEntry -Step 27 -Type 'RegistryHKCU' -Data @{ Path = 'HKCU:\Control Panel\Desktop\WindowMetrics'; Name = 'MinAnimate'; Existed = $false; Value = $null; Type = 'String' }
-    Add-RollbackEntry -Step 27 -Type 'RegistryHKCU' -Data @{ Path = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Accessibility'; Name = 'AnimationEffect'; Existed = $false; Value = $null; Type = 'DWord' }
 
     try {
         # Compile P/Invoke type once per session
@@ -8943,6 +9017,19 @@ namespace Native {
     # Visual-effect registry writes (transparency, animations,
     # context menu) are only re-read by Explorer on a full restart
     # of the shell process. WM_SETTINGCHANGE alone is not enough.
+    # [FIX-BATCH-C-20] Flag-gated restart. Without -AllowExplorerRestart
+    # the settings apply to the registry but require sign-out or manual
+    # Explorer restart. Prevents forcibly killing open File Explorer
+    # windows and losing unsaved shell state on a routine maintenance
+    # run.
+    if (-not $Script:AllowExplorerRestart) {
+        Write-Log 'Visual tweaks applied to registry.' -Level OK
+        Write-Log 'Sign out or restart Explorer to see the changes take effect.' -Level INFO
+        Write-Log '  (Use -AllowExplorerRestart to force an automatic restart.)' -Level INFO
+        Write-Log 'Step 27 complete.' -Level OK
+        return
+    }
+
     Write-Log 'Restarting Explorer to apply visual-effect changes...' -Level INFO
 
     $explorerProcs = Get-Process -Name 'explorer' -ErrorAction SilentlyContinue
@@ -9446,7 +9533,23 @@ function Invoke-Step30 {
     Backup-RegistryKey -Step 30 -RegPath 'HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
     Write-Log 'Disabling LLMNR multicast fallback...' -Level INFO
 
+    # [FIX-BATCH-C-9] Capture original values and write rollback entries
+    # before mutation.
+    $__captureReg30 = {
+        param([string]$Path, [string]$Name)
+        $existed = $false; $value = $null
+        try {
+            if (Test-Path -LiteralPath $Path) {
+                $v = (Get-ItemProperty -Path $Path -Name $Name -ErrorAction SilentlyContinue).$Name
+                if ($null -ne $v) { $existed = $true; $value = $v }
+            }
+        } catch { }
+        return [PSCustomObject]@{ Existed = $existed; Value = $value }
+    }
+
     $llmnrPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient'
+    $__llmnr = & $__captureReg30 $llmnrPath 'EnableMulticast'
+    $null = Add-RollbackEntry -Step 30 -Type 'RegistryHKLM' -Data @{ Path = $llmnrPath; Name = 'EnableMulticast'; Existed = $__llmnr.Existed; Value = $__llmnr.Value; Type = 'DWord' }
     if (& $setDword $llmnrPath 'EnableMulticast' 0) {
         Write-Log '  [OK] LLMNR multicast disabled.' -Level OK
     } else {
@@ -9461,6 +9564,8 @@ function Invoke-Step30 {
     Write-Log 'Disabling WinHTTP WPAD discovery...' -Level INFO
 
     $wpadPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings\WinHttp'
+    $__wpad = & $__captureReg30 $wpadPath 'DisableWpad'
+    $null = Add-RollbackEntry -Step 30 -Type 'RegistryHKLM' -Data @{ Path = $wpadPath; Name = 'DisableWpad'; Existed = $__wpad.Existed; Value = $__wpad.Value; Type = 'DWord' }
     if (& $setDword $wpadPath 'DisableWpad' 1) {
         Write-Log '  [OK] WinHTTP WPAD discovery disabled.' -Level OK
     } else {
@@ -9475,6 +9580,8 @@ function Invoke-Step30 {
     Write-Log 'Disabling user proxy auto-detection...' -Level INFO
 
     $autoDetectPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
+    $__ad = & $__captureReg30 $autoDetectPath 'AutoDetect'
+    $null = Add-RollbackEntry -Step 30 -Type 'RegistryHKCU' -Data @{ Path = $autoDetectPath; Name = 'AutoDetect'; Existed = $__ad.Existed; Value = $__ad.Value; Type = 'DWord' }
     if (& $setDword $autoDetectPath 'AutoDetect' 0) {
         Write-Log '  [OK] User proxy auto-detection disabled.' -Level OK
     } else {
@@ -9593,6 +9700,16 @@ function Invoke-Step31 {
 
     $dohRegPath = 'HKLM:\SYSTEM\CurrentControlSet\Services\Dnscache\Parameters'
     try {
+        # [FIX-BATCH-C-10] Backup + rollback entry before mutation.
+        Backup-RegistryKey -Step 31 -RegPath 'HKLM\SYSTEM\CurrentControlSet\Services\Dnscache\Parameters'
+        $__dohOrig = $null
+        $__dohExisted = $false
+        if (Test-Path -LiteralPath $dohRegPath) {
+            $__dohVal = (Get-ItemProperty -Path $dohRegPath -Name 'EnableAutoDoh' -ErrorAction SilentlyContinue).EnableAutoDoh
+            if ($null -ne $__dohVal) { $__dohOrig = $__dohVal; $__dohExisted = $true }
+        }
+        $null = Add-RollbackEntry -Step 31 -Type 'RegistryHKLM' -Data @{ Path = $dohRegPath; Name = 'EnableAutoDoh'; Existed = $__dohExisted; Value = $__dohOrig; Type = 'DWord' }
+
         if (-not (Test-Path -LiteralPath $dohRegPath)) {
             New-Item -Path $dohRegPath -Force -ErrorAction Stop | Out-Null
         }
@@ -9803,14 +9920,15 @@ function Invoke-Step32 {
     }
 
     # ---- ASR rule GUIDs ----
+    # [FIX-BATCH-C-11/18] Corrected ASR GUID descriptions per Microsoft docs:
     $asrRuleIds = @(
-        'BE9BA2D9-53EA-4CDC-84E5-9B1EEEE46550'   # Block Office child processes
-        'D4F940AB-401B-4EFC-AADC-AD5F3C50688A'   # Block Office executable content
-        '3B576869-A4EC-4529-8536-B80A7769E899'   # Block Office process injection
-        '75668C1F-73B5-4CF0-BB93-3ECF5CB7CC84'   # Block Office child processes (2)
-        'D3E037E1-3EB8-44C8-A917-57927947596D'   # Block JS/VBS downloaded content
-        '5BEB7EFE-FD9A-4556-801D-275E5FFC04CC'   # Block obfuscated scripts
-        '92E97FA1-2EDF-4476-BDD6-9DD0B4DDDC7B'   # Block Win32 API from Office macros
+        'BE9BA2D9-53EA-4CDC-84E5-9B1EEEE46550'   # Block executable content from email client / webmail
+        'D4F940AB-401B-4EFC-AADC-AD5F3C50688A'   # Block Office apps from creating child processes
+        '3B576869-A4EC-4529-8536-B80A7769E899'   # Block Office apps from creating executable content
+        '75668C1F-73B5-4CF0-BB93-3ECF5CB7CC84'   # Block Office apps from injecting into other processes
+        'D3E037E1-3EB8-44C8-A917-57927947596D'   # Block JS/VBS from launching downloaded executable content
+        '5BEB7EFE-FD9A-4556-801D-275E5FFC04CC'   # Block execution of potentially obfuscated scripts
+        '92E97FA1-2EDF-4476-BDD6-9DD0B4DDDC7B'   # Block Win32 API calls from Office macros
     )
 
     $actionMode = 'AuditMode'   # Change to 'Enabled' to activate Block mode
@@ -9854,6 +9972,35 @@ function Invoke-Step32 {
 
 
     try {
+        # [FIX-BATCH-C-11b] Capture each rule's current action for
+        # rollback. Values: 0=Disabled, 1=Enabled, 2=AuditMode, 6=Warn.
+        # -1 = not present (rollback will Remove-MpPreference that rule).
+        $__asrOrig = @{}
+        try {
+            $__prefBefore = Get-MpPreference -ErrorAction Stop
+            for ($i = 0; $i -lt $__prefBefore.AttackSurfaceReductionRules_Ids.Count; $i++) {
+                $__key = $__prefBefore.AttackSurfaceReductionRules_Ids[$i].ToString().ToUpper()
+                $__asrOrig[$__key] = [int]$__prefBefore.AttackSurfaceReductionRules_Actions[$i]
+            }
+        } catch {
+            Write-Log ("  [WARN] Could not capture pre-existing ASR state: {0}" -f $_.Exception.Message) -Level WARN
+        }
+
+        # Write rollback entries BEFORE mutation.
+        for ($i = 0; $i -lt $asrRuleIds.Count; $i++) {
+            $__ruleId = $asrRuleIds[$i].ToUpper()
+            $__origAction = if ($__asrOrig.ContainsKey($__ruleId)) { $__asrOrig[$__ruleId] } else { -1 }
+            $__rbOk = Add-RollbackEntry -Step 32 -Type 'DefenderAsr' -Data @{
+                RuleId         = $__ruleId
+                OriginalAction = $__origAction
+                NewAction      = 2
+            }
+            if ($__rbOk -is [bool] -and -not $__rbOk) {
+                Write-Log '  [ABORT] Rollback manifest write failed - refusing to modify ASR rules.' -Level ERROR
+                return
+            }
+        }
+
         $actions = @($actionMode) * $asrRuleIds.Count
         Add-MpPreference -AttackSurfaceReductionRules_Ids $asrRuleIds -AttackSurfaceReductionRules_Actions $actions -ErrorAction Stop
 
@@ -10919,7 +11066,33 @@ function Invoke-Step37 {
     Backup-RegistryKey -Step 37 -RegPath 'HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
     Write-Log 'Configuring UX\Settings feature-update deferral...' -Level INFO
 
+    # [FIX-BATCH-C-12b] Capture and rollback ALL five values, not just two.
+    $__captureReg37 = {
+        param([string]$Path, [string]$Name)
+        $existed = $false; $value = $null
+        try {
+            if (Test-Path -LiteralPath $Path) {
+                $v = (Get-ItemProperty -Path $Path -Name $Name -ErrorAction SilentlyContinue).$Name
+                if ($null -ne $v) { $existed = $true; $value = $v }
+            }
+        } catch { }
+        return [PSCustomObject]@{ Existed = $existed; Value = $value }
+    }
+
     $uxPath = 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings'
+    $policyPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
+
+    $__uxDefer  = & $__captureReg37 $uxPath 'DeferFeatureUpdates'
+    $__uxDays   = & $__captureReg37 $uxPath 'DeferFeatureUpdatesPeriodInDays'
+    $__uxBRL    = & $__captureReg37 $uxPath 'BranchReadinessLevel'
+    $__polDefer = & $__captureReg37 $policyPath 'DeferFeatureUpdates'
+    $__polDays  = & $__captureReg37 $policyPath 'DeferFeatureUpdatesPeriodInDays'
+
+    $null = Add-RollbackEntry -Step 37 -Type 'RegistryHKLM' -Data @{ Path = $uxPath;     Name = 'DeferFeatureUpdates';             Existed = $__uxDefer.Existed;  Value = $__uxDefer.Value;  Type = 'DWord' }
+    $null = Add-RollbackEntry -Step 37 -Type 'RegistryHKLM' -Data @{ Path = $uxPath;     Name = 'DeferFeatureUpdatesPeriodInDays'; Existed = $__uxDays.Existed;   Value = $__uxDays.Value;   Type = 'DWord' }
+    $null = Add-RollbackEntry -Step 37 -Type 'RegistryHKLM' -Data @{ Path = $uxPath;     Name = 'BranchReadinessLevel';            Existed = $__uxBRL.Existed;    Value = $__uxBRL.Value;    Type = 'DWord' }
+    $null = Add-RollbackEntry -Step 37 -Type 'RegistryHKLM' -Data @{ Path = $policyPath; Name = 'DeferFeatureUpdates';             Existed = $__polDefer.Existed; Value = $__polDefer.Value; Type = 'DWord' }
+    $null = Add-RollbackEntry -Step 37 -Type 'RegistryHKLM' -Data @{ Path = $policyPath; Name = 'DeferFeatureUpdatesPeriodInDays'; Existed = $__polDays.Existed;  Value = $__polDays.Value;  Type = 'DWord' }
 
     if (& $setDword $uxPath 'DeferFeatureUpdates' 1) {
         Write-Log '  [OK] DeferFeatureUpdates = 1' -Level OK
@@ -10964,8 +11137,8 @@ function Invoke-Step37 {
     # P3: Step 37 rollback entries
     # [FIX-STEP37-HKLM] These target HKLM. RegistryHKLM is the same
     # restore logic but self-describes the hive in the manifest.
-    Add-RollbackEntry -Step 37 -Type 'RegistryHKLM' -Data @{ Path = 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings'; Name = 'DeferFeatureUpdates'; Existed = $false; Value = $null; Type = 'DWord' }
-    Add-RollbackEntry -Step 37 -Type 'RegistryHKLM' -Data @{ Path = 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings'; Name = 'DeferFeatureUpdatesPeriodInDays'; Existed = $false; Value = $null; Type = 'DWord' }
+    $null = Add-RollbackEntry -Step 37 -Type 'RegistryHKLM' -Data @{ Path = 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings'; Name = 'DeferFeatureUpdates'; Existed = $false; Value = $null; Type = 'DWord' }
+    $null = Add-RollbackEntry -Step 37 -Type 'RegistryHKLM' -Data @{ Path = 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings'; Name = 'DeferFeatureUpdatesPeriodInDays'; Existed = $false; Value = $null; Type = 'DWord' }
     Write-Log 'Verifying configuration...' -Level INFO
 
     try {
@@ -10975,9 +11148,20 @@ function Invoke-Step37 {
         Write-Log ("  UX path:     {0} days" -f $uxValue) -Level INFO
         Write-Log ("  Policy path: {0} days" -f $policyValue) -Level INFO
 
-        if ($uxValue -ne $deferDays -and $policyValue -ne $deferDays) {
-            Write-Log 'Configuration did not persist to either path.' -Level WARN
-            $overallSuccess = $false
+        # [FIX-BATCH-C-12a] Fail verification if EITHER path is wrong, not
+        # just when BOTH are wrong. Policy path takes precedence on
+        # Pro/Enterprise; a stale Policy value while UX is correct means
+        # the wrong deferral actually applies. Home SKU may ignore the
+        # Policy path entirely, so a Policy-only failure there is a WARN.
+        $__uxOk = ($uxValue -eq $deferDays)
+        $__policyOk = ($policyValue -eq $deferDays)
+        if (-not $__uxOk -or -not $__policyOk) {
+            Write-Log ("  [WARN] One path failed verification (UX={0}, Policy={1}, expected {2})" -f $uxValue, $policyValue, $deferDays) -Level WARN
+            if (-not $Script:WinHomeSku) {
+                $overallSuccess = $false
+            } else {
+                Write-Log '  (Windows Home may ignore the policy path — not fatal.)' -Level INFO
+            }
         }
     } catch {
         Write-Log ("  Verification failed: {0}" -f $_.Exception.Message) -Level DEBUG
@@ -13019,8 +13203,19 @@ function Invoke-Step45 {
     # default on most modern Windows systems (value 0x80000003
     # means "user managed, disabled"). Setting to 1 makes it
     # explicit and fleet-consistent.
+    # [FIX-BATCH-C-13a] Backup + rollback for NTFS last-access before mutation.
+    Backup-RegistryKey -Step 45 -RegPath 'HKLM\SYSTEM\CurrentControlSet\Control\FileSystem'
+    $__fsPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem'
+    $__ntfsOrig = $null
+    $__ntfsExisted = $false
     try {
-        $__fsPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem'
+        if (Test-Path -LiteralPath $__fsPath) {
+            $__ntfsVal = (Get-ItemProperty -Path $__fsPath -Name 'NtfsDisableLastAccessUpdate' -ErrorAction SilentlyContinue).NtfsDisableLastAccessUpdate
+            if ($null -ne $__ntfsVal) { $__ntfsOrig = $__ntfsVal; $__ntfsExisted = $true }
+        }
+    } catch { }
+    try {
+        $null = Add-RollbackEntry -Step 45 -Type 'RegistryHKLM' -Data @{ Path = $__fsPath; Name = 'NtfsDisableLastAccessUpdate'; Existed = $__ntfsExisted; Value = $__ntfsOrig; Type = 'DWord' }
         if (-not (Test-Path -LiteralPath $__fsPath)) { New-Item -Path $__fsPath -Force | Out-Null }
         New-ItemProperty -Path $__fsPath -Name 'NtfsDisableLastAccessUpdate' -Value 1 -PropertyType DWord -Force -ErrorAction Stop | Out-Null
         Write-Log '  [OK] NTFS last-access timestamps disabled.' -Level OK
@@ -13044,6 +13239,18 @@ function Invoke-Step45 {
             if (-not (Test-Path -LiteralPath $prefetchParams)) {
                 New-Item -Path $prefetchParams -Force -ErrorAction Stop | Out-Null
             }
+
+            # [FIX-BATCH-C-13b] Capture and rollback both prefetcher values.
+            $__pfOrig = $null; $__pfExisted = $false
+            $__sfOrig = $null; $__sfExisted = $false
+            try {
+                $__pfVal = (Get-ItemProperty -Path $prefetchParams -Name 'EnablePrefetcher' -ErrorAction SilentlyContinue).EnablePrefetcher
+                if ($null -ne $__pfVal) { $__pfOrig = $__pfVal; $__pfExisted = $true }
+                $__sfVal = (Get-ItemProperty -Path $prefetchParams -Name 'EnableSuperfetch' -ErrorAction SilentlyContinue).EnableSuperfetch
+                if ($null -ne $__sfVal) { $__sfOrig = $__sfVal; $__sfExisted = $true }
+            } catch { }
+            $null = Add-RollbackEntry -Step 45 -Type 'RegistryHKLM' -Data @{ Path = $prefetchParams; Name = 'EnablePrefetcher'; Existed = $__pfExisted; Value = $__pfOrig; Type = 'DWord' }
+            $null = Add-RollbackEntry -Step 45 -Type 'RegistryHKLM' -Data @{ Path = $prefetchParams; Name = 'EnableSuperfetch'; Existed = $__sfExisted; Value = $__sfOrig; Type = 'DWord' }
 
             New-ItemProperty -Path $prefetchParams -Name 'EnablePrefetcher' -Value 0 -PropertyType DWord -Force -ErrorAction Stop | Out-Null
             Write-Log '  [OK] EnablePrefetcher = 0' -Level OK
@@ -13234,7 +13441,7 @@ function Invoke-Step46 {
         # Add-RollbackEntry throws (once AUD-3.1 makes it fail-closed),
         # the outer try/catch aborts before the registry is touched.
         $__doExisted = ($null -ne $currentMode)
-        Add-RollbackEntry -Step 46 -Type 'RegistryHKLM' -Data @{
+        $null = Add-RollbackEntry -Step 46 -Type 'RegistryHKLM' -Data @{
             Path    = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DeliveryOptimization\Config'
             Name    = 'DODownloadMode'
             Existed = $__doExisted
@@ -13264,8 +13471,15 @@ function Invoke-Step46 {
     Write-Log 'Step 46 complete.' -Level OK
     Write-Log '[SUCCESS] Delivery Optimization set to LAN-only peering.' -Level OK
     Write-Log '' -Level INFO
-    $rollbackCmd = "Remove-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DeliveryOptimization\Config' -Name DODownloadMode"
-    Write-Log ("Rollback: {0}" -f $rollbackCmd) -Level INFO
+    # [FIX-BATCH-C-17] The old manual instruction always said "Remove-ItemProperty",
+    # which contradicted the rollback record that preserves the original
+    # value. Correct instruction depends on whether the value existed before.
+    if ($__doExisted) {
+        Write-Log ("Rollback (manual): Set-ItemProperty -Path '{0}' -Name DODownloadMode -Value {1}" -f $doPath, $currentMode) -Level INFO
+    } else {
+        Write-Log ("Rollback (manual): Remove-ItemProperty -Path '{0}' -Name DODownloadMode" -f $doPath) -Level INFO
+    }
+    Write-Log '  (Or use -Rollback to auto-restore from the manifest.)' -Level INFO
 }
 
 # ============================================================
@@ -13543,10 +13757,11 @@ function Invoke-Step49 {
         if (-not (Test-Path -LiteralPath $policyPath)) {
             New-Item -Path $policyPath -Force -ErrorAction Stop | Out-Null
         }
+        # [FIX-BATCH-C-7c] Use $currentValue (already captured at top of
+        # function) and write rollback BEFORE mutation.
+        $null = Add-RollbackEntry -Step 49 -Type 'RegistryHKCU' -Data @{ Path = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer'; Name = 'NoDriveTypeAutorun'; Existed = ($null -ne $currentValue); Value = $currentValue; Type = 'DWord' }
         New-ItemProperty -Path $policyPath -Name 'NoDriveTypeAutorun' -Value 0xFF -PropertyType DWord -Force -ErrorAction Stop | Out-Null
         Write-Log '  [OK] NoDriveTypeAutorun set to 0xFF.' -Level OK
-        # P3: Step 49 rollback entries
-        Add-RollbackEntry -Step 49 -Type 'RegistryHKCU' -Data @{ Path = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer'; Name = 'NoDriveTypeAutorun'; Existed = $false; Value = $null; Type = 'DWord' }
     } catch {
         Write-Log ("  [WARN] Could not set NoDriveTypeAutorun: {0}" -f $_.Exception.Message) -Level WARN
         return
@@ -13971,13 +14186,21 @@ function Invoke-Step52 {
         }
 
         try {
-            Set-Service -Name $t.Name -StartupType $t.NewStart -ErrorAction Stop
-            Write-Log ("  [OK] {0}: {1} -> {2} ({3})" -f $t.Name, $currentStart, $t.NewStart, $t.Reason) -Level OK
-            Add-RollbackEntry -Step 52 -Type 'Service' -Data @{
+            # [FIX-BATCH-C-6] Write rollback entry BEFORE Set-Service. If
+            # the manifest write fails, the service stays at its original
+            # configuration. Matches "backup before mutation".
+            $__rbOk = Add-RollbackEntry -Step 52 -Type 'Service' -Data @{
                 Name          = $t.Name
                 OriginalStart = $currentStart
                 NewStart      = $t.NewStart
             }
+            if ($__rbOk -is [bool] -and -not $__rbOk) {
+                Write-Log ("  [SKIP] {0}: rollback manifest write failed - service left unchanged." -f $t.Name) -Level WARN
+                $failed++
+                continue
+            }
+            Set-Service -Name $t.Name -StartupType $t.NewStart -ErrorAction Stop
+            Write-Log ("  [OK] {0}: {1} -> {2} ({3})" -f $t.Name, $currentStart, $t.NewStart, $t.Reason) -Level OK
             $changed++
         } catch {
             Write-Log ("  [WARN] Could not set {0}: {1}" -f $t.Name, $_.Exception.Message) -Level WARN
@@ -14066,7 +14289,7 @@ function Invoke-Step54 {
             # [FIX-STEP54-HKLM] Pick the label per hive so the manifest
             # self-describes correctly. Restore logic is identical.
             $__rollbackType = if ($t.Path -like 'HKLM:\*') { 'RegistryHKLM' } else { 'RegistryHKCU' }
-            Add-RollbackEntry -Step 54 -Type $__rollbackType -Data @{
+            $null = Add-RollbackEntry -Step 54 -Type $__rollbackType -Data @{
                 Path    = $t.Path
                 Name    = $t.Name
                 Existed = $existed
@@ -14340,6 +14563,63 @@ function Invoke-RollbackMode {
                     $ok++
                 }
 
+                # [FIX-BATCH-C-5] NetworkDns handler. Step 58 writes
+                # rollback entries of this type, but the previous switch
+                # had no case for it — the entries were silent no-ops.
+                'NetworkDns' {
+                    try {
+                        $adapterIndex = [int]$e.Data.AdapterIndex
+                        $prevDns = @($e.Data.PreviousDns)
+                        if ($prevDns.Count -gt 0) {
+                            Set-DnsClientServerAddress -InterfaceIndex $adapterIndex -ServerAddresses $prevDns -ErrorAction Stop
+                            Write-Host ("  OK   {0}: restored DNS on adapter {1} ({2})" -f $label, $e.Data.AdapterName, ($prevDns -join ',')) -ForegroundColor Green
+                        } else {
+                            # Empty array means DHCP-assigned DNS. Reset
+                            # so Windows re-queries the DHCP server.
+                            Set-DnsClientServerAddress -InterfaceIndex $adapterIndex -ResetServerAddresses -ErrorAction Stop
+                            Write-Host ("  OK   {0}: reset DNS on adapter {1} to DHCP" -f $label, $e.Data.AdapterName) -ForegroundColor Green
+                        }
+                        $ok++
+                    } catch {
+                        Write-Host ("  FAIL {0}: {1}" -f $label, $_.Exception.Message) -ForegroundColor Red
+                        $fail++
+                    }
+                }
+                # [FIX-BATCH-C-5] DefenderAsr handler. Step 32 writes
+                # rollback entries per rule; restores each rule's original
+                # action independently.
+                'DefenderAsr' {
+                    try {
+                        $ruleId = [string]$e.Data.RuleId
+                        $origAction = [int]$e.Data.OriginalAction
+                        if ($origAction -lt 0) {
+                            # Rule did not exist before WinTune — remove it.
+                            try {
+                                Remove-MpPreference -AttackSurfaceReductionRules_Ids $ruleId -ErrorAction Stop
+                                Write-Host ("  OK   {0}: removed new ASR rule {1}" -f $label, $ruleId) -ForegroundColor Green
+                            } catch {
+                                # Rule not present is acceptable — already gone
+                                Write-Host ("  SKIP {0}: ASR rule {1} not present" -f $label, $ruleId) -ForegroundColor DarkGray
+                                $skip++
+                                continue
+                            }
+                        } else {
+                            $actionName = switch ($origAction) {
+                                0 { 'Disabled' }
+                                1 { 'Enabled' }
+                                2 { 'AuditMode' }
+                                6 { 'Warn' }
+                                default { 'Disabled' }
+                            }
+                            Add-MpPreference -AttackSurfaceReductionRules_Ids $ruleId -AttackSurfaceReductionRules_Actions $actionName -ErrorAction Stop
+                            Write-Host ("  OK   {0}: restored ASR rule {1} to {2}" -f $label, $ruleId, $actionName) -ForegroundColor Green
+                        }
+                        $ok++
+                    } catch {
+                        Write-Host ("  FAIL {0}: {1}" -f $label, $_.Exception.Message) -ForegroundColor Red
+                        $fail++
+                    }
+                }
                 default {
                     Write-Host ("  SKIP {0}: unknown type" -f $label) -ForegroundColor DarkGray
                     $skip++
@@ -14424,6 +14704,18 @@ function Invoke-Step55 {
         }
     } catch {
         Write-Log ("  [WARN] Could not read TCP global state: {0}" -f $_.Exception.Message) -Level WARN
+    }
+
+    # [FIX-BATCH-C-14a] Save TCP state for manual rollback. netsh int tcp
+    # reset (which the old code presented as "rollback") clears ALL TCP
+    # settings including user customizations predating WinTune. Capturing
+    # the pre-change state lets the user restore exact values.
+    $__tcpBackupPath = Join-Path $Script:ScriptDir ('TcpGlobal_{0}.txt' -f $Script:RunStamp)
+    try {
+        Set-Content -LiteralPath $__tcpBackupPath -Value $rawOutput -Encoding UTF8 -ErrorAction Stop
+        Write-Log ("  [BACKUP] TCP state saved: {0}" -f $__tcpBackupPath) -Level INFO
+    } catch {
+        Write-Log ("  [WARN] Could not save TCP state: {0}" -f $_.Exception.Message) -Level WARN
     }
 
     $rssLabel      = $null
@@ -14595,7 +14887,20 @@ function Invoke-Step55 {
     # [FIX-EXTRA-STEP55] Disable Network Throttling
     Write-Log 'Disabling Network Throttling...' -Level INFO
     $throttlePath = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile'
+    # [FIX-BATCH-C-14b] Backup + rollback for NetworkThrottlingIndex before
+    # writing 0xFFFFFFFF. This is a real registry value that many
+    # users have customized; overwriting without backup loses their setting.
+    Backup-RegistryKey -Step 55 -RegPath 'HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile'
+    $__throttleOrig = $null
+    $__throttleExisted = $false
     try {
+        if (Test-Path -LiteralPath $throttlePath) {
+            $__throttleVal = (Get-ItemProperty -Path $throttlePath -Name 'NetworkThrottlingIndex' -ErrorAction SilentlyContinue).NetworkThrottlingIndex
+            if ($null -ne $__throttleVal) { $__throttleOrig = $__throttleVal; $__throttleExisted = $true }
+        }
+    } catch { }
+    try {
+        $null = Add-RollbackEntry -Step 55 -Type 'RegistryHKLM' -Data @{ Path = $throttlePath; Name = 'NetworkThrottlingIndex'; Existed = $__throttleExisted; Value = $__throttleOrig; Type = 'DWord' }
         if (-not (Test-Path -LiteralPath $throttlePath)) { New-Item -Path $throttlePath -Force | Out-Null }
         New-ItemProperty -Path $throttlePath -Name 'NetworkThrottlingIndex' -Value 0xFFFFFFFF -PropertyType DWord -Force -ErrorAction Stop | Out-Null
         Write-Log '  [OK] Network Throttling disabled (0xFFFFFFFF).' -Level OK
@@ -14603,7 +14908,20 @@ function Invoke-Step55 {
         Write-Log ("  [WARN] Could not disable Network Throttling: {0}" -f $_.Exception.Message) -Level WARN
     }
 
-    Write-Log '  Rollback: netsh int tcp reset' -Level INFO
+    # [FIX-BATCH-C-14a] Accurate rollback instructions using the captured
+    # pre-change state. netsh int tcp reset is NOT a valid rollback — it
+    # clears all settings, including ones WinTune didn't touch.
+    Write-Log '  Rollback (manual, using the values captured above):' -Level INFO
+    if ($rssLabel -and $rssState) {
+        Write-Log ("    netsh int tcp set global rss={0}" -f (($rssState -replace '\s','') -replace 'enabled','enabled' -replace 'disabled','disabled').ToLower()) -Level INFO
+    }
+    if ($autoTuneLabel -and $autoTuneState) {
+        Write-Log ("    netsh int tcp set global autotuninglevel={0}" -f ($autoTuneState -replace '\s','').ToLower()) -Level INFO
+    }
+    if ($ccLabel -and $ccState) {
+        Write-Log ("    netsh int tcp set supplemental Internet congestionprovider={0}" -f $ccState.ToLower()) -Level INFO
+    }
+    Write-Log '    NetworkThrottlingIndex rollback is handled by -Rollback (RegistryHKLM entry).' -Level INFO
 }
 
 # ============================================================
@@ -14620,6 +14938,26 @@ function Invoke-Step57 {
 
     Write-Log 'STEP 57: Advanced System Tweaks' -Level STEP
     Write-Log ('-' * 60) -Level STEP
+
+    # [FIX-BATCH-C-1] DryRun guard. The previous version had no early
+    # return, so -DryRun with any of the -Allow* flags for this step
+    # would actually modify the system (powercfg, bcdedit, registry
+    # writes, scheduled task). Violates the DryRun contract.
+    if ($Script:DryRun) {
+        $requested = @()
+        if ($Script:AllowHibernationOff)   { $requested += 'disable hibernation' }
+        if ($Script:AllowModernStandbyOff) { $requested += 'disable Modern Standby (reboot required)' }
+        if ($Script:AllowHpetOff)          { $requested += 'remove forced platform clock via bcdedit' }
+        if ($Script:AllowFastStartupOff)   { $requested += 'disable Fast Startup' }
+        if ($Script:AllowGamingTweaks)     { $requested += 'enable HAGS + Game Mode' }
+        if ($Script:AllowRegistryBackup)   { $requested += 'enable RegIdleBackup task' }
+        if ($requested.Count -eq 0) {
+            Write-Log 'No advanced tweaks requested (no -Allow* flags).' -Level INFO
+        } else {
+            Write-Log ('Would: {0}' -f ($requested -join '; ')) -Level PREVIEW
+        }
+        return
+    }
 
     $applied = $false
 
@@ -14785,19 +15123,34 @@ function Invoke-Step58 {
 
     foreach ($r in $resolvers) {
         $times = @()
+        $successes = 0
         foreach ($n in $testNames) {
             try {
+                # [FIX-BATCH-C-3] Capture the result so we can verify the
+                # query succeeded. The old code only measured time with
+                # -ErrorAction SilentlyContinue, which counted FAILED
+                # queries as fast responses — a dead server that fails
+                # fast looked like the fastest resolver.
+                $__result = $null
                 $t = Measure-Command {
-                    Resolve-DnsName -Name $n -Server $r.Primary -DnsOnly -QuickTimeout -ErrorAction SilentlyContinue | Out-Null
+                    $__result = Resolve-DnsName -Name $n -Server $r.Primary -DnsOnly -QuickTimeout -ErrorAction SilentlyContinue
                 }
-                $times += $t.TotalMilliseconds
+                if ($__result -and @($__result).Count -gt 0) {
+                    $times += $t.TotalMilliseconds
+                    $successes++
+                }
             } catch { }
         }
-        if ($times.Count -gt 0) {
+        # [FIX-BATCH-C-3] Require at least 2 of 3 test queries to succeed.
+        # A resolver that answered only 1/3 is likely flaky and should not
+        # be selected as "fastest".
+        if ($times.Count -gt 0 -and $successes -ge 2) {
             $avg = ($times | Measure-Object -Average).Average
             $results += [PSCustomObject]@{
-                Name = $r.Name; Primary = $r.Primary; Secondary = $r.Secondary; AvgMs = [math]::Round($avg, 1)
+                Name = $r.Name; Primary = $r.Primary; Secondary = $r.Secondary; AvgMs = [math]::Round($avg, 1); Successes = $successes
             }
+        } else {
+            Write-Log ("  [SKIP] {0,-12} only {1}/{2} queries succeeded - excluded" -f $r.Name, $successes, $testNames.Count) -Level INFO
         }
     }
 
@@ -14812,16 +15165,22 @@ function Invoke-Step58 {
         Write-Log ("    {0,-12} {1,6:N1} ms  ({2})" -f $r.Name, $r.AvgMs, $r.Primary) -Level INFO
     }
 
-    # ---- Get current DNS ----
+    # ---- Get current DNS (per-adapter) ----
+    # [FIX-BATCH-C-4] Capture per-adapter DNS, not combined. The old code
+    # accumulated $currentDns from ALL adapters into one array, then
+    # attached the same combined array to every adapter's rollback entry.
+    # Restoring would set both adapters to the union of both adapters'
+    # original DNS — overwriting each adapter's specific configuration.
     $adapters = @(Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' })
-    $currentDns = @()
+    $perAdapterDns = @{}
+    $currentDns = @()   # kept for logging only
     foreach ($a in $adapters) {
         $dns = Get-DnsClientServerAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue
-        if ($dns -and $dns.ServerAddresses) {
-            $currentDns += $dns.ServerAddresses
-        }
+        $__dnsList = if ($dns -and $dns.ServerAddresses) { @($dns.ServerAddresses) } else { @() }
+        $perAdapterDns[$a.ifIndex] = $__dnsList
+        if ($__dnsList.Count -gt 0) { $currentDns += $__dnsList }
     }
-    Write-Log ("  Current DNS: {0}" -f ($currentDns -join ', ')) -Level INFO
+    Write-Log ("  Current DNS (all adapters): {0}" -f ($currentDns -join ', ')) -Level INFO
 
     $best = $results[0]
     Write-Log ("  Fastest: {0} ({1} ms, {2})" -f $best.Name, $best.AvgMs, $best.Primary) -Level OK
@@ -14855,13 +15214,19 @@ function Invoke-Step58 {
     $appliedCount = 0
     foreach ($a in $adapters) {
         try {
-            Set-DnsClientServerAddress -InterfaceIndex $a.ifIndex -ServerAddresses @($best.Primary, $best.Secondary) -ErrorAction Stop
-            Write-Log ("  [OK] {0}: DNS -> {1}, {2}" -f $a.Name, $best.Primary, $best.Secondary) -Level OK
-            Add-RollbackEntry -Step 58 -Type 'NetworkDns' -Data @{
+            # [FIX-BATCH-C-4] Rollback entry FIRST, then apply. Uses the
+            # per-adapter DNS captured earlier (not combined array).
+            $__rbOk = Add-RollbackEntry -Step 58 -Type 'NetworkDns' -Data @{
                 AdapterIndex = $a.ifIndex
                 AdapterName  = $a.Name
-                PreviousDns  = $currentDns
+                PreviousDns  = $perAdapterDns[$a.ifIndex]
             }
+            if ($__rbOk -is [bool] -and -not $__rbOk) {
+                Write-Log ("  [SKIP] {0}: rollback manifest write failed - DNS unchanged." -f $a.Name) -Level WARN
+                continue
+            }
+            Set-DnsClientServerAddress -InterfaceIndex $a.ifIndex -ServerAddresses @($best.Primary, $best.Secondary) -ErrorAction Stop
+            Write-Log ("  [OK] {0}: DNS -> {1}, {2}" -f $a.Name, $best.Primary, $best.Secondary) -Level OK
             $appliedCount++
         } catch {
             Write-Log ("  [WARN] {0}: {1}" -f $a.Name, $_.Exception.Message) -Level WARN
@@ -14891,10 +15256,10 @@ function Invoke-Step59 {
     Write-Log 'STEP 59: Sandbox / WSL / Dev Drive Audit' -Level STEP
     Write-Log ('-' * 60) -Level STEP
 
-    if ($Script:DryRun) {
-        Write-Log 'Would audit Sandbox/WSL/DevDrive and optionally enable.' -Level PREVIEW
-        return
-    }
+    # [FIX-BATCH-C-15] DryRun runs the full read-only audit, then stops.
+    # The old code returned BEFORE the audit, so -DryRun showed nothing
+    # useful.
+    $__dryRunPreview = $Script:DryRun
 
     # ---- Audit current state ----
     Write-Log 'Current feature state:' -Level INFO
@@ -14919,6 +15284,20 @@ function Invoke-Step59 {
         $__devDriveState = if ($__devDriveReg) { 'Configured' } else { 'Not configured' }
         Write-Log ("    {0,-18} : {1}" -f 'Dev Drive', $__devDriveState) -Level INFO
     } catch { }
+
+    # [FIX-BATCH-C-15] In DryRun, report what would be enabled and stop.
+    if ($__dryRunPreview) {
+        $__would = @()
+        if ($Script:AllowSandboxInstall) { $__would += 'enable Windows Sandbox' }
+        if ($Script:AllowWslInstall)     { $__would += 'install WSL' }
+        if ($Script:AllowDevDriveEnable) { $__would += 'enable Dev Drive capability' }
+        if ($__would.Count -eq 0) {
+            Write-Log 'No enable requested (audit-only mode).' -Level PREVIEW
+        } else {
+            Write-Log ('Would: {0}' -f ($__would -join '; ')) -Level PREVIEW
+        }
+        return
+    }
 
     # ---- Optional enable ----
     if ($Script:AllowSandboxInstall) {
@@ -15764,7 +16143,7 @@ function Invoke-Step56 {
                 Write-Log '  [PREVIEW] Would set WebClient to Disabled and stop if running.' -Level PREVIEW
             } else {
                 $__wcWasRunning = ($wcSvc.Status -eq 'Running')
-                Add-RollbackEntry -Step 56 -Type 'Service' -Data @{
+                $null = Add-RollbackEntry -Step 56 -Type 'Service' -Data @{
                     Name           = 'WebClient'
                     OriginalStart  = $wcStart
                     NewStart       = 'Disabled'
@@ -15878,7 +16257,7 @@ function Invoke-Step56 {
         } else {
             # [FIX-AUD-7] Record original state before writing.
             $__sblExisted = ($null -ne $sblEnabled)
-            Add-RollbackEntry -Step 56 -Type 'RegistryHKLM' -Data @{
+            $null = Add-RollbackEntry -Step 56 -Type 'RegistryHKLM' -Data @{
                 Path    = $sblPath
                 Name    = 'EnableScriptBlockLogging'
                 Existed = $__sblExisted
