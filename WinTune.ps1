@@ -2011,14 +2011,15 @@ function Confirm-Action {
             return $false
         }
 
-        # Starts with 'y' = Yes
-        if ($clean.StartsWith('y')) {
+        # [FIX-BATCH-E-7] Accept only y/yes/n/no (case-insensitive, trimmed).
+        # Previous StartsWith check accepted "yikes", "yolo", "nah", "nope"
+        # as valid responses. Exact matches prevent ambiguity.
+        if ($clean -in @('y','yes')) {
             Write-Log ('  [INPUT] "{0}" resolved to Yes.' -f $raw) -Level OK
             return $true
         }
 
-        # Starts with 'n' = No
-        if ($clean.StartsWith('n')) {
+        if ($clean -in @('n','no')) {
             Write-Log ('  [INPUT] "{0}" resolved to No.' -f $raw) -Level INFO
             return $false
         }
@@ -10333,10 +10334,8 @@ function Invoke-Step35 {
         return
     }
 
-    if ($Script:DryRun) {
-        Write-Log 'Would enumerate provisioned packages for bloatware audit.' -Level PREVIEW
-        return
-    }
+    # [FIX-BATCH-E-5] DryRun handling moved below (after enumeration and
+    # classification) so the preview shows WHICH packages would be removed.
 
     # ============================================================
     # 1. Enumerate provisioned packages
@@ -10450,6 +10449,13 @@ function Invoke-Step35 {
     # ============================================================
     # 4. Removal mode (opt-in)
     # ============================================================
+    # [FIX-BATCH-E-5] DryRun short-circuits here, AFTER enumeration and
+    # classification, so the preview shows the actual candidate list.
+    if ($Script:DryRun) {
+        Write-Log ('[PREVIEW] Would remove {0} package(s).' -f $removable.Count) -Level PREVIEW
+        return
+    }
+
     if (-not $Script:RemoveBloatware) {
         Write-Log 'Audit complete. No changes made.' -Level INFO
         Write-Log 'Add -RemoveBloatware to enable removal of listed packages.' -Level INFO
@@ -10486,7 +10492,15 @@ function Invoke-Step35 {
         Write-Log ("  Removing: {0}" -f $pkg.DisplayName) -Level INFO
 
         try {
-            # Remove from provision (future users) - primary target
+            # [FIX-BATCH-E-8] This operation is NOT reversible from WinTune.
+            # To restore a removed provisioned package:
+            #   1. winget install <AppxPackageName>   (Microsoft Store apps)
+            #   2. Or reinstall the app from the Microsoft Store
+            #   3. Or re-provision on the next Windows feature update
+            # The removal deprovisions the app for FUTURE user profiles.
+            # The current user's copy is removed separately and best-effort.
+            # Recovery artifacts: $pkg.PackageName and $pkg.Version are
+            # captured in the log above for reference.
             Remove-AppxProvisionedPackage -Online -PackageName $pkg.PackageName -ErrorAction Stop | Out-Null
 
             # Also remove from current user if installed
@@ -11609,16 +11623,32 @@ function Get-StartupEntries {
             if (-not $hasTrigger) { continue }
 
             $exe = ''
+            $actionCount = 0
+            $hasComHandler = $false
+            $firstExe = ''
             if ($task.Actions) {
                 foreach ($a in $task.Actions) {
+                    $actionCount++
                     if ($a.PSObject.Properties['Execute'] -and $a.Execute) {
-                        $exe = [string]$a.Execute
+                        $candidate = [string]$a.Execute
                         if ($a.PSObject.Properties['Arguments'] -and $a.Arguments) {
-                            $exe += ' ' + [string]$a.Arguments
+                            $candidate += ' ' + [string]$a.Arguments
                         }
-                        break
+                        if (-not $firstExe) { $firstExe = $candidate }
+                    } else {
+                        $hasComHandler = $true
                     }
                 }
+            }
+            # [FIX-BATCH-E-6] Multi-action or COM-handler scheduled tasks
+            # cannot be classified by a single executable path. Mark them
+            # unclassifiable (empty command) so Classify-StartupEntry
+            # returns Unknown (kept for manual review) instead of the
+            # previous silent "first action determines everything".
+            if ($actionCount -gt 1 -or $hasComHandler) {
+                $exe = ''
+            } else {
+                $exe = $firstExe
             }
 
             [void]$entries.Add([PSCustomObject]@{
@@ -11887,14 +11917,24 @@ function Invoke-Step38 {
     }
 
     try {
-        $merged = $regExports[0]
-        for ($i = 1; $i -lt $regExports.Count; $i++) {
-            $body = $regExports[$i] -replace '^Windows Registry Editor Version 5\.00\s*', ''
-            $merged += "`r`n" + $body
+        # [FIX-BATCH-E-3] Handle the case where no registry keys were
+        # exported (all sources are startup folders or scheduled tasks,
+        # or every Run/StartupApproved key was legitimately absent).
+        # Previous code did $regExports[0] which threw when empty.
+        if ($regExports.Count -eq 0) {
+            Write-Log '  [INFO] No registry keys require backup (all sources are non-registry)' -Level INFO
+            Set-Content -LiteralPath $backupFile -Value 'Windows Registry Editor Version 5.00' -Encoding Unicode -ErrorAction Stop
+            Write-Log ('  Registry backup: {0} (empty - no registry sources)' -f $backupFile) -Level OK
+        } else {
+            $merged = $regExports[0]
+            for ($i = 1; $i -lt $regExports.Count; $i++) {
+                $body = $regExports[$i] -replace '^Windows Registry Editor Version 5\.00\s*', ''
+                $merged += "`r`n" + $body
+            }
+            Set-Content -LiteralPath $backupFile -Value $merged -Encoding Unicode -ErrorAction Stop
+            Write-Log ('  Registry backup: {0}' -f $backupFile) -Level OK
+            Write-Log ('  Registry backup verified: {0} location(s)' -f $regExports.Count) -Level OK
         }
-        Set-Content -LiteralPath $backupFile -Value $merged -Encoding Unicode -ErrorAction Stop
-        Write-Log ('  Registry backup: {0}' -f $backupFile) -Level OK
-        Write-Log ('  Registry backup verified: {0} location(s)' -f $regExports.Count) -Level OK
     } catch {
         Write-Log ('  [ABORT] Could not write merged backup: ' + $_.Exception.Message) -Level ERROR
         $Script:LastStepDetail = 'Purge aborted: merged backup write failed'
@@ -13664,19 +13704,44 @@ function Invoke-Step50 {
             $parentFull = Split-Path -Parent $oldFull
             $newName    = "$($e.Name).WinTuneDisabled"
 
+            # [FIX-BATCH-E-2] Write rollback entry BEFORE any destructive
+            # operation. If the manifest write fails, skip this entry
+            # entirely - the original key remains in place. Relies on
+            # FIX-BATCH-E-4 (Add-RollbackEntry returns bool); if E-4 is
+            # not applied, this check degrades safely to "always proceed"
+            # because Add-RollbackEntry returns $null (not $false).
+            $rbResult = Add-RollbackEntry -Step 50 -Type 'ContextMenu' -Data @{
+                KeyPath      = $e.KeyPath
+                Name         = $e.Name
+                DisabledName = $newName
+            }
+            if ($rbResult -is [bool] -and -not $rbResult) {
+                Write-Log ("  [SKIP] Rollback manifest write failed for {0} - original preserved" -f $e.Name) -Level WARN
+                $failed++
+                continue
+            }
+
+            # [FIX-BATCH-E-2] Refuse to overwrite an existing disabled
+            # backup from a previous partial run. Cleanup is manual.
+            $existingBackup = $false
+            try {
+                $null = & reg.exe query "$parentFull\$newName" 2>&1
+                if ($LASTEXITCODE -eq 0) { $existingBackup = $true }
+            } catch { }
+            if ($existingBackup) {
+                Write-Log ("  [SKIP] Disabled backup already exists at {0}\{1} - clean up manually" -f $parentFull, $newName) -Level WARN
+                $failed++
+                continue
+            }
+
             $null = & reg.exe copy "$oldFull" "$parentFull\$newName" /s /f 2>&1
             if ($LASTEXITCODE -eq 0) {
                 $null = & reg.exe delete "$oldFull" /f 2>&1
                 if ($LASTEXITCODE -eq 0) {
                     Write-Log ("  [DISABLED] {0}" -f $e.Name) -Level OK
-                    Add-RollbackEntry -Step 50 -Type 'ContextMenu' -Data @{
-                        KeyPath      = $e.KeyPath
-                        Name         = $e.Name
-                        DisabledName = $newName
-                    }
                     $disabled++
                 } else {
-                    Write-Log ("  [FAIL] Could not delete original {0}" -f $e.Name) -Level WARN
+                    Write-Log ("  [FAIL] Could not delete original {0} - backup copy exists at {1}, restore manually if needed" -f $e.Name, $newName) -Level WARN
                     $failed++
                 }
             } else {
@@ -13812,18 +13877,39 @@ function Invoke-Step51 {
         return
     }
 
+    # [FIX-BATCH-E-1] Export .reg backup before any deletion. If backup
+    # fails, skip that key entirely (no partial state). This matches the
+    # "backup before mutation" principle applied to Step 38.
+    $backupDir = Join-Path $Script:ScriptDir ("UninstallBackup_{0}" -f $Script:RunStamp)
+    if (-not (Test-Path -LiteralPath $backupDir)) {
+        New-Item -ItemType Directory -Path $backupDir -Force -ErrorAction Stop | Out-Null
+    }
+    Write-Log ("  Backup directory: {0}" -f $backupDir) -Level INFO
+
     $removed = 0
     $failed  = 0
+    $skipped = 0
 
     foreach ($p in $programs) {
         try {
             $keyPath = $p.KeyPath -replace '^Microsoft\.PowerShell\.Core\\Registry::', ''
+            # [FIX-BATCH-E-1] Export .reg backup before deletion
+            $safeName = $keyPath -replace '[\\/:*?"<>|]', '_'
+            $regBackupPath = Join-Path $backupDir ("$safeName.reg")
+            $exportResult = & reg.exe export "$keyPath" "$regBackupPath" /y 2>&1
+            $exportExit = $LASTEXITCODE
+            if ($exportExit -ne 0 -or -not (Test-Path -LiteralPath $regBackupPath) -or (Get-Item -LiteralPath $regBackupPath).Length -lt 50) {
+                Write-Log ("  [SKIP] Backup export failed for {0}: exit={1}" -f $p.Display, $exportExit) -Level WARN
+                $skipped++
+                continue
+            }
+            # Backup verified. Now delete.
             $null = & reg.exe delete "$keyPath" /f 2>&1
             if ($LASTEXITCODE -eq 0) {
-                Write-Log ("  [REMOVED] {0}" -f $p.Display) -Level OK
+                Write-Log ("  [REMOVED] {0} (backup: {1})" -f $p.Display, (Split-Path -Leaf $regBackupPath)) -Level OK
                 $removed++
             } else {
-                Write-Log ("  [FAIL] Could not remove {0}" -f $p.Display) -Level WARN
+                Write-Log ("  [FAIL] Could not remove {0} - backup preserved at {1}" -f $p.Display, $regBackupPath) -Level WARN
                 $failed++
             }
         } catch {
@@ -13833,7 +13919,7 @@ function Invoke-Step51 {
     }
 
     Write-Host ''
-    Write-Log ("Step 51 summary: {0} removed, {1} failed" -f $removed, $failed) -Level INFO
+    Write-Log ("Step 51 summary: {0} removed, {1} skipped (backup failed), {2} failed" -f $removed, $skipped, $failed) -Level INFO
     Write-Log 'Step 51 complete.' -Level OK
     Write-Log '[SUCCESS] Installed program audit complete.' -Level OK
 }
@@ -14078,6 +14164,9 @@ function Add-RollbackEntry {
             At   = (Get-Date).ToString('o')
         } | ConvertTo-Json -Compress
         Add-Content -LiteralPath $Script:RollbackManifestPath -Value $json -Encoding UTF8 -ErrorAction Stop
+        # [FIX-BATCH-E-4] Return $true on success so pre-mutation callers
+        # can proceed (Step 50 uses this to abort if manifest write failed).
+        return $true
     } catch {
         # Rollback is a safety guarantee â€” a write failure is not silent.
         Write-Log ("ROLLBACK MANIFEST WRITE FAILED: {0}" -f $_.Exception.Message) -Level ERROR
@@ -14085,6 +14174,8 @@ function Add-RollbackEntry {
         Write-Log ("  Change was applied but cannot be rolled back via -Rollback.") -Level WARN
         Write-Host ""
         Write-Host "  [WARN] Rollback manifest could not be written. This change is NOT reversible." -ForegroundColor Yellow
+        # [FIX-BATCH-E-4] Signal failure so pre-mutation callers can abort.
+        return $false
     }
 }
 
