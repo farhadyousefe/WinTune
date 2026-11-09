@@ -14255,7 +14255,15 @@ function Invoke-Step54 {
         # supported Win11 equivalent — hides the Widgets button cleanly.
         [PSCustomObject]@{ Path = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced';      Name = 'TaskbarDa';                         Value = 0; Type = 'DWord' }
         [PSCustomObject]@{ Path = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Search';                 Name = 'SearchboxTaskbarMode';              Value = 0; Type = 'DWord' }
-        [PSCustomObject]@{ Path = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System';                       Name = 'AllowClipboardHistory';             Value = 0; Type = 'DWord' }
+        # [FIX-BATCH-C-2] AllowClipboardHistory HKLM policy REMOVED.
+        # That policy machine-wide-disables Win+V clipboard history for
+        # every user. Clipboard history is a productivity feature, not a
+        # privacy/security threat surface — disabling it breaks a useful
+        # Windows 11 capability with no corresponding benefit. Users who
+        # want it off can toggle it themselves at Settings → System →
+        # Clipboard. Any user who ran an earlier Step 54 needs to
+        # manually delete HKLM\SOFTWARE\Policies\Microsoft\Windows\System\
+        # AllowClipboardHistory and sign out to restore Win+V.
 
         # [FIX-TIER1-START-MENU] Hide the "Recommended" block from Start menu
         [PSCustomObject]@{ Path = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Explorer';                     Name = 'HideRecommendedSection';            Value = 1; Type = 'DWord' }
